@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""Build a patched PL100 MCU firmware from IAP_PL100_1v1_b250219.hex.
+
+Patch 1 - track display "Tr03" -> "03/09" (current / total tracks).
+  * Both playback branches of the display update (0x0800D4E4) call a new
+    routine fmt_track() placed in unused flash after the original image.
+  * "03/09" is 86 px in the 33 px font with 2 px letter spacing and fits the
+    original 88 px label (x 135..223). "Tr03/09" (117 px) did not: the right
+    edge of the screen (~x 230) is hidden behind the front panel window.
+  * Discs with 0 or >= 100 tracks (MP3) keep the original "Tr03" / "Tr123".
+
+Patch 2 - backlight fully off in standby.
+  * The backlight is active-low (PB1 low = lit; confirmed on the device).
+  * Standby entry (0x0800AA20) stops TIM3 and re-inits PB1 (TIM3_CH4) as
+    input-pull-up - meant as "off" - but then writes BRR, which turns the
+    pull-up into the ~40k pull-down: a weak "on", so the backlight glows.
+  * Init PB1 as push-pull output and call GPIO_SetBits instead of
+    GPIO_ResetBits, so PB1 is driven high (off). Wake-up (0x0800AA08)
+    re-inits PB1 as PWM.
+
+Patch 3 - total time of the previous disc shown after a disc change.
+  * The CD module's 0x20 message is latched as the disc total time only while
+    total_min (+0x110) is 0; later 0x20 messages are track lengths (+0x108).
+    The disc info is only reset by the Open/Close key (0x0800E6E0), so a tray
+    pushed shut by hand, or an old-disc 0x20 arriving after the key reset,
+    leaves the previous disc's total in place.
+  * Also reset the disc info when the module reports the tray open (status
+    0x21, handler 0x0800DCDE), mirroring the fields the key handler clears,
+    including the "disc ready" bit ([+0x11C] bit1).
+
+Patch 4 - Play pressed while the disc is still loading is lost.
+  * The Play/Pause handler (0x0800E10E) sends "play track 1" while the module
+    is still reading the TOC (ignored) and sets the play state to 6 anyway,
+    so the player shows the play icon and stays on "Read" forever.
+  * Play while stopped and loading only sets a pending flag (spare byte
+    0x20000238). A hook on the main loop starts playback through the original
+    handler once the disc is ready (TOC done, tracks known, total time known
+    for audio CDs). Opening the tray, no disc, any other play-state change or
+    standby cancels it. Needs disctime (added automatically).
+
+Patch 5 - time remaining, shown in red.
+  * Remote key FN (IR 0x08) toggles line 2 between elapsed track time
+    (white) and track time remaining = track length (+0x108/+0x10C) - elapsed
+    (red). MENU (IR 0x04) is mapped to a no-op key so it stays unused.
+  * The red/white label styles are the firmware's own (0x08029020 is used
+    for MUTE, 0x080290D2 is the normal style). A hook before every display
+    update applies red only while playing/paused/seeking in remaining mode,
+    not on the volume screen and never while muted.
+  * Mode and applied colour live in spare bytes 0x20000239 / 0x2000023A.
+
+Patch 6 - DISP cycles the backlight brightness.
+  * DISP (IR 0x0C, key 0x14) has no function on the PL100. A hook on the main
+    loop's get_key steps the brightness setting (0x200004A5) through levels
+    5,4,3,2,1,0 = 10/20/35/55/65/100 % (the backlight is active-low, so the
+    menu's levels run backwards) and saves it like the settings menu would.
+  * The settings load clamps brightness to 1..6, which would turn level 0
+    into 1; brightness gets its own check instead (0..5 valid, else 3).
+  * IR_DIAG_ON (off by default): show the last received IR command as
+    "IRxx" on line 1, e.g. to identify remote buttons.
+
+Usage: build_patch.py <original.hex> <patched.hex> [patch,...]
+  patches: track, backlight, disctime, play, remaining, brightness (default: all)
+"""
+import argparse
+import struct
+
+from thumbasm import assemble, reglist
+
+BASE = 0x08004000
+ENTRY = 0x080041B5
+SETTINGS_PAGE = 0x0807FC00  # firmware stores user settings here - never touch
+
+# firmware routines / data (v1.1 b250219)
+PUT_CHAR_L1 = 0x0800614A   # (pos, ch)            -> line1[pos] = ch
+PUT_NUM_L1 = 0x08006152    # (pos, value, ndigits) -> zero-padded digits into line1
+CD_STATE = 0x200008AC      # +0xF4 total tracks, +0xFC current track
+GPIO_SET_BITS = 0x0800FB0E  # (port, pins) -> BSRR
+PLAY_HANDLER = 0x0800E10E  # Play/Pause key (0x2F) handler
+MAIN_TASK = 0x08007F30     # called every main-loop pass while powered on
+STANDBY_FIRST_CALL = 0x08008B04  # first call made by standby entry 0x0800A7E0
+DISPLAY_REDRAW = 0x2000018C  # set to 1 to refresh the display
+PLAY_PENDING = 0x20000238  # spare byte: key-history buffer of the dead hidden-mode detector
+TIME_MODE = 0x20000239     # spare byte: 0 elapsed, 1 track remaining
+TIME_COLOUR = 0x2000023A   # spare byte: time label colour applied, 0 white / 1 red
+PUT_CHAR_L2 = 0x08006060   # (pos, ch)            -> line2[pos] = ch
+PUT_NUM_L2 = 0x08006090    # (pos, value, ndigits) -> zero-padded digits into line2
+STYLE_WHITE = 0x080290D2   # time label style, white text (normal)
+STYLE_RED = 0x08029020     # time label style, red text (used for MUTE)
+DISPLAY_UPDATE = 0x0800D4E4
+LAST_SHOWN_MIN = 0x20000620  # minutes last written to the time label
+MUTE = 0x2000004E
+UI_STATE = 0x20000178      # 1 main screen, 2 volume screen
+IR_TABLE = 0x0802D213      # IR command -> key code
+IR_RAW = 0x200001E0        # last raw IR command byte (cleared after a timeout)
+IR_DIAG = 0x2000023B       # spare byte: last IR command, for the diagnostic display
+LINE1_BUF = 0x20000860     # line 1 text buffer (10 bytes)
+UI = 0x2000082C            # GUI-Guider ui struct, +0x08 line 1 label
+LABEL_SET_TEXT = 0x0802758C  # lv_label_set_text(obj, text)
+GET_KEY = 0x0800882C       # main-loop key reader (IR > panel > knob)
+POWER_ON = 0x2000004C      # 1 = on, 0 = standby
+BRIGHTNESS = 0x200004A5    # setting, level 0..6 (saved)
+SET_BRIGHTNESS = 0x08005F70
+SCHEDULE_SAVE = 0x0800A798  # save settings to flash after a short delay
+
+FN_IR = 0x08               # IR command of the FN key (MENU 0x04, FN 0x08, DISP 0x0C; tested)
+IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
+
+CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
+
+
+def read_hex(path):
+    mem, base = {}, 0
+    for ln in open(path):
+        ln = ln.strip()
+        if not ln:
+            continue
+        b = bytes.fromhex(ln[1:])
+        assert sum(b) & 0xFF == 0, 'bad checksum: ' + ln
+        n, addr, t = b[0], (b[1] << 8) | b[2], b[3]
+        if t == 0:
+            for i, x in enumerate(b[4:4 + n]):
+                mem[base + addr + i] = x
+        elif t == 4:
+            base = int.from_bytes(b[4:6], 'big') << 16
+    lo, hi = min(mem), max(mem)
+    assert lo == BASE and len(mem) == hi - lo + 1, 'unexpected image layout'
+    return bytearray(mem[a] for a in range(lo, hi + 1))
+
+
+def line_ending(path):
+    """Line ending used by the source file, so the output diffs cleanly against it."""
+    return '\r\n' if b'\r\n' in open(path, 'rb').read() else '\n'
+
+
+def write_hex(path, img, eol):
+    def rec(n, addr, t, data):
+        b = bytes([n, addr >> 8, addr & 0xFF, t]) + data
+        return ':' + (b + bytes([-sum(b) & 0xFF])).hex().upper() + eol
+
+    out, cur_hi = [], None
+    for off in range(0, len(img), 16):
+        a = BASE + off
+        if a >> 16 != cur_hi:
+            cur_hi = a >> 16
+            out.append(rec(2, 0, 4, struct.pack('>H', cur_hi)))
+        chunk = bytes(img[off:off + 16])
+        out.append(rec(len(chunk), a & 0xFFFF, 0, chunk))
+    out.append(rec(4, 0, 5, struct.pack('>I', ENTRY)))
+    out.append(':00000001FF' + eol)
+    open(path, 'w', newline='').write(''.join(out))
+
+
+def patch(img, addr, expect, new):
+    o = addr - BASE
+    cur = bytes(img[o:o + len(expect)])
+    assert cur == expect, f'{addr:#x}: expected {expect.hex()} found {cur.hex()}'
+    assert len(new) <= len(expect)
+    img[o:o + len(new)] = new
+
+
+def put(img, addr, data):
+    o = addr - BASE
+    if len(img) < o + len(data):
+        img.extend(b'\xff' * (o + len(data) - len(img)))
+    assert all(x == 0xFF for x in img[o:o + len(data)]), f'{addr:#x} not free'
+    img[o:o + len(data)] = data
+
+
+# fmt_track(): writes "CC/TT" when the disc has 1..99 tracks,
+# otherwise the original "TrCC" / "TrCCC".
+FMT_TRACK = [
+    'fmt_track:',
+    ('push', reglist('r4', 'r5', lr=True)),
+    ('ldr_lit', 'r3', 'lit_state'),
+    ('ldr', 'r4', 'r3', 8),          # cur = [state+0xFC]
+    ('ldr', 'r5', 'r3', 0),          # tot = [state+0xF4]
+    ('cbz', 'r5', 'orig'),
+    ('cmp', 'r5', 100),
+    ('bhs', 'orig'),
+    ('movs', 'r0', 0),
+    ('uxth', 'r1', 'r4'),
+    ('movs', 'r2', 2),
+    ('bl', PUT_NUM_L1),
+    ('movs', 'r0', 2),
+    ('movs', 'r1', 0x2F),            # '/'
+    ('bl', PUT_CHAR_L1),
+    ('movs', 'r0', 3),
+    ('uxth', 'r1', 'r5'),
+    ('movs', 'r2', 2),
+    ('bl', PUT_NUM_L1),
+    ('pop', reglist('r4', 'r5', pc=True)),
+    'orig:',
+    ('movs', 'r0', 0),
+    ('movs', 'r1', 0x54),            # 'T'
+    ('bl', PUT_CHAR_L1),
+    ('movs', 'r0', 1),
+    ('movs', 'r1', 0x72),            # 'r'
+    ('bl', PUT_CHAR_L1),
+    ('movs', 'r2', 2),
+    ('cmp', 'r4', 100),
+    ('blo', 'orig_num'),
+    ('movs', 'r2', 3),
+    'orig_num:',
+    ('movs', 'r0', 2),
+    ('uxth', 'r1', 'r4'),
+    ('bl', PUT_NUM_L1),
+    ('pop', reglist('r4', 'r5', pc=True)),
+    ('align',),
+    'lit_state:',
+    ('word', CD_STATE + 0xF4),
+]
+
+
+def cave_addr(img):
+    """Next free word-aligned address in the area after the original image."""
+    return max(CAVE, (BASE + len(img) + 3) & ~3)
+
+
+def patch_track(img):
+    cave, labels = assemble(FMT_TRACK, cave_addr(img))
+    fmt = labels['fmt_track']
+
+    # Playback (state 3/6): replace "print current track" block, continue at 0x0800D70A
+    site1, _ = assemble([('bl', fmt), ('b', 0x0800D70A)], 0x0800D6DE)
+    patch(img, 0x0800D6DE, bytes.fromhex('4148d0f8fc00'), site1)
+    # Seek (state 7/8): same, continue at 0x0800D77E
+    site2, _ = assemble([('bl', fmt), ('b', 0x0800D77E)], 0x0800D752)
+    patch(img, 0x0800D752, bytes.fromhex('2448d0f8fc00'), site2)
+
+    put(img, fmt, cave)
+    print(f'track: fmt_track at {fmt:#x}, {len(cave)} bytes')
+
+
+def patch_backlight(img):
+    # backlight_off(): GPIO_InitTypeDef.mode = 0x48 (IPU) -> 0x10 (Out_PP); speed 3 stays
+    patch(img, 0x0800AA40, bytes([0x48, 0x20]), bytes([0x10, 0x20]))
+    # GPIO_ResetBits(GPIOB, PB1) -> GPIO_SetBits(GPIOB, PB1)
+    site, _ = assemble([('bl', GPIO_SET_BITS)], 0x0800AA58)
+    patch(img, 0x0800AA58, bytes.fromhex('05f05bf8'), site)
+    print('backlight: PB1 driven high (off) in standby')
+
+
+# tray_open(): status 0x21 handler - [+7] = 2 ("Eject") as before, then clear
+# the disc info like the Open/Close key does (0x0800E6F0..0x0800E714).
+TRAY_OPEN = [
+    'tray_open:',
+    ('ldr_lit', 'r1', 'lit_state'),
+    ('movs', 'r0', 2),
+    ('strb', 'r0', 'r1', 7),         # tray status = Eject
+    ('adds_i8', 'r1', 0xF4),         # r1 = state + 0xF4
+    ('movs', 'r0', 0),
+    ('movs', 'r2', 1),
+    ('str', 'r0', 'r1', 0x00),       # +0xF4  total tracks
+    ('str', 'r2', 'r1', 0x08),       # +0xFC  current track = 1
+    ('str', 'r0', 'r1', 0x0C),       # +0x100 minutes
+    ('strb', 'r0', 'r1', 0x10),      # +0x104 seconds
+    ('str', 'r0', 'r1', 0x14),       # +0x108 track length min
+    ('strb', 'r0', 'r1', 0x18),      # +0x10C track length sec
+    ('str', 'r0', 'r1', 0x1C),       # +0x110 disc total min
+    ('adds_i8', 'r1', 0x20),         # r1 = state + 0x114
+    ('strb', 'r0', 'r1', 0x00),      # +0x114 disc total sec
+    ('strb', 'r0', 'r1', 0x04),      # +0x118 disc type flags
+    ('ldr', 'r0', 'r1', 0x08),       # +0x11C status flags:
+    ('movs', 'r2', 2),
+    ('bics', 'r0', 'r2'),            #   clear bit1 "disc ready"
+    ('str', 'r0', 'r1', 0x08),
+    ('bx_lr',),
+    ('align',),
+    'lit_state:',
+    ('word', CD_STATE),
+]
+
+
+# disc_ready() -> r0: TOC done ([+0x11C] bit1), track count known and, for an
+# audio CD ([+0x118] bit0), the total time received. Clobbers r0-r2.
+DISC_READY = [
+    'disc_ready:',
+    ('ldr_lit', 'r2', 'lit_state_f4'),
+    ('ldr', 'r0', 'r2', 0x28),       # +0x11C
+    ('movs', 'r1', 2),
+    ('tst', 'r0', 'r1'),
+    ('beq', 'not_ready'),
+    ('ldr', 'r0', 'r2', 0x00),       # +0xF4 total tracks
+    ('cbz', 'r0', 'not_ready'),
+    ('ldr', 'r0', 'r2', 0x24),       # +0x118 disc type
+    ('lsls', 'r0', 'r0', 31),
+    ('beq', 'ready'),                # not CD-DA: no total time to wait for
+    ('ldr', 'r0', 'r2', 0x1C),       # +0x110 total min
+    ('cbnz', 'r0', 'ready'),
+    ('adds_i8', 'r2', 0x20),
+    ('ldrb', 'r0', 'r2', 0),         # +0x114 total sec
+    ('cbnz', 'r0', 'ready'),
+    'not_ready:',
+    ('movs', 'r0', 0),
+    ('bx_lr',),
+    'ready:',
+    ('movs', 'r0', 1),
+    ('bx_lr',),
+]
+
+# play_key(): Play/Pause pressed. While stopped and the disc is still loading
+# (tray status 0 Read / 1 Load / 5 Read, disc not ready) only remember it;
+# otherwise run the original handler.
+PLAY_KEY = [
+    'play_key:',
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r3', 'lit_state'),
+    ('ldrb', 'r0', 'r3', 4),         # play state
+    ('cmp', 'r0', 1),                # 1 = stopped
+    ('bne', 'play_now'),
+    ('ldrb', 'r0', 'r3', 7),         # tray status
+    ('cbz', 'r0', 'loading'),
+    ('cmp', 'r0', 1),
+    ('beq', 'loading'),
+    ('cmp', 'r0', 5),
+    ('bne', 'play_now'),
+    'loading:',
+    ('bl', 'disc_ready'),
+    ('cbnz', 'r0', 'play_now'),
+    ('ldr_lit', 'r1', 'lit_pending'),
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 0),
+    ('pop', reglist('r4', pc=True)),
+    'play_now:',
+    ('bl', PLAY_HANDLER),
+    ('pop', reglist('r4', pc=True)),
+
+    # play_poll(): replaces the main loop's call to 0x08007F30. Starts a
+    # pending Play once the disc is ready; drops it if the tray opens, there
+    # is no disc / the tray is blocked, or the play state changed meanwhile.
+    'play_poll:',
+    ('push', reglist('r4', lr=True)),
+    ('bl', MAIN_TASK),
+    ('ldr_lit', 'r4', 'lit_pending'),
+    ('ldrb', 'r0', 'r4', 0),
+    ('cbz', 'r0', 'poll_done'),
+    ('ldr_lit', 'r3', 'lit_state'),
+    ('ldrb', 'r0', 'r3', 7),         # tray status 2 Eject / 3 Disc / 4 Block
+    ('subs_i3', 'r0', 'r0', 2),
+    ('cmp', 'r0', 2),
+    ('bls', 'poll_cancel'),
+    ('ldrb', 'r0', 'r3', 4),
+    ('cmp', 'r0', 1),
+    ('bne', 'poll_cancel'),
+    ('bl', 'disc_ready'),
+    ('cbz', 'r0', 'poll_done'),
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r4', 0),
+    ('bl', PLAY_HANDLER),
+    ('ldr_lit', 'r1', 'lit_redraw'),
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 0),         # same as the key dispatcher after a key
+    'poll_done:',
+    ('pop', reglist('r4', pc=True)),
+    'poll_cancel:',
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r4', 0),
+    ('pop', reglist('r4', pc=True)),
+
+    # play_standby(): standby entry - forget a pending Play, then continue
+    # with the original first call of the standby routine.
+    'play_standby:',
+    ('ldr_lit', 'r1', 'lit_pending'),
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r1', 0),
+    ('b.w', STANDBY_FIRST_CALL),
+] + DISC_READY + [
+    ('align',),
+    'lit_state:',
+    ('word', CD_STATE),
+    'lit_state_f4:',
+    ('word', CD_STATE + 0xF4),
+    'lit_pending:',
+    ('word', PLAY_PENDING),
+    'lit_redraw:',
+    ('word', DISPLAY_REDRAW),
+]
+
+
+def patch_disctime(img):
+    cave, labels = assemble(TRAY_OPEN, cave_addr(img))
+    fn = labels['tray_open']
+    # case 0x21: movs r0,#2 / ldr r1,=state / strb r0,[r1,#7] / b 0x0800DD3A
+    site, _ = assemble([('bl', fn), ('b', 0x0800DD3A), ('nop',)], 0x0800DCDE)
+    patch(img, 0x0800DCDE, bytes.fromhex('0220e649c87129e0'), site)
+    put(img, fn, cave)
+    print(f'disctime: tray_open at {fn:#x}, {len(cave)} bytes')
+
+
+def patch_play(img):
+    cave, labels = assemble(PLAY_KEY, cave_addr(img))
+    # key 0x2F case in the dispatcher: bl 0x0800E10E -> bl play_key
+    site, _ = assemble([('bl', labels['play_key'])], 0x0800E766)
+    patch(img, 0x0800E766, bytes.fromhex('fff7d2fc'), site)
+    # main loop (powered on): bl 0x08007F30 -> bl play_poll
+    site, _ = assemble([('bl', labels['play_poll'])], 0x08004324)
+    patch(img, 0x08004324, bytes.fromhex('03f004fe'), site)
+    # standby entry 0x0800A7E0: bl 0x08008B04 -> bl play_standby
+    site, _ = assemble([('bl', labels['play_standby'])], 0x0800A7E2)
+    patch(img, 0x0800A7E2, bytes.fromhex('fef78ff9'), site)
+    put(img, labels['play_key'], cave)
+    print(f"play: play_key at {labels['play_key']:#x}, {len(cave)} bytes")
+
+
+# Diagnostic (IR_DIAG_ON only), called after each display update.
+IR_SHOW = [
+    # ir_show(): diagnostic - once an IR command has been seen (IR_DIAG, set
+    # by key_hook in the brightness patch), show it as "IRxx" on line 1.
+    'ir_show:',
+    ('ldr_lit', 'r1', 'lit_ir_diag'),
+    ('ldrb', 'r2', 'r1', 0),
+    ('cbz', 'r2', 'ir_show_done'),
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r3', 'lit_line1'),
+    ('movs', 'r0', 0x49),            # 'I'
+    ('strb', 'r0', 'r3', 0),
+    ('movs', 'r0', 0x52),            # 'R'
+    ('strb', 'r0', 'r3', 1),
+    ('lsrs', 'r0', 'r2', 4),
+    ('bl', 'hex_digit'),
+    ('strb', 'r0', 'r3', 2),
+    ('movs', 'r0', 15),
+    ('ands', 'r0', 'r2'),
+    ('bl', 'hex_digit'),
+    ('strb', 'r0', 'r3', 3),
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r3', 4),
+    ('ldr_lit', 'r1', 'lit_ui'),
+    ('ldr', 'r0', 'r1', 8),          # line 1 label
+    ('mov', 'r1', 'r3'),
+    ('bl', LABEL_SET_TEXT),
+    ('pop', reglist('r4', pc=True)),
+    'ir_show_done:',
+    ('bx_lr',),
+    'hex_digit:',
+    ('adds_i8', 'r0', 0x30),
+    ('cmp', 'r0', 0x39),
+    ('bls', 'hex_done'),
+    ('adds_i8', 'r0', 7),
+    'hex_done:',
+    ('bx_lr',),
+]
+
+
+# fmt_time(): line 2 time during play/pause/seek. Elapsed track time, or in
+# remaining mode track length - elapsed (falls back to elapsed while the
+# length is unknown).
+FMT_TIME = [
+    'fmt_time:',
+    ('push', reglist('r4', 'r5', lr=True)),
+    ('ldr_lit', 'r3', 'lit_state_f4'),
+    ('ldr', 'r4', 'r3', 0x0C),       # +0x100 elapsed min
+    ('ldrb', 'r5', 'r3', 0x10),      # +0x104 elapsed sec
+    ('ldr_lit', 'r0', 'lit_mode'),
+    ('ldrb', 'r0', 'r0', 0),
+    ('cbz', 'r0', 'show'),
+    ('ldr', 'r1', 'r3', 0x14),       # +0x108 track length min
+    ('ldrb', 'r2', 'r3', 0x18),      # +0x10C track length sec
+    ('movs', 'r0', 60),
+    ('muls', 'r1', 'r0'),
+    ('adds', 'r1', 'r1', 'r2'),      # length in s
+    ('cbz', 'r1', 'show'),
+    ('muls', 'r4', 'r0'),
+    ('adds', 'r4', 'r4', 'r5'),      # elapsed in s
+    ('subs', 'r1', 'r1', 'r4'),
+    ('bpl', 'non_neg'),
+    ('movs', 'r1', 0),
+    'non_neg:',
+    ('udiv', 'r4', 'r1', 'r0'),      # minutes
+    ('muls', 'r0', 'r4'),
+    ('subs', 'r5', 'r1', 'r0'),      # seconds
+    'show:',
+    ('movs', 'r0', 0),
+    ('uxth', 'r1', 'r4'),
+    ('movs', 'r2', 2),
+    ('bl', PUT_NUM_L2),
+    ('movs', 'r0', 2),
+    ('movs', 'r1', 0x2E),            # '.'
+    ('bl', PUT_CHAR_L2),
+    ('movs', 'r0', 3),
+    ('uxth', 'r1', 'r5'),
+    ('movs', 'r2', 2),
+    ('bl', PUT_NUM_L2),
+    ('pop', reglist('r4', 'r5', pc=True)),
+
+    # time_toggle(): DISP/MENU/FN key - flip elapsed <-> remaining, force the
+    # time label to be rewritten and the screen redrawn.
+    'time_toggle:',
+    ('ldr_lit', 'r1', 'lit_mode'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('movs', 'r2', 1),
+    ('subs', 'r0', 'r2', 'r0'),
+    ('strb', 'r0', 'r1', 0),
+    ('ldr_lit', 'r1', 'lit_last_min'),
+    ('movs', 'r0', 0xFF),
+    ('str', 'r0', 'r1', 0),
+    ('ldr_lit', 'r1', 'lit_redraw'),
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 0),
+    ('bx_lr',),
+
+    # disp_hook(): before every display update, make the time label red in
+    # remaining mode while playing/paused/seeking, white otherwise. Leaves the
+    # colour alone while muted (red "MUTE").
+    'disp_hook:',
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r1', 'lit_mute'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbnz', 'r0', 'disp_orig'),
+    ('movs', 'r4', 0),
+    ('ldr_lit', 'r1', 'lit_mode'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'apply'),
+    ('ldr_lit', 'r1', 'lit_ui_state'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cmp', 'r0', 2),                # volume screen
+    ('beq', 'apply'),
+    ('ldr_lit', 'r1', 'lit_state'),
+    ('ldrb', 'r0', 'r1', 4),         # play state 3/6/7/8
+    ('cmp', 'r0', 3),
+    ('beq', 'want_red'),
+    ('cmp', 'r0', 6),
+    ('beq', 'want_red'),
+    ('cmp', 'r0', 7),
+    ('beq', 'want_red'),
+    ('cmp', 'r0', 8),
+    ('bne', 'apply'),
+    'want_red:',
+    ('movs', 'r4', 1),
+    'apply:',
+    ('ldr_lit', 'r1', 'lit_colour'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cmp', 'r0', 'r4'),
+    ('beq', 'disp_orig'),
+    ('cbz', 'r4', 'set_white'),
+    ('bl', 'red_style'),
+    ('b', 'disp_orig'),
+    'set_white:',
+    ('bl', 'white_style'),
+    'disp_orig:',
+    ('bl', DISPLAY_UPDATE),
+    *([('bl', 'ir_show')] if IR_DIAG_ON else []),
+    ('pop', reglist('r4', pc=True)),
+
+    *(IR_SHOW if IR_DIAG_ON else []),
+
+    # white_style()/red_style(): the firmware's time label styles, recording
+    # which colour is now applied. All original callers are redirected here.
+    'white_style:',
+    ('ldr_lit', 'r1', 'lit_colour'),
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r1', 0),
+    ('b.w', STYLE_WHITE),
+    'red_style:',
+    ('ldr_lit', 'r1', 'lit_colour'),
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 0),
+    ('b.w', STYLE_RED),
+    ('align',),
+    'lit_state:',
+    ('word', CD_STATE),
+    'lit_state_f4:',
+    ('word', CD_STATE + 0xF4),
+    'lit_mode:',
+    ('word', TIME_MODE),
+    'lit_colour:',
+    ('word', TIME_COLOUR),
+    'lit_last_min:',
+    ('word', LAST_SHOWN_MIN),
+    'lit_redraw:',
+    ('word', DISPLAY_REDRAW),
+    'lit_mute:',
+    ('word', MUTE),
+    'lit_ui_state:',
+    ('word', UI_STATE),
+    *(['lit_ir_diag:', ('word', IR_DIAG),
+       'lit_line1:', ('word', LINE1_BUF),
+       'lit_ui:', ('word', UI)] if IR_DIAG_ON else []),
+]
+
+
+# key_hook(): replaces the main loop's call to get_key (0x0800882C).
+# DISP (key 0x14, no function on the PL100) cycles the backlight brightness
+# while powered on. With IR_DIAG_ON, also records the last IR command.
+KEY_HOOK = [
+    'key_hook:',
+    ('push', reglist('r4', lr=True)),
+    ('bl', GET_KEY),
+    ('mov', 'r4', 'r0'),
+] + ([
+    ('cmp', 'r4', 0xFF),
+    ('beq', 'no_diag'),
+    ('ldr_lit', 'r1', 'lit_ir_raw'),
+    ('ldrb', 'r0', 'r1', 0),         # raw IR command, 0 if the key was not IR
+    ('cbz', 'r0', 'no_diag'),
+    ('ldr_lit', 'r1', 'lit_ir_diag'),
+    ('strb', 'r0', 'r1', 0),
+    'no_diag:',
+] if IR_DIAG_ON else []) + [
+    ('cmp', 'r4', 0x14),
+    ('bne', 'key_ret'),
+    ('ldr_lit', 'r1', 'lit_power'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'key_ret'),        # standby: leave it to the standby handler
+    ('bl', 'bright_cycle'),
+    ('movs', 'r4', 0xFF),            # consumed
+    'key_ret:',
+    ('mov', 'r0', 'r4'),
+    ('pop', reglist('r4', pc=True)),
+
+    # bright_cycle(): levels 5,4,3,2,1,0 = 10,20,35,55,65,100 % (active-low
+    # backlight), then back to 5. Level 6 (off) is skipped. Saved like the
+    # settings menu does.
+    'bright_cycle:',
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r4', 'lit_bright'),
+    ('ldrb', 'r0', 'r4', 0),
+    ('cbz', 'r0', 'bright_wrap'),
+    ('cmp', 'r0', 5),
+    ('bhi', 'bright_wrap'),
+    ('subs_i3', 'r0', 'r0', 1),
+    ('b', 'bright_set'),
+    'bright_wrap:',
+    ('movs', 'r0', 5),
+    'bright_set:',
+    ('strb', 'r0', 'r4', 0),
+    ('bl', SET_BRIGHTNESS),
+    ('bl', SCHEDULE_SAVE),
+    ('pop', reglist('r4', pc=True)),
+
+    # bright_load(): replaces the generic 1..6 clamp when the saved brightness
+    # is loaded, so level 0 (100 %) survives a power cycle. Anything else -> 3.
+    'bright_load:',
+    ('cmp', 'r0', 5),
+    ('bls', 'bright_ok'),
+    ('movs', 'r0', 3),
+    'bright_ok:',
+    ('bx_lr',),
+    ('align',),
+    'lit_ir_raw:',
+    ('word', IR_RAW),
+    'lit_ir_diag:',
+    ('word', IR_DIAG),
+    'lit_power:',
+    ('word', POWER_ON),
+    'lit_bright:',
+    ('word', BRIGHTNESS),
+]
+
+
+def patch_brightness(img):
+    cave, lab = assemble(KEY_HOOK, cave_addr(img))
+    # main loop: bl get_key -> bl key_hook
+    code, _ = assemble([('bl', lab['key_hook'])], 0x08004300)
+    patch(img, 0x08004300, bytes.fromhex('04f094fa'), code)
+    # settings load: brightness clamp(val, 7) -> bright_load
+    code, _ = assemble([('bl', lab['bright_load'])], 0x08006EBC)
+    patch(img, 0x08006EBC, bytes.fromhex('fff778fe'), code)
+    put(img, lab['key_hook'], cave)
+    print(f"brightness: key_hook at {lab['key_hook']:#x}, {len(cave)} bytes"
+          + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
+
+
+def patch_remaining(img):
+    cave, lab = assemble(FMT_TIME, cave_addr(img))
+    # line-2 time in the play/pause (0x0800D70A) and seek (0x0800D77E) branches
+    for site, cont in ((0x0800D70A, 0x0800D730), (0x0800D77E, 0x0800D7A4)):
+        code, _ = assemble([('bl', lab['fmt_time']), ('b', cont)], site)
+        expect = bytes(img[site - BASE:site - BASE + 6])
+        assert expect[2:] == bytes.fromhex('b0f80001'), f'{site:#x}: unexpected code'
+        patch(img, site, expect, code)
+    # key 0x26 case (did only "0x20000186 = 2") -> time_toggle
+    code, _ = assemble([('bl', lab['time_toggle']), ('b', 0x0800ED4C), ('nop',)], 0x0800ED42)
+    patch(img, 0x0800ED42, bytes.fromhex('02200f49088000e0'), code)
+    # MENU and FN are two of IR commands 0x04 / 0x08 / 0x1B (tested: both
+    # toggle when all three give key 0x26; DISP is 0x0C). Until FN_IR is known,
+    # all three toggle; then only FN does and MENU goes back to doing nothing.
+    originals = {0x04: 0x26, 0x08: 0x5C, 0x1B: 0x31}  # 0x5C, 0x31: no-op keys
+    for ir, key in originals.items():
+        if FN_IR is None or ir == FN_IR:
+            new = 0x26
+        else:
+            new = 0x5C if key == 0x26 else key   # 0x04 is natively 0x26: make it a no-op key
+        if new != key:
+            patch(img, IR_TABLE + ir, bytes([key]), bytes([new]))
+    # display update call in the main task -> disp_hook
+    code, _ = assemble([('bl', lab['disp_hook'])], 0x0800E0B6)
+    patch(img, 0x0800E0B6, bytes.fromhex('fff715fa'), code)
+    # style changes elsewhere: un-mute, after volume display, power-on -> white; mute -> red
+    for site, expect, fn in ((0x08007402, '21f066fe', 'white_style'),
+                             (0x08007EC6, '21f004f9', 'white_style'),
+                             (0x0800A85C, '1ef039fc', 'white_style'),
+                             (0x080073FC, '21f010fe', 'red_style')):
+        code, _ = assemble([('bl', lab[fn])], site)
+        patch(img, site, bytes.fromhex(expect), code)
+    put(img, lab['fmt_time'], cave)
+    print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes")
+
+
+PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
+           'play': patch_play, 'remaining': patch_remaining, 'brightness': patch_brightness}
+# 'play' relies on disctime clearing the disc-ready state when the tray opens
+REQUIRES = {'play': ['disctime']}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('src')
+    ap.add_argument('dst')
+    ap.add_argument('patches', nargs='?', default=','.join(PATCHES))
+    args = ap.parse_args()
+
+    names = args.patches.split(',')
+    for name in list(names):
+        for dep in REQUIRES.get(name, []):
+            if dep not in names:
+                print(f'{name} needs {dep}: adding it')
+                names.insert(names.index(name), dep)
+
+    img = read_hex(args.src)
+    for name in names:
+        PATCHES[name](img)
+    assert BASE + len(img) <= SETTINGS_PAGE
+    write_hex(args.dst, img, line_ending(args.src))
+    print(f'image ends at {BASE + len(img) - 1:#x}')
+
+
+if __name__ == '__main__':
+    main()
