@@ -38,11 +38,14 @@ It is possible to only apply some patches to the original firmware if you do not
 Clone this repository and run:
 
 ```
-build_patch.py <original.hex> <patched.hex> [patch,...]
+build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
 ```
 
 Options for patches are: track, backlight, disctime, play, remaining, brightness. When nothing is
 specified, all patches are applied.
+
+Optionally a version can be supplied. When supplied this version is shown on the splash screen during
+boot, below the SMSL logo and "Ver 1.1". When omitted the splash screen remains unchanged.
 
 ## Preparation before flashing
 

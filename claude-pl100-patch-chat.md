@@ -1334,3 +1334,83 @@ Opus 5.5 · Claude Team
   To build without the icon, set REMAINING_ICON_ON = False and run python3 
   build_patch.py ../IAP_PL100_1v1_b250219.hex out.hex. I left the default on, so
   IAP_PL100_1v1_b250219_all.hex is unchanged.
+
+❯ During boot time it shows the SMSL logo and below that "ver 1.1". Is is       
+  possible to add an additional line "patch vYYYY-MM-DD"? The vYYYY-MM-DD       
+  should be an option given to the python build, so the release workflow can    
+  automatically add the tag as the version shown during boot                    
+
+⏺ I've added a --version option: with it, the boot screen shows a patch 
+  <version> line under "Ver 1.1". It works in the emulator; it hasn't been
+  tested on the player yet. The release workflow now passes the tag:
+
+  python3 build_patch.py --version v2026-10-25 IAP_PL100_1v1_b250219.hex out.hex
+
+  The emulator render shows the result:
+  - Without --version: the original boot screen.
+  - With --version v2026-10-25:
+    - "Ver 1.1" moves up 18 px to make room.
+    - The new line goes below it, centred and in the same font, ending at about
+      x 216, inside the visible area.
+
+  Limits and how it's drawn:
+  - Characters: the boot font has A–Z, a–z, 0–9 and  .:-+=<>/, so no _.
+  - Length: at most 18 characters including "patch ", so a version of up to 12
+    characters.
+  - Spacing: the original text routine uses 13 px per character, which would
+    have pushed patch v2026-10-25 past the visible edge. I draw the line myself
+    at 12 px per character instead.
+  - Bad input: the build stops with a clear message for a version that's too
+    long or uses an unsupported character.
+
+  Checks:
+  - No --version: the output is byte‑identical to your
+    IAP_PL100_1v1_b250219_all.hex.
+  - With --version: only 6 bytes of the original change (at 0x08004B18), plus 66
+    new bytes at the end of the image. Python 3.9 gives the same output.
+  - Workflow step: running its build command locally with
+    GITHUB_REF_NAME=v2026-10-25 works.
+
+  Changes:
+  - build_patch.py: the --version option and the new boot‑screen code,
+    documented in the docstring.
+  - thumbasm.py: three new instruction encodings that the new code needs.
+  - README.md: the build section describes --version.
+  - .github/workflows/release.yml:
+    - Passes --version "$GITHUB_REF_NAME".
+    - Uses python3.
+    - The plain checkout step is enough.
+    - Only runs for tags starting with v, so a tag without the v won't create a
+      release.
+
+  Nothing is committed or pushed. To try it on the player, build with --version
+  into patch/; .hex files are git‑ignored, so it won't end up in the repo.
+
+❯ This doesn't work. When loading this firmware in the flash program            
+  ispV24.exe, there is an error "Index was outside the bounds of the array"     
+
+⏺ I've changed the build so the image always ends on a whole 4‑byte word, and
+  rebuilt patch/IAP_PL100_1v1_b250219_patch_v2026-10-25.hex. That replaced the
+  copy that failed to load. I haven't been able to confirm the fix in
+  ispV2.4.exe; please load the new file in it.
+
+  The cause isn't proven, but the evidence points one way:
+  - The failing file is valid: checksums, record format and CRLF line endings
+    are all correct.
+  - Its size is the only difference: your earlier builds and the original image
+    all end on a 4‑byte boundary. The version text made this one end 2 bytes
+    into a word (it ended at …508D).
+
+  What the build does now:
+  - Padding: after patching, it pads the image with 0xFF (what empty flash
+    contains) up to the next 4‑byte boundary.
+  - Applies to every build: this covers any version text or patch combination,
+    including the release workflow.
+  - No change otherwise: builds that already ended on a word are unaffected; the
+    default build is still identical to the _all.hex you flashed.
+  - Version lengths: v1, v1.2, v2026-10-25 and v2026-10-25b all now end on a
+    word boundary.
+  - Boot screen: the emulated boot screen is unchanged.
+
+  If the tool still shows the error, tell me. The next step would be to pad to
+  16 bytes so there's no partial record at all.

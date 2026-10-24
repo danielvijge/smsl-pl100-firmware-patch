@@ -18,8 +18,8 @@ jobs:
 
       - name: Build firmware
         run: |
-          python3 build_patch.py IAP_PL100_1v1_b250219.hex IAP_PL100_1v1_b250219_patch_$GITHUB_REF_NAME.hex
+          python3 build_patch.py --version "$GITHUB_REF_NAME" IAP_PL100_1v1_b250219.hex "IAP_PL100_1v1_b250219_patch_${GITHUB_REF_NAME}.hex"
 
       - name: Create GitHub release
         run: |
-          gh release create "$GITHUB_REF_NAME" "IAP_PL100_1v1_b250219_patch_$GITHUB_REF_NAME.hex" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          gh release create "$GITHUB_REF_NAME" "IAP_PL100_1v1_b250219_patch_${GITHUB_REF_NAME}.hex" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
