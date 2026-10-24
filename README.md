@@ -6,7 +6,7 @@ It adds the following fixes and enhancements:
 **Enhancements:**
 1. Instead of `Tr03` display `03/09`, where `09` is the total number of tracks on the CD.
 2. Option to change the brightness of the display using six settings using the remote's DISP button.
-3. Toggle between elapsed time and remaining time of a track using the remote's FN button. When displaying remaining time it is displayed in red.
+3. Toggle between elapsed time and remaining time of a track using the remote's FN button. When displaying remaining time it displays an hourglass icon. (If you don't like the icon, it can be toggled off in the python script.)
 
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest standby.
