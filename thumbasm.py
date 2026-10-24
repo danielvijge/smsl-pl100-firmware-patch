@@ -108,6 +108,15 @@ def assemble(prog, base):
                 h = 0x1A00 | reg(a[2]) << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'subs_i3':
                 h = 0x1E00 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
+            elif op == 'str_sp':  # str rt, [sp, #imm]
+                assert a[1] % 4 == 0 and a[1] < 1024
+                h = 0x9000 | reg(a[0]) << 8 | a[1] >> 2
+            elif op == 'add_sp':  # add sp, #imm
+                assert a[0] % 4 == 0 and a[0] < 512
+                h = 0xB000 | a[0] >> 2
+            elif op == 'sub_sp':  # sub sp, #imm
+                assert a[0] % 4 == 0 and a[0] < 512
+                h = 0xB080 | a[0] >> 2
             elif op == 'str':  # str rt, [rn, #imm]
                 assert a[2] % 4 == 0 and a[2] < 128
                 h = 0x6000 | (a[2] >> 2) << 6 | reg(a[1]) << 3 | reg(a[0])

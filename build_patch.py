@@ -59,7 +59,13 @@ Patch 6 - DISP cycles the backlight brightness.
   * IR_DIAG_ON (off by default): show the last received IR command as
     "IRxx" on line 1, e.g. to identify remote buttons.
 
-Usage: build_patch.py <original.hex> <patched.hex> [patch,...]
+Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
+  * The boot screen (0x08004AFA) is drawn straight to the LCD, not through
+    LVGL. "Ver 1.1" moves up a little and the patch line is drawn below it in
+    the same 12x16 font, centred, 12 px per char (max 18 chars).
+  * Without --version the boot screen stays original.
+
+Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
   patches: track, backlight, disctime, play, remaining, brightness (default: all)
 """
 import argparse
@@ -105,6 +111,14 @@ POWER_ON = 0x2000004C      # 1 = on, 0 = standby
 BRIGHTNESS = 0x200004A5    # setting, level 0..6 (saved)
 SET_BRIGHTNESS = 0x08005F70
 SCHEDULE_SAVE = 0x0800A798  # save settings to flash after a short delay
+DRAW_STR = 0x08009A42      # boot screen: (col, row, str, fg, [sp] bg), 13 px per char
+DRAW_CHAR = 0x0800994A     # boot screen: (col, row, ch, fg, [sp] bg), 12x16 glyph
+SPLASH_VER_COL_ORIG, SPLASH_VER_COL = 100, 82  # "Ver 1.1" line (panel column = y)
+SPLASH_PATCH_COL = 104     # patch version line, below "Ver 1.1"
+SPLASH_CENTER_ROW = 116    # horizontal centre of the original "Ver 1.1" (panel row = x)
+SPLASH_ADVANCE = 12        # px per char; draw_str's 13 makes "patch v2026-10-25" too wide
+SPLASH_MAX_CHARS = 18      # 216 px; the screen edge beyond ~x 230 is hidden
+SPLASH_CHARS = set(' .:-+=<>/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
 
 FN_IR = 0x08               # IR command of the FN key (MENU 0x04, FN 0x08, DISP 0x0C; tested)
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
@@ -719,6 +733,61 @@ def patch_remaining(img):
           + (' (with hourglass icon)' if REMAINING_ICON_ON else ' (no icon)'))
 
 
+# splash_hook(): draws the original "Ver 1.1" line, then the patch version
+# line below it. Replaces the bl draw_str at 0x08004B1A, so r0-r3 still hold
+# the original arguments.
+def splash_hook(text, row):
+    return [
+        'splash_hook:',
+        ('push', reglist('r4', 'r5', 'r6', lr=True)),
+        ('sub_sp', 8),
+        ('movs', 'r4', 0),
+        ('str_sp', 'r4', 0),             # background: black
+        ('bl', DRAW_STR),
+        ('ldr_lit', 'r4', 'lit_text'),
+        ('movs', 'r5', row),
+        'next_char:',
+        ('ldrb', 'r2', 'r4', 0),
+        ('cbz', 'r2', 'done'),
+        ('movs', 'r0', SPLASH_PATCH_COL),
+        ('mov', 'r1', 'r5'),
+        ('ldr_lit', 'r3', 'lit_white'),
+        ('bl', DRAW_CHAR),
+        ('adds_i8', 'r4', 1),
+        ('adds_i8', 'r5', SPLASH_ADVANCE),
+        ('b', 'next_char'),
+        'done:',
+        ('add_sp', 8),
+        ('pop', reglist('r4', 'r5', 'r6', pc=True)),
+        ('align',),
+        'lit_text:',
+        ('word', 'text'),
+        'lit_white:',
+        ('word', 0xFFFF),
+        'text:',
+        ('bytes', text.encode('ascii') + b'\0'),
+    ]
+
+
+def patch_splash(img, version):
+    text = 'patch ' + version
+    bad = sorted(set(c for c in text if c not in SPLASH_CHARS))
+    if bad:
+        raise SystemExit(f'--version: unsupported character(s) {"".join(bad)!r} '
+                         f'(boot screen font has A-Z a-z 0-9 and " .:-+=<>/")')
+    if len(text) > SPLASH_MAX_CHARS:
+        raise SystemExit(f'--version: "{text}" is {len(text)} characters, '
+                         f'at most {SPLASH_MAX_CHARS} fit on the boot screen')
+    row = SPLASH_CENTER_ROW - len(text) * SPLASH_ADVANCE // 2
+    cave, lab = assemble(splash_hook(text, row), cave_addr(img))
+    # "Ver 1.1": column 100 -> 82, to make room for the patch line below it
+    patch(img, 0x08004B18, bytes([SPLASH_VER_COL_ORIG, 0x20]), bytes([SPLASH_VER_COL, 0x20]))
+    code, _ = assemble([('bl', lab['splash_hook'])], 0x08004B1A)
+    patch(img, 0x08004B1A, bytes.fromhex('04f092ff'), code)
+    put(img, lab['splash_hook'], cave)
+    print(f"splash: \"{text}\" at {lab['splash_hook']:#x}, {len(cave)} bytes")
+
+
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'play': patch_play, 'remaining': patch_remaining, 'brightness': patch_brightness}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens
@@ -730,6 +799,7 @@ def main():
     ap.add_argument('src')
     ap.add_argument('dst')
     ap.add_argument('patches', nargs='?', default=','.join(PATCHES))
+    ap.add_argument('--version', help='show "patch VERSION" on the boot screen, e.g. v2026-10-25')
     args = ap.parse_args()
 
     names = args.patches.split(',')
@@ -742,6 +812,11 @@ def main():
     img = read_hex(args.src)
     for name in names:
         PATCHES[name](img)
+    if args.version:
+        patch_splash(img, args.version)
+    # ispV2.4 fails ("Index was outside the bounds of the array") on an image
+    # that is not a whole number of 32-bit words; pad with erased-flash 0xFF
+    img.extend(b'\xff' * (-len(img) % 4))
     assert BASE + len(img) <= SETTINGS_PAGE
     write_hex(args.dst, img, line_ending(args.src))
     print(f'image ends at {BASE + len(img) - 1:#x}')
