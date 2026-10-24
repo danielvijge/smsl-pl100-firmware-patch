@@ -30,6 +30,8 @@ def size(ins):
         return 4
     if op == 'word':
         return 4
+    if op == 'bytes':
+        return len(ins[1])
     if op == 'align':
         return None
     return 2
@@ -69,6 +71,8 @@ def assemble(prog, base):
             out += enc_bl(pc, tgt(a[0]), link=False)
         elif op == 'word':
             out += struct.pack('<I', tgt(a[0]))
+        elif op == 'bytes':
+            out += a[0]
         elif op == 'udiv':  # udiv rd, rn, rm
             out += struct.pack('<HH', 0xFBB0 | reg(a[1]), 0xF0F0 | reg(a[0]) << 8 | reg(a[2]))
         else:

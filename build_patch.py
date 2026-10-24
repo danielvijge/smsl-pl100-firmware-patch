@@ -38,15 +38,16 @@ Patch 4 - Play pressed while the disc is still loading is lost.
     for audio CDs). Opening the tray, no disc, any other play-state change or
     standby cancels it. Needs disctime (added automatically).
 
-Patch 5 - time remaining, shown in red.
-  * Remote key FN (IR 0x08) toggles line 2 between elapsed track time
-    (white) and track time remaining = track length (+0x108/+0x10C) - elapsed
-    (red). MENU (IR 0x04) is mapped to a no-op key so it stays unused.
-  * The red/white label styles are the firmware's own (0x08029020 is used
-    for MUTE, 0x080290D2 is the normal style). A hook before every display
-    update applies red only while playing/paused/seeking in remaining mode,
-    not on the volume screen and never while muted.
-  * Mode and applied colour live in spare bytes 0x20000239 / 0x2000023A.
+Patch 5 - track time remaining, with an hourglass icon.
+  * Remote key FN (IR 0x08) toggles line 2 between elapsed track time and
+    track time remaining = track length (+0x108/+0x10C) - elapsed. MENU
+    (IR 0x04) is mapped to a no-op key so it stays unused.
+  * Indicator: the unused shuffle icon object (ui+0x24, always hidden) gets a
+    30x30 hourglass (icons.py, same format and colour as the repeat icons) and
+    is moved to (52,8), right of the play/pause icon. A hook before every
+    display update shows it in remaining mode while playing/paused/seeking.
+    REMAINING_ICON_ON = False leaves the icon (code, image and hooks) out.
+  * The mode lives in spare byte 0x20000239.
 
 Patch 6 - DISP cycles the backlight brightness.
   * DISP (IR 0x0C, key 0x14) has no function on the PL100. A hook on the main
@@ -64,6 +65,7 @@ Usage: build_patch.py <original.hex> <patched.hex> [patch,...]
 import argparse
 import struct
 
+from icons import hourglass, lv_img_true_color_alpha
 from thumbasm import assemble, reglist
 
 BASE = 0x08004000
@@ -81,16 +83,18 @@ STANDBY_FIRST_CALL = 0x08008B04  # first call made by standby entry 0x0800A7E0
 DISPLAY_REDRAW = 0x2000018C  # set to 1 to refresh the display
 PLAY_PENDING = 0x20000238  # spare byte: key-history buffer of the dead hidden-mode detector
 TIME_MODE = 0x20000239     # spare byte: 0 elapsed, 1 track remaining
-TIME_COLOUR = 0x2000023A   # spare byte: time label colour applied, 0 white / 1 red
 PUT_CHAR_L2 = 0x08006060   # (pos, ch)            -> line2[pos] = ch
 PUT_NUM_L2 = 0x08006090    # (pos, value, ndigits) -> zero-padded digits into line2
-STYLE_WHITE = 0x080290D2   # time label style, white text (normal)
-STYLE_RED = 0x08029020     # time label style, red text (used for MUTE)
 DISPLAY_UPDATE = 0x0800D4E4
 LAST_SHOWN_MIN = 0x20000620  # minutes last written to the time label
-MUTE = 0x2000004E
-UI_STATE = 0x20000178      # 1 main screen, 2 volume screen
 IR_TABLE = 0x0802D213      # IR command -> key code
+SETUP_UI = 0x08028FD8      # GUI-Guider setup_ui(&ui), called once from main
+IMG_SET_SRC = 0x0802600E   # lv_img_set_src(obj, src)
+OBJ_SET_POS = 0x08013F2E   # lv_obj_set_pos(obj, x, y)
+OBJ_SET_SIZE = 0x08015B88  # lv_obj_set_size(obj, w, h)
+OBJ_SET_HIDDEN = 0x08015F4A  # lv_obj_set_hidden(obj, en)
+OBJ_FLAGS = 0x34           # lv_obj_t byte with the hidden flag (bit 4)
+ICON_X, ICON_Y, ICON_SIZE = 52, 8, 30
 IR_RAW = 0x200001E0        # last raw IR command byte (cleared after a timeout)
 IR_DIAG = 0x2000023B       # spare byte: last IR command, for the diagnostic display
 LINE1_BUF = 0x20000860     # line 1 text buffer (10 bytes)
@@ -104,6 +108,7 @@ SCHEDULE_SAVE = 0x0800A798  # save settings to flash after a short delay
 
 FN_IR = 0x08               # IR command of the FN key (MENU 0x04, FN 0x08, DISP 0x0C; tested)
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
+REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
 
@@ -402,6 +407,68 @@ def patch_play(img):
     print(f"play: play_key at {labels['play_key']:#x}, {len(cave)} bytes")
 
 
+ICON_HEADER, ICON_DATA = lv_img_true_color_alpha(hourglass(ICON_SIZE), ICON_SIZE, ICON_SIZE)
+DISP_HOOK_ON = REMAINING_ICON_ON or IR_DIAG_ON
+
+# Hourglass visibility, part of disp_hook (REMAINING_ICON_ON only); r4 = want hidden.
+ICON_VISIBILITY = [
+    ('movs', 'r4', 1),               # want hidden
+    ('ldr_lit', 'r1', 'lit_mode'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'apply'),
+    ('ldr_lit', 'r1', 'lit_state'),
+    ('ldrb', 'r0', 'r1', 4),         # play state 3/6/7/8
+    ('cmp', 'r0', 3),
+    ('beq', 'want_shown'),
+    ('cmp', 'r0', 6),
+    ('beq', 'want_shown'),
+    ('cmp', 'r0', 7),
+    ('beq', 'want_shown'),
+    ('cmp', 'r0', 8),
+    ('bne', 'apply'),
+    'want_shown:',
+    ('movs', 'r4', 0),
+    'apply:',
+    ('ldr_lit', 'r1', 'lit_ui'),
+    ('ldr', 'r0', 'r1', 0x24),       # icon object
+    ('cbz', 'r0', 'disp_orig'),
+    ('mov', 'r2', 'r0'),
+    ('adds_i8', 'r2', OBJ_FLAGS),
+    ('ldrb', 'r2', 'r2', 0),
+    ('lsrs', 'r2', 'r2', 4),         # bit 4 = hidden
+    ('movs', 'r3', 1),
+    ('ands', 'r2', 'r3'),
+    ('cmp', 'r2', 'r4'),
+    ('beq', 'disp_orig'),
+    ('mov', 'r1', 'r4'),
+    ('bl', OBJ_SET_HIDDEN),
+]
+
+UI_SETUP = [
+    # ui_setup(): wraps setup_ui() in main. Turns the unused shuffle icon
+    # object (ui+0x24, always hidden) into the hourglass, right of the
+    # play/pause icon (x 5..44) and left of the repeat icon (x 90).
+    'ui_setup:',
+    ('push', reglist('r4', lr=True)),
+    ('bl', SETUP_UI),
+    ('ldr_lit', 'r1', 'lit_ui'),
+    ('ldr', 'r4', 'r1', 0x24),
+    ('mov', 'r0', 'r4'),
+    ('ldr_lit', 'r1', 'lit_icon'),
+    ('bl', IMG_SET_SRC),
+    ('mov', 'r0', 'r4'),
+    ('movs', 'r1', ICON_X),
+    ('movs', 'r2', ICON_Y),
+    ('bl', OBJ_SET_POS),
+    ('mov', 'r0', 'r4'),
+    ('movs', 'r1', ICON_SIZE),
+    ('movs', 'r2', ICON_SIZE),
+    ('bl', OBJ_SET_SIZE),
+    ('pop', reglist('r4', pc=True)),
+]
+
+
+
 # Diagnostic (IR_DIAG_ON only), called after each display update.
 IR_SHOW = [
     # ir_show(): diagnostic - once an IR command has been seen (IR_DIAG, set
@@ -499,63 +566,21 @@ FMT_TIME = [
     ('strb', 'r0', 'r1', 0),
     ('bx_lr',),
 
-    # disp_hook(): before every display update, make the time label red in
-    # remaining mode while playing/paused/seeking, white otherwise. Leaves the
-    # colour alone while muted (red "MUTE").
-    'disp_hook:',
-    ('push', reglist('r4', lr=True)),
-    ('ldr_lit', 'r1', 'lit_mute'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cbnz', 'r0', 'disp_orig'),
-    ('movs', 'r4', 0),
-    ('ldr_lit', 'r1', 'lit_mode'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cbz', 'r0', 'apply'),
-    ('ldr_lit', 'r1', 'lit_ui_state'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cmp', 'r0', 2),                # volume screen
-    ('beq', 'apply'),
-    ('ldr_lit', 'r1', 'lit_state'),
-    ('ldrb', 'r0', 'r1', 4),         # play state 3/6/7/8
-    ('cmp', 'r0', 3),
-    ('beq', 'want_red'),
-    ('cmp', 'r0', 6),
-    ('beq', 'want_red'),
-    ('cmp', 'r0', 7),
-    ('beq', 'want_red'),
-    ('cmp', 'r0', 8),
-    ('bne', 'apply'),
-    'want_red:',
-    ('movs', 'r4', 1),
-    'apply:',
-    ('ldr_lit', 'r1', 'lit_colour'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cmp', 'r0', 'r4'),
-    ('beq', 'disp_orig'),
-    ('cbz', 'r4', 'set_white'),
-    ('bl', 'red_style'),
-    ('b', 'disp_orig'),
-    'set_white:',
-    ('bl', 'white_style'),
-    'disp_orig:',
-    ('bl', DISPLAY_UPDATE),
-    *([('bl', 'ir_show')] if IR_DIAG_ON else []),
-    ('pop', reglist('r4', pc=True)),
+    # disp_hook(): runs before every display update (only installed when the
+    # icon or the IR diagnostic is enabled). Icon: show the "time remaining"
+    # hourglass (object ui+0x24) in remaining mode while playing/paused/seeking,
+    # hide it otherwise; only calls lv_obj_set_hidden when that changes.
+    *(['disp_hook:',
+       ('push', reglist('r4', lr=True)),
+       *(ICON_VISIBILITY if REMAINING_ICON_ON else []),
+       'disp_orig:',
+       ('bl', DISPLAY_UPDATE),
+       *([('bl', 'ir_show')] if IR_DIAG_ON else []),
+       ('pop', reglist('r4', pc=True))] if DISP_HOOK_ON else []),
 
     *(IR_SHOW if IR_DIAG_ON else []),
 
-    # white_style()/red_style(): the firmware's time label styles, recording
-    # which colour is now applied. All original callers are redirected here.
-    'white_style:',
-    ('ldr_lit', 'r1', 'lit_colour'),
-    ('movs', 'r0', 0),
-    ('strb', 'r0', 'r1', 0),
-    ('b.w', STYLE_WHITE),
-    'red_style:',
-    ('ldr_lit', 'r1', 'lit_colour'),
-    ('movs', 'r0', 1),
-    ('strb', 'r0', 'r1', 0),
-    ('b.w', STYLE_RED),
+    *(UI_SETUP if REMAINING_ICON_ON else []),
     ('align',),
     'lit_state:',
     ('word', CD_STATE),
@@ -563,19 +588,17 @@ FMT_TIME = [
     ('word', CD_STATE + 0xF4),
     'lit_mode:',
     ('word', TIME_MODE),
-    'lit_colour:',
-    ('word', TIME_COLOUR),
     'lit_last_min:',
     ('word', LAST_SHOWN_MIN),
     'lit_redraw:',
     ('word', DISPLAY_REDRAW),
-    'lit_mute:',
-    ('word', MUTE),
-    'lit_ui_state:',
-    ('word', UI_STATE),
+    *(['lit_ui:', ('word', UI)] if DISP_HOOK_ON else []),
     *(['lit_ir_diag:', ('word', IR_DIAG),
-       'lit_line1:', ('word', LINE1_BUF),
-       'lit_ui:', ('word', UI)] if IR_DIAG_ON else []),
+       'lit_line1:', ('word', LINE1_BUF)] if IR_DIAG_ON else []),
+    *(['lit_icon:', ('word', 'icon_dsc'),
+       # lv_img_dsc_t: header, data_size, data
+       'icon_dsc:', ('word', ICON_HEADER), ('word', len(ICON_DATA)), ('word', 'icon_data'),
+       'icon_data:', ('bytes', ICON_DATA)] if REMAINING_ICON_ON else []),
 ]
 
 
@@ -683,18 +706,17 @@ def patch_remaining(img):
             new = 0x5C if key == 0x26 else key   # 0x04 is natively 0x26: make it a no-op key
         if new != key:
             patch(img, IR_TABLE + ir, bytes([key]), bytes([new]))
-    # display update call in the main task -> disp_hook
-    code, _ = assemble([('bl', lab['disp_hook'])], 0x0800E0B6)
-    patch(img, 0x0800E0B6, bytes.fromhex('fff715fa'), code)
-    # style changes elsewhere: un-mute, after volume display, power-on -> white; mute -> red
-    for site, expect, fn in ((0x08007402, '21f066fe', 'white_style'),
-                             (0x08007EC6, '21f004f9', 'white_style'),
-                             (0x0800A85C, '1ef039fc', 'white_style'),
-                             (0x080073FC, '21f010fe', 'red_style')):
-        code, _ = assemble([('bl', lab[fn])], site)
-        patch(img, site, bytes.fromhex(expect), code)
+    if DISP_HOOK_ON:
+        # display update call in the main task -> disp_hook
+        code, _ = assemble([('bl', lab['disp_hook'])], 0x0800E0B6)
+        patch(img, 0x0800E0B6, bytes.fromhex('fff715fa'), code)
+    if REMAINING_ICON_ON:
+        # main: bl setup_ui -> bl ui_setup (set up the hourglass icon object)
+        code, _ = assemble([('bl', lab['ui_setup'])], 0x080042C6)
+        patch(img, 0x080042C6, bytes.fromhex('24f087fe'), code)
     put(img, lab['fmt_time'], cave)
-    print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes")
+    print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes"
+          + (' (with hourglass icon)' if REMAINING_ICON_ON else ' (no icon)'))
 
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
