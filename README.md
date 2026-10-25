@@ -64,7 +64,7 @@ to flash the firmware, this is on a different chip. So even if flashing fails yo
 the original firmware again. However, do understand that this is not a guarantee. You accept the risk by flashing
 this patched firmware.
 
-1. Download the firmware from the [release page].
+1. Download the firmware from the [release page](https://github.com/danielvijge/smsl-pl100-firmware-patch/releases).
 2. Download the [flash utility from SMSL](https://www.smsl-audio.com/upload/portal/undefined/SMSLPL200MCUFW24126.zip). This is the firmware for a different CD player (PL200), but we only need the flash utility contained in the zip file.
 3. Open the zip file. Inside is another zip file named _ISP_PC_EN2.zip_. All these files are needed, so extract them somewhere. There is no need to actually install the program.
 4. Open the program  _ispV2.4.exe_.
