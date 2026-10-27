@@ -1414,3 +1414,653 @@ Opus 5.5 · Claude Team
 
   If the tool still shows the error, tell me. The next step would be to pad to
   16 bytes so there's no partial record at all.
+
+❯ For the time remaining display, there are 3 somewhat weird behaviours,        
+  although eventually they all resolve automatically and the remaining time is  
+  displayed correctly. Are these inherent to the hardware implementation, or    
+  bugs introduced in the patch? All 3 assume the mode is set to time remaining. 
+  1. When inserting a disc and pressing play, the hourglass icon shows, but it  
+  is first time elapsed. It can take anywhere between 10 - 60 seconds to show   
+  the time remaining.                                                           
+  2. When a new track starts playing, sometimes it starts from the track length 
+  of the previous track. After a while it corrects to the time for the current  
+  track.                                                                        
+  3. When the player is off with a disc in the player, switching it on and      
+  pressing play, it first displays the remaining time for the whole disc, and   
+  after a while it switches to the time remaining for the track.                
+
+⏺ The time math in the patch is correct. All three effects come from how the
+  original firmware stores the track length the countdown subtracts from, so
+  they aren't hardware limits. I see three things the patch could improve.
+
+  How the firmware gets the track length
+
+  The CD module sends a message type 0x20 with a minutes/seconds value; the
+  handler is at 0x0800DE02. The same message is used for two things, and the
+  firmware guesses which one it is:
+  - If the disc total (+0x110) is still 0, the value is taken as the disc total.
+  - Otherwise, it's taken as the track length (+0x108/+0x10C).
+
+  Nothing else in the firmware writes the track length or clears it, not even a
+  track change or standby. The original firmware never displayed the track
+  length, so these quirks were invisible until the countdown used it.
+
+  1. Hourglass shown, but the time counts up
+
+  After a disc is inserted, the first 0x20 message is the disc total, and the
+  track length is still 0. To avoid showing a nonsense countdown, the patch then
+  falls back to elapsed time. The module only sends the track length later; you
+  saw 10–60 s.
+
+  The bug in the patch is that the icon doesn't check this. It shows whenever
+  remaining mode is on and the player is playing, even while elapsed time is on
+  screen.
+
+  2. New track starts from the previous track's length
+
+  The firmware keeps the old track length until the module sends the new one.
+  Until then, the patch counts down from the old length. This is stale data that
+  the patch takes at face value.
+
+  3. After switching on, the disc's remaining time is shown
+
+  Standby doesn't clear the disc total. When the player wakes up, the module
+  re‑reads the disc and sends the disc total again. Because the disc total is
+  already set, the firmware's guess files it as the track length, so the
+  countdown runs from the whole disc's length until the real track length
+  arrives.
+
+  What the patch can fix
+
+  ┌───────────────────────────────┬─────────────────────────────────────────┐
+  │              Fix              │                 Effect                  │
+  ├───────────────────────────────┼─────────────────────────────────────────┤
+  │ Show the hourglass only when  │                                         │
+  │ remaining time is actually on │ Fixes 1: icon and time always agree     │
+  │  screen                       │                                         │
+  ├───────────────────────────────┼─────────────────────────────────────────┤
+  │ Forget the track length when  │ Fixes 2: shows elapsed (no hourglass)   │
+  │ the track number changes      │ until the new length arrives, instead   │
+  │                               │ of a wrong countdown                    │
+  ├───────────────────────────────┼─────────────────────────────────────────┤
+  │ Ignore a 0x20 value equal to  │ Fixes 3; a single‑track disc, where     │
+  │ the disc total when storing   │ both are equal anyway, is unaffected    │
+  │ the track length              │                                         │
+  └───────────────────────────────┴─────────────────────────────────────────┘
+
+  None of these makes the countdown start sooner. The wait depends on when the
+  module sends the track length, which I can't control without knowing the
+  module's protocol better. It's possible the regular time message also carries
+  the track length or the disc position in bytes the firmware ignores. The
+  raw‑bytes diagnostic I offered earlier would show that, and could lead to an
+  immediate countdown.
+
+  Should I implement the three fixes, the diagnostic first, or both?
+
+❯ all 3 don't really fix the underlying problem, so a small dyagnistic build    
+  that shows raw-bytes might prove a better path forward.                       
+
+⏺ The diagnostic build is ready: patch/IAP_PL100_1v1_b250219_cd_diag.hex. I
+  checked it in the emulator with fake messages; it hasn't run on the player
+  yet. It has all six patches, but the normal display is replaced by the raw
+  messages from the CD module, so it's only for investigating. Flash _all.hex
+  back afterwards.
+
+  This is the emulator's render with made‑up data
+  (/private/tmp/claude-501/-Users-daniel-Projects-github-pl100/88cfedcb-82b1-4be
+  2-85a7-f37443209b40/scratchpad/out/diag_screen.png):
+
+  ┌──────┬───────────────────────────────────────────────────────────────────┐
+  │ Line │                               Shows                               │
+  ├──────┼───────────────────────────────────────────────────────────────────┤
+  │ 1–2  │ last time message (starts 04 21)                                  │
+  ├──────┼───────────────────────────────────────────────────────────────────┤
+  │ 3–4  │ last length message (starts 04 20)                                │
+  ├──────┼───────────────────────────────────────────────────────────────────┤
+  │ 5–6  │ last other message from the same group, e.g. track info (04 26)   │
+  ├──────┼───────────────────────────────────────────────────────────────────┤
+  │ 7    │ last message of any other kind, e.g. disc/tray status             │
+  ├──────┼───────────────────────────────────────────────────────────────────┤
+  │ 8    │ OK received messages, ER messages dropped for a bad checksum      │
+  │      │ (hex)                                                             │
+  └──────┴───────────────────────────────────────────────────────────────────┘
+
+  Bytes are in hex, alternating white/yellow so each pair is easy to tell apart.
+  The playback controls still work as usual.
+
+  What to film: short videos of the screen, ideally with the remote in view,
+  during:
+  1. Inserting a disc and pressing Play, until the length line shows the track's
+     length (the 10–60 s case).
+  2. A track change, including the moment the new track starts.
+  3. Player off → on with the disc inside → Play.
+  4. Optionally, a minute of normal playback. If ER goes up, that confirms the
+     one‑second skips come from dropped messages.
+
+  I can read the bytes from the video. What I'm looking for is whether the time
+  message, or another frequent message, already carries the track length or the
+  disc position in bytes the firmware ignores. If it does, the countdown can
+  start straight away and the three quirks go away.
+
+  Checks:
+  - Default build unchanged: without --cd-diag the output is still
+    byte‑identical to _all.hex.
+  - Image size: this file ends on a word boundary, so it avoids the flash‑tool
+    error from before.
+  - Build:
+    - New --cd-diag flag in build_patch.py.
+    - Two new instruction encodings in thumbasm.py.
+    - Python 3.9 gives the same output.
+
+  Possible issues:
+  - Text size: the 12×16 text is small, so film close up.
+  - Screen edges: if the top or bottom line is hidden behind the front panel
+    window, tell me and I'll move the lines.
+
+❯ For test 1, the film is in the file diag_01.mov Is this good, and can it      
+  already provide some indication. Based on this, what can be deducted? And     
+  does it make sense to film the other diagnostic cases?                        
+
+⏺ Yes, the video works. At 640×360 the bytes are still readable once I crop the
+  display out of each frame. If you can, film at 1080p; a few frames were
+  borderline.
+
+  What the video shows
+
+  ┌────────────────┬────────────────────────────────────────────────────────┐
+  │ Time in video  │              Messages from the CD module               │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 5–9 s          │ Length message 04 20 01 01 00 FF FF 00 2E 27 22 =      │
+  │ (loading)      │ 46:39, the whole disc. Track count: 9.                 │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 10 s (playback │ First time message, track 1 at 0:01. A new length      │
+  │  starts)       │ message at the same moment: 04 20 01 01 01 00 01 00 06 │
+  │                │  16 0C = 6:22, track 1                                 │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 10–89 s        │ Time message once per second (0:11, 0:36, 1:01,        │
+  │                │ 1:19…), nothing else changes                           │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ End            │ OK 0x89, ER 0006                                       │
+  └────────────────┴────────────────────────────────────────────────────────┘
+
+  What can be concluded
+
+  1. The length message says which track it's for. The byte the firmware ignores
+     (buffer +0x93) is 00 for the whole‑disc length and 01 for track 1. The
+     bytes after it also differ (FF FF vs 00 01). So the firmware's guess ("if
+     no disc total yet, it's the disc total") isn't needed; the patch could read
+     the message directly. That would fix quirk 3 (the disc total misread as
+     the track length after switching on). It would also prevent quirk 2: a
+     length that belongs to another track would simply not be used. This needs
+     confirming on a track change, where the byte should read 02 for track 2.
+  2. The module sends very little: about one message per second in total, almost
+     all time messages. There's no "remaining" or disc‑position field in the
+     first 18 bytes of the time message, which is as much as the diagnostic
+     shows. Bytes 14–17 stay 00 00 FF FF.
+  3. The one‑second skips are explained. 6 of about 85 messages (~7 %) failed
+     the checksum and were dropped. A dropped time message means the display
+     jumps 2 seconds.
+  4. Quirk 1 didn't happen here. The track length arrived together with the
+     first time message, so the countdown would have started almost right away.
+     The 10–60 s delay you've seen probably happens when that one length message
+     is among the ~7 % lost. The module then seems to send it again later, but
+     I can't confirm that yet.
+  5. The firmware has a command to request a length message. It's command 0x21,
+     which sends class 4 / type 0x20 / 01, and the firmware sends it once after
+     loading. If the module also answers it with the current track's length, the
+     patch could request it at every track change and on every checksum error,
+     and the countdown would never wait.
+
+  Should you film the other cases? Yes, especially the track change (case 2) and
+  switching on (case 3). But the current diagnostic has one blind spot: when a
+  message repeats with identical content, nothing on screen changes, so I can't
+  see whether the length message is re‑sent or how often. I'd first make a small
+  change to the diagnostic build, replacing the less useful bottom line:
+  - Count length messages and time messages separately, so repeats are visible.
+  - Show the track length and disc total as the firmware has stored them,
+    exactly what the countdown uses, so a wrong value is visible.
+  - Keep the error count.
+
+  With that, one video per case answers the open questions: whether the length
+  message is re‑sent, whether the track byte reads 02 on track 2, and what
+  happens after switching on.
+
+  Want me to make that version?
+
+❯ yes    
+
+⏺ The updated diagnostic is ready: patch/IAP_PL100_1v1_b250219_cd_diag.hex (same
+  file name, replaced). I've checked it in the emulator; it hasn't run on the
+  player yet.
+
+  What's on screen now (emulator render with test data:
+  /private/tmp/claude-501/-Users-daniel-Projects-github-pl100/88cfedcb-82b1-4be2
+  -85a7-f37443209b40/scratchpad/out/diag2_screen.png):
+
+  ┌──────────┬──────────────────────────────────────────────────────────────┐
+  │   Line   │                            Shows                             │
+  ├──────────┼──────────────────────────────────────────────────────────────┤
+  │ 1–2      │ last time message (04 21 …)                                  │
+  ├──────────┼──────────────────────────────────────────────────────────────┤
+  │ 3–4      │ last length message (04 20 …)                                │
+  ├──────────┼──────────────────────────────────────────────────────────────┤
+  │ 5–6      │ last other message from the module (e.g. 04 45, 04 24)       │
+  ├──────────┼──────────────────────────────────────────────────────────────┤
+  │ 7 (cyan) │ 20=xx 21=xx ER=xx: number of length messages, time messages  │
+  │          │ and checksum errors (hex)                                    │
+  ├──────────┼──────────────────────────────────────────────────────────────┤
+  │ 8        │ TR mm:ss DI mm:ss: track length and disc total as the        │
+  │ (green)  │ firmware stored them, which is what the countdown uses       │
+  └──────────┴──────────────────────────────────────────────────────────────┘
+
+  Lines 7 and 8 update with every message. If 20= goes up while lines 3–4 stay
+  the same, the module has re‑sent the length message.
+
+  A bug I caught before it reached you: my first version of the new counters
+  overwrote a register. Incoming messages would have been copied to a wrong RAM
+  address, which could corrupt memory on the player. The emulator showed it as
+  missing hex lines. It's fixed, and the emulator now also checks that the
+  diagnostic writes nothing outside its own RAM area and the stack.
+
+  Checks:
+  - The normal build is still byte‑identical to _all.hex.
+  - The diagnostic file matches the emulated build.
+  - Python 3.9 gives the same output.
+
+  What to film (1080p if possible, start a few seconds before each action):
+  1. Track change: let a track run out, or press Next. Keep filming until line
+     8's TR shows the new track's length, however long that takes. This shows
+     whether the length message arrives at the start of the new track or only
+     after the module re‑sends it.
+  2. Switching on: player off with a disc inside → on → Play. This shows what
+     the module sends after wake‑up, and whether DI ends up in TR.
+  3. Optional, case 1 again: insert a disc and press Play while it's still
+     loading, the way the 10–60 s delay happened before.
+
+  Watch ER during these. A length message lost to a checksum error is my main
+  suspect for the long waits.
+
+❯ Video in diag_02.mp4. This starts playing at track 4 and changes to track 5   
+
+⏺ I read the video second by second; here's what happens.
+
+  ┌─────────┬───────────────────────────────┬──────────────────────────────┐
+  │ Video   │             Event             │    Length messages (20=)     │
+  │  time   │                               │                              │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ 1–4 s   │ Stopped, disc loaded          │ #1: whole disc, 45:06 (byte  │
+  │         │                               │ 4 = 00, track = FF)          │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ 5 s     │ Play, track 4 starts          │                              │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ 7 s     │                               │ #2: track 4, 0:32            │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ ≈28 s   │                               │ #3: track 4 again, 0:32      │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ 35–39 s │ Gap before track 5: time      │                              │
+  │         │ counts down 0:03 → 0:00       │                              │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ 40 s    │ Track 5 at 0:00               │ TR still shows 0:32          │
+  ├─────────┼───────────────────────────────┼──────────────────────────────┤
+  │ ≈51 s   │ Track 5 at 0:11               │ #4: track 5, 1:12            │
+  └─────────┴───────────────────────────────┴──────────────────────────────┘
+
+  ER stayed at 01 throughout, so no length message was lost.
+
+  What this tells us
+
+  1. The module sends the track length on a timer, about every 22 s (t = 7,
+     28, 51). It doesn't send it when a track starts. At the start of track 4 a
+     timer tick happened to come 2 s after Play. Track 5 had to wait 11 s, plus
+     the 4 s gap. That fully explains the behaviour you saw:
+     - Case 2: the previous track's length is kept for up to about 22 s (here 15
+       s).
+     - Case 1: the same wait. Up to about 22 s normally, roughly 44 s or more if
+       a tick is lost to a checksum error (about 7 % of messages are).
+  2. The length message says what it describes. Byte 4 is 00 for the whole disc
+     and 01 for a track, and byte 6 is the track number (FF for the disc, 04,
+     05). In video 1, byte 6 was 01 for track 1 as well. The firmware ignores
+     both bytes and just guesses, which is what causes case 3. The patch can
+     read them and file each length correctly.
+  3. Time message: byte 10 is the track and bytes 12/13/14 are min/sec/frames.
+     In the gap before a track, the time counts down. There's still nothing that
+     holds the remaining time or the position on the disc.
+
+  Two ways to fix it
+
+  - A. Correct but slow (certain to work): use bytes 4 and 6. Only use a length
+    when it belongs to the current track. On a track change, show elapsed time
+    without the hourglass until the right length arrives. Nothing wrong is ever
+    shown, but after each track change you see elapsed time for up to about 22
+    s.
+  - B. Ask the module (needs one more test): the firmware has a command that
+    sends [04 20 01], matching the length message. It already sends it once
+    after loading, and the module then replies with the disc total. If the patch
+    sends it at every track change and the module replies straight away with
+    the current track's length, the countdown starts within a second. I don't
+    know yet whether it answers with the track or always with the disc total.
+
+  Next step: one more diagnostic build, v3, that sends this request whenever the
+  track number changes. Film one track change. If 20= goes up within a second
+  and line 3 shows the new track number, B works and I'll build the real fix
+  around it. Otherwise, I'll build A.
+
+  The test is low‑risk, because it's a command the original firmware already
+  sends to the module. If you also film switching on with a disc inside (case 3)
+  in the same session, that confirms point 2.
+
+  Should I build v3?
+
+❯ yes, build v3                                                                 
+
+⏺ Diagnostic v3 is ready: patch/IAP_PL100_1v1_b250219_cd_diag.hex (replaced). It
+  works in the emulator; it hasn't run on the player yet.
+
+  What's new: whenever the current track number changes, including the first
+  Play, it sends the module one request ([04 20 01]). That's the firmware's own
+  command, which it normally only sends after loading a disc. Line 7 now reads
+  20=xx 21=xx Exx Rx:
+  - R counts the requests sent.
+  - E is the checksum‑error count; it used to be ER=.
+  - The OK count is gone; it wasn't needed any more.
+
+  What to film:
+  1. A track change, e.g. by pressing Next, or let a short track run out like in
+     the last video. Start a few seconds before.
+  2. Switching on with a disc inside, then Play (case 3).
+
+  How to read the result: watch R go up, then look at the next second or two:
+  - The request works: 20= also goes up and line 3 shows 04 20 01 01 01 00 <new 
+    track> …. Then the fixed patch can always fetch the length straight away.
+  - The module returns the disc total: 20= goes up, but line 3 shows … 00 FF FF 
+    …. Then the request only returns the disc total, and I'll build the fix that
+    reads the track number from each length message instead. Wrong lengths go
+    away, but you'll still sometimes see elapsed time for up to ~22 s after a
+    track change.
+  - No answer: 20= doesn't move until the regular ~22‑second message. Same fix
+    as above.
+
+  Checks:
+  - Emulator:
+    - On the track sequence 0 → 4 → 4 → 5 → 5 → 5 → 1, a request is sent exactly
+      at 4, 5 and 1.
+    - Nothing is written outside the diagnostic's own RAM area or the stack.
+  - Builds:
+    - The normal build is still byte‑identical to _all.hex.
+    - The flashed file matches the emulated one.
+    - Python 3.9 gives the same output.
+
+  Building it hit two limits of my small assembler: data constants have to sit
+  within 1 KB of the code using them, and byte offsets can't exceed 31. The
+  script now places a copy of the constants after each section. Both limits made
+  the build stop with an error rather than produce wrong code.
+
+❯ The videos are ready. Case 1 is diag_v3_01.mp4, case 2 is diag_v3_02.mp4. For 
+  case 1 it plays track #4 and goes to track #5. For case 2 it starts at the    
+  beginning with track #1.                                                      
+  Some information about the cd, from a computer cd player. The disc contains   
+  50 tracks. Track #1 is 01:02, track #4 is 00:34, track #5 is 01:14. The total 
+  length is 45:07.                                                              
+
+⏺ Both videos answer the question, and the answer is no: the request doesn't
+  produce the track length.
+
+  What happened
+
+  Video: 1 (track 4 → 5)
+  Moment: Each request (R goes up)
+  Length messages: The module answers within ~1 s, but always with the disc 
+  total
+  (… 00 FF FF 00 2D 06 46 = 45:06). The firmware then files it as the track
+  length: TR 45:06.
+  ────────────────────────────────────────
+  Video:
+  Moment: Around 26–30 s (track 4) / 47 s (track 5, 8 s in)
+  Length messages: The real track lengths 0:32 and 1:12 arrive only with the
+  module's own periodic message
+  ────────────────────────────────────────
+  Video: 2 (switching on)
+  Moment: 6 s, just after the logo
+  Length messages: Disc entry with time 00 00 00 (module still starting up)
+  ────────────────────────────────────────
+  Video:
+  Moment: 10 s
+  Length messages: Disc total 45:06 → filed as the track length: TR 45:06. This
+  is exactly your case 3.
+  ────────────────────────────────────────
+  Video:
+  Moment: Track 1 plays from about 12 s; the request at that point got no answer
+
+  at all
+  Length messages:
+  ────────────────────────────────────────
+  Video:
+  Moment: About 33–36 s, 22 s into track 1
+  Length messages: First real length: track 1, 1:00
+
+  Conclusions
+
+  1. Asking the module doesn't help. Command 0x21 only returns the disc total,
+     and the original firmware has no other command that asks for a track
+     length. I could try guessing variants of the command, but I don't recommend
+     sending made‑up commands to the CD module.
+  2. The track length only comes with the periodic message, about every 22 s. So
+     after a track starts, it takes 0–22 s before the right length is known;
+     video 2 shows the worst case. This is how the module works and the patch
+     can't speed it up.
+  3. All three quirks come from the firmware's guesswork. Each length message
+     says what it describes: byte 4 is 00 for the disc and 01 for a track, and
+     byte 6 is the track number. The firmware ignores this. Using it fixes cases
+     2 and 3 completely.
+  4. The module's lengths are 2 s shorter than your computer's (0:32 vs 0:34,
+     1:12 vs 1:14, 1:00 vs 1:02). The module counts up to the start of the 2 s
+     gap before the next track, while the computer includes the gap. So the
+     countdown reaches 0:00, and then the next track's gap counts down 0:02 →
+     0:00 (we saw that in the video). That's correct.
+
+  Proposed fix: replaces the current guesswork in the remaining patch
+  - Disc total: filed only from messages with byte 4 = 00.
+  - Track length: filed only from messages with byte 4 = 01, together with their
+    track number.
+  - The countdown and hourglass only appear when the stored length belongs to
+    the track that's playing. Otherwise you see the normal elapsed time without
+    the hourglass. So:
+    - Case 1: elapsed until the length arrives (0–22 s), then the countdown with
+      the hourglass. Never a wrong number.
+    - Case 2: the previous track's length is never used.
+    - Case 3: the disc total never ends up as the track length.
+  - Optional: remember each length per track number in spare RAM. Replaying a
+    track, e.g. with repeat or Previous, then counts down immediately.
+
+  The remaining compromise is the elapsed time shown at the start of each track.
+  Instead of elapsed time, it could show --:-- until the length is known. Which
+  do you prefer, and should I build the fix?
+
+❯ Then it's best to leave it as it was. If remaining time is activated, the     
+  icon always shows, and at the beginning the time can be incorrect. So the     
+  hourglass icon indicates the mode that is currently active, not necessarily   
+  the information that is displayed on the screen.                              
+  But I do need another change. I want to swap the functions of the DISP and FN 
+  buttons. DISP should toggle elapsed/remaining time, and FN should change      
+  brightness.                                                                   
+
+⏺ The buttons are swapped: DISP now toggles elapsed/remaining time and FN cycles
+  the brightness. The new build is patch/IAP_PL100_1v1_b250219_all_v2.hex; I
+  haven't tried it on the player. Your current _all.hex is unchanged, so you can
+  go back to it.
+
+  I left the countdown and hourglass as they are, as you decided.
+
+  What changed in build_patch.py
+  - Settings: FN_IR is replaced by one setting per function, next to the other
+    options:
+  TIME_IR = 0x0C             # elapsed / remaining time toggle: DISP
+  BRIGHT_IR = 0x08           # brightness cycle: FN
+  - Remap: a new remap_buttons() builds the whole IR remap from those two
+    settings. Any other button that would trigger one of the two functions is
+    mapped to a do‑nothing key; this keeps MENU unused.
+  - Swapping back: exchange the two values. The time and brightness code itself
+    didn't change.
+
+  Resulting mapping
+
+  ┌────────────────┬───────────────────┬───────────────────┐
+  │     Button     │ Original firmware │     New build     │
+  ├────────────────┼───────────────────┼───────────────────┤
+  │ MENU (IR 0x04) │ key 0x26          │ no function       │
+  ├────────────────┼───────────────────┼───────────────────┤
+  │ FN (IR 0x08)   │ no function       │ brightness        │
+  ├────────────────┼───────────────────┼───────────────────┤
+  │ DISP (IR 0x0C) │ no function       │ elapsed/remaining │
+  └────────────────┴───────────────────┴───────────────────┘
+
+  Checks
+  - With the old assignment (FN = time, DISP = brightness), the script still
+    produces your current _all.hex byte for byte.
+  - The new build differs from _all.hex in exactly two bytes, the IR table
+    entries for FN and DISP. The size is the same and the line endings are CRLF.
+  - Building with only brightness or only remaining also maps the buttons
+    correctly.
+  - Python 3.9 gives the same output.
+
+  Also updated: the README's feature list (FN = brightness, DISP = time toggle,
+  and the hourglass shows whenever remaining‑time mode is on) and the docstring.
+
+  Not changed: the diagnostic build (--cd-diag) still contains the
+  length‑request experiment from v3. It's only built when the flag is given, so
+  it doesn't affect the normal firmware. I can remove it or reset it to the v2
+  behaviour if you'd like it cleaned up before you commit.
+
+❯ Add the diagnostic build to a git branch so it is saved. Commit this with the 
+  message "Diagnostic build for remaining time". Then remove the diagnostic     
+  changes for the main branch. No need to commit on main just yet.              
+
+⏺ The diagnostic build is committed on its own branch, and main now has only the
+  DISP/FN swap, uncommitted.
+
+  Branch diagnostic-remaining-time (commit 82b04f8, "Diagnostic build for
+  remaining time"):
+  - Contents: the diagnostic exactly as you tested it, based on the last main
+    commit, without the button swap. It changes build_patch.py and thumbasm.py;
+    the latter gets two extra instruction encodings the diagnostic needs.
+  - Checks: this version rebuilds the _cd_diag.hex you flashed for the v3 videos
+    byte for byte, and its normal build is identical to your original _all.hex.
+
+  main (no commit):
+  - Contents: README.md and build_patch.py hold only the DISP/FN swap. All
+    diagnostic code and the --cd-diag option are removed, and thumbasm.py is
+    back to the last commit.
+  - Checks: the normal build reproduces _all_v2.hex. --cd-diag is now rejected,
+    and --version still works.
+
+  Nothing was pushed; the branch exists only locally. Copies of the files from
+  before the split are in /private/tmp/claude-501/-Users-daniel-Projects-github-
+  pl100/88cfedcb-82b1-4be2-85a7-f37443209b40/scratchpad/gitwork/full/. The .hex
+  files in patch/ are git‑ignored, so _cd_diag.hex and _all_v2.hex stay where
+  they are, outside the repo.
+
+
+❯ For future changes, no need to change README.md, I'll do that myself          
+
+⏺ Understood. From now on I'll leave README.md alone; if a change affects what
+  it describes, I'll say so in my reply instead. I've saved this as a note for
+  future sessions too.
+
+  The README edit I already made for the DISP/FN swap is still uncommitted on
+  main (the button descriptions in the feature list). Keep it, adjust it, or
+  undo it with git checkout README.md.
+
+❯ For the brightness change, is there anything in the existing settings menu    
+  that shows a UI when the brightness is changed? It would be good to show      
+  something on the screen what the brightness setting is after pressing the     
+  button. If the settngs menu already has something, maybe this can be reused.  
+
+⏺ After each FN press, line 1 (where 03/09 normally is) now shows the new
+  brightness as a percentage for about 2 seconds. The build is
+  patch/IAP_PL100_1v1_b250219_all_v3.hex. I tested it in the emulator; it hasn't
+  run on the player yet.
+
+  What the existing firmware had
+  - Menu brightness screen: the settings menu has one ("LEVEL1"…"LEVEL9"), but
+    nothing calls it. It also draws straight to the LCD the old way, and LVGL
+    would immediately draw over it, so I couldn't reuse it.
+  - Reused instead: the way volume is shown, a temporary value in the line‑1
+    label. I didn't use volume's method of pausing the whole display update,
+    because that would also freeze the time. The percentage replaces only line
+    1, so the time keeps running.
+
+  How it works
+  - On a press: besides stepping the level, FN starts a counter of 250 display
+    updates, about 2 seconds. Each press restarts it.
+  - While the counter runs: right after each display update, a small hook puts
+    the text for the current level into line 1. When the counter runs out, the
+    firmware's next update shows the track number again; every path through the
+    display update rewrites line 1 each time.
+  - Sequence: 35 % → 55 % → 65 % → 100 % → 10 % → 20 % → 35 %, …
+  - Spare RAM: two bytes of the dead settings menu's cursor (0x20000294), which
+    are 0 after boot.
+
+  Checks
+  - Emulator:
+    - Each press shows the right text on the line‑1 label.
+    - The text is set for 249 ticks after a press, then never again, and before
+      any press it's never set.
+    - The firmware's own timer check still gets its original argument, and its
+      result is passed back unchanged.
+    - Other keys pass through, and in standby FN does nothing.
+    - Nothing is written outside the brightness setting, the counter and the
+      stack.
+  - Build: compared with _all_v2.hex, only brightness code changed: the patch's
+    code in the free flash area, the new hook (0x0800E0BC), and one call that
+    points to code which moved. Python 3.9 gives the same output.
+
+  Things to check on the device
+  - Duration: the timer tick is somewhere between 7.5 and 10 ms, so the text
+    shows for 1.9–2.5 s. If you want it longer or shorter, change
+    BRIGHT_OSD_TICKS = 250.
+  - Position: 100% is the widest text. It should fit in the space that 03/09
+    uses, but tell me if it gets cut off.
+
+  All changes are in build_patch.py and thumbasm.py (two new instruction
+  encodings). Nothing is committed. The README's feature list doesn't mention
+  the on‑screen percentage yet; I've left that to you.
+
+❯ It works, but the brightness stays on the screen for around 10 seconds. Can   
+  be less, like the 2.5s mentioned. So maybe something about the timing was     
+  wrong?                                                                        
+
+⏺ Yes, the timing assumption was wrong, and it's fixed. The new build is
+  patch/IAP_PL100_1v1_b250219_all_v4.hex; I tested it in the emulator, not yet
+  on the player.
+
+  What was wrong: I counted display updates and assumed one per 7.5–10 ms timer
+  tick. But the display update runs only once per pass of the firmware's main
+  loop, and a pass takes about 40 ms, mostly the screen drawing. Ticks that
+  happen in between are merged into one. So 250 updates came to about 10 s,
+  which matches what you saw.
+
+  The fix: the duration is now measured on a real clock instead of counting
+  updates.
+  - Clock: the timer interrupt runs every 7.5 ms (96 MHz / 72 / 10000, from the
+    start‑up clock settings) and already advances a counter (0x20000560) every
+    10 ticks, so every 75 ms. Nothing else writes that counter.
+  - On FN press: store "end = clock + 33" (33 × 75 ms ≈ 2.5 s) and set an
+    "active" flag.
+  - On each display update: show the percentage until the end time is reached,
+    then clear the flag so the track number comes back. The duration no longer
+    depends on how fast the main loop runs.
+  - Clock wrap: the counter wraps every 81 minutes. The flag stops the text from
+    flashing up at that moment, and a press just before the wrap also works.
+
+  Checks:
+  - Emulator, with the clock simulated: after a press the text shows for exactly
+    33 clock steps (2.475 s), with several display updates per step, and never
+    after that. The flag is cleared. The same holds for a press just before the
+    clock wraps. Nothing is shown at boot or at a later wrap without a press,
+    and nothing is written outside the brightness setting, the timer bytes and
+    the stack.
+  - Build: compared with v3, only brightness code changed. The written file
+    matches the emulated build, and Python 3.9 gives the same output.
+
+  To change the duration, adjust BRIGHT_OSD_STEPS = 33 (steps of 75 ms). Nothing
+  is committed.

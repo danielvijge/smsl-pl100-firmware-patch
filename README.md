@@ -5,8 +5,20 @@ It adds the following fixes and enhancements:
 
 **Enhancements:**
 1. Instead of `Tr03` display `03/09`, where `09` is the total number of tracks on the CD.
-2. Option to change the brightness of the display using six settings using the remote's DISP button.
-3. Toggle between elapsed time and remaining time of a track using the remote's FN button. When displaying remaining time it displays an hourglass icon. (If you don't like the icon, it can be toggled off in the python script.)
+2. Option to change the brightness of the display using six settings using the remote's FN button. The brightness
+percentage is shown on the screen, briefly replacing the track number, similar to the volume indicator.
+3. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining time it displays an hourglass icon. (If you don't like the icon, it can be toggled off in the python script.)
+
+There are a couple of bugs/weird things with the time remaining display:
+* It can take anywhere between 0 and 60+ seconds for the remaining time to show. Until that time the elapsed time is displayed.
+* On track change it might first count down from the time of the previous track. Again, after a while it becomes correct.
+* Powering on the player with a disc inserted and playing it will first count down from the total disc time, not the track time.
+All this is not a bug in this firmware, but is inherent to how the hardware is implemented. This only sends a track
+update around every 22 seconds. And a message can be corrupted, missing an update.
+Corrupted messages are also the reason that sometimes a time change is not shown, and it can jump from 00:31 to 00:33.
+I did quite some diagnostics to try to find out if this could be changed, and apparently the answer is no. The full
+results can be read in [claude-pl100-patch-chat.md](claude-pl100-patch-chat.md) (line 1500 and onwards). The diagnostic
+build script is available in the `diagnostic-remaining-time` git branch.
 
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest standby.
