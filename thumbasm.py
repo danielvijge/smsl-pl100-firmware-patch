@@ -111,6 +111,11 @@ def assemble(prog, base):
             elif op == 'str_sp':  # str rt, [sp, #imm]
                 assert a[1] % 4 == 0 and a[1] < 1024
                 h = 0x9000 | reg(a[0]) << 8 | a[1] >> 2
+            elif op == 'ldr_sp':  # ldr rt, [sp, #imm]
+                assert a[1] % 4 == 0 and a[1] < 1024
+                h = 0x9800 | reg(a[0]) << 8 | a[1] >> 2
+            elif op == 'orrs':  # orrs rdn, rm
+                h = 0x4300 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'add_sp':  # add sp, #imm
                 assert a[0] % 4 == 0 and a[0] < 512
                 h = 0xB000 | a[0] >> 2

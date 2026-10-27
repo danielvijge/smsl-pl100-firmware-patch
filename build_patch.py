@@ -65,7 +65,12 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
     the same 12x16 font, centred, 12 px per char (max 18 chars).
   * Without --version the boot screen stays original.
 
-Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
+CD module diagnostic (--cd-diag) - for investigation only, not for normal use.
+  * Instead of the normal display, shows the raw bytes of the last CD module
+    messages (time 0x21, length 0x20, other) in hex, plus counters of good
+    messages and checksum failures. See cd_diag() for the layout.
+
+Usage: build_patch.py [--version VERSION] [--cd-diag] <original.hex> <patched.hex> [patch,...]
   patches: track, backlight, disctime, play, remaining, brightness (default: all)
 """
 import argparse
@@ -788,6 +793,407 @@ def patch_splash(img, version):
     print(f"splash: \"{text}\" at {lab['splash_hook']:#x}, {len(cave)} bytes")
 
 
+# --- CD module diagnostic (--cd-diag) -------------------------------------
+# Replaces the normal display with the raw bytes of the last CD module
+# messages, in hex, 9 bytes per line, alternating white/yellow per byte:
+#   lines 0-1  last time message      (class 4, type 0x21)
+#   lines 2-3  last length message    (class 4, type 0x20)
+#   lines 4-5  last other class-4 message
+#   line  6    20=/21=/E: count of length and time messages, checksum
+#              failures (hex, low byte); R: length requests sent (low digit)
+#   line  7    TR/DI: track length (+0x108/+0x10C) and disc total
+#              (+0x110/+0x114) as stored by the firmware, decimal mm:ss
+# A message is [len][class][type][data...][checksum] at CD_STATE+0x8E; the
+# bytes shown start at class. LVGL keeps running but its flush is a no-op.
+CD_MSG = CD_STATE + 0x8E
+CD_FLAGS = CD_STATE + 0x118  # bit 16: message received with a good checksum
+CD_READ = 0x0800DE8C       # read one message from the module (I2C)
+CD_PARSE = 0x0800D890      # parse the received message
+CD_QUEUE = 0x0800D03A      # queue a command for the module (cmd number)
+CMD_REQ_LENGTH = 0x21      # sends [04 20 01]; the firmware sends it once after loading
+DIAG_LAST_TRACK = 0x13     # spare byte of slot 0: track number seen last
+LCD_CLEAR = 0x08008E90     # whole panel black (direct, not LVGL)
+SPLASH = 0x08004AFA        # boot screen, drawn on every wake
+LV_FLUSH_PTR = 0x08028114  # literal: LVGL display driver flush_cb
+LV_FLUSH_READY = 0x080283EE  # lv_disp_flush_ready(drv)
+DIAG = 0x20000298          # 0x60 bytes of the dead settings menu's item tables
+DIAG_REQS, DIAG_ERR, DIAG_DIRTY, DIAG_MAGIC = DIAG + 0x50, DIAG + 0x54, DIAG + 0x58, DIAG + 0x5C
+DIAG_SLOT = 20             # [n][18 bytes]
+DIAG_ROW0 = 6
+WHITE, YELLOW, CYAN, GREEN = 0xFFFF, 0xFFE0, 0x07FF, 0x07E0
+
+
+def cd_diag():
+    n = [0]
+
+    def lbl(name):
+        n[0] += 1
+        return f'{name}_{n[0]}'
+
+    def dch():  # draw char r2 at (col r6, row r7) in colour r5, advance
+        return [('mov', 'r0', 'r6'), ('mov', 'r1', 'r7'), ('mov', 'r3', 'r5'),
+                ('bl', DRAW_CHAR), ('adds_i8', 'r7', 12)]
+
+    def hexchar():  # r2 = nibble -> '0'..'9', 'A'..'F'
+        d = lbl('dig')
+        return [('cmp', 'r2', 10), ('blo', d), ('adds_i8', 'r2', 7), d + ':', ('adds_i8', 'r2', 0x30)]
+
+    def ch(c):
+        return [('movs', 'r2', ord(c))] + dch()
+
+    def hex8():  # r4 low 8 bits as 2 hex digits
+        return ([('lsrs', 'r2', 'r4', 4), ('movs', 'r3', 15), ('ands', 'r2', 'r3')] + hexchar() + dch()
+                + [('movs', 'r2', 15), ('ands', 'r2', 'r4')] + hexchar() + dch())
+
+    def dec2():  # r4 as 2 decimal digits (capped at 99)
+        ok = lbl('dec')
+        return [('cmp', 'r4', 99), ('bls', ok), ('movs', 'r4', 99), ok + ':',
+                ('movs', 'r1', 10), ('udiv', 'r2', 'r4', 'r1'),   # tens
+                ('movs', 'r3', 10), ('muls', 'r3', 'r2'),
+                ('subs', 'r4', 'r4', 'r3'),                     # ones
+                ('adds_i8', 'r2', 0x30)] + dch() + [('mov', 'r2', 'r4'), ('adds_i8', 'r2', 0x30)] + dch()
+
+    prog = [
+        # LVGL flush_cb: draw nothing, just report done
+        'flush_stub:',
+        ('b.w', LV_FLUSH_READY),
+
+        # wake: screen needs clearing after the boot screen
+        'diag_wake:',
+        ('ldr_lit', 'r0', 'lit_dirty'),
+        ('movs', 'r1', 0),
+        ('strb', 'r1', 'r0', 1),
+        ('b.w', SPLASH),
+
+        # first call after reset: the area still holds the menu tables
+        'diag_init:',
+        ('ldr_lit', 'r0', 'lit_magic_addr'),
+        ('ldr', 'r1', 'r0', 0),
+        ('ldr_lit', 'r2', 'lit_magic'),
+        ('cmp', 'r1', 'r2'),
+        ('beq', 'init_done'),
+        ('str', 'r2', 'r0', 0),
+        ('ldr_lit', 'r0', 'lit_diag'),
+        ('movs', 'r1', 0),
+        ('movs', 'r3', (DIAG_MAGIC - DIAG) // 4),
+        'init_loop:',
+        ('str', 'r1', 'r0', 0),
+        ('adds_i8', 'r0', 4),
+        ('subs_i3', 'r3', 'r3', 1),
+        ('bne', 'init_loop'),
+        'init_done:',
+        ('bx_lr',),
+
+        # replaces bl CD_READ: count checksum failures
+        'read_hook:',
+        ('push', reglist('r4', lr=True)),
+        ('bl', CD_READ),
+        ('bl', 'diag_init'),
+        ('ldr_lit', 'r0', 'lit_flags'),
+        ('ldr', 'r0', 'r0', 0),
+        ('ldr_lit', 'r1', 'lit_bit16'),
+        ('tst', 'r0', 'r1'),
+        ('bne', 'read_done'),
+        ('ldr_lit', 'r4', 'lit_err'),
+        ('ldr_lit', 'r0', 'lit_dirty'),
+        ('ldrb', 'r1', 'r0', 0),
+        ('movs', 'r2', 0x10),
+        ('orrs', 'r1', 'r2'),
+        ('strb', 'r1', 'r0', 0),
+        ('ldr', 'r0', 'r4', 0),
+        ('adds_i8', 'r0', 1),
+        ('str', 'r0', 'r4', 0),
+        'read_done:',
+        ('pop', reglist('r4', pc=True)),
+
+        # replaces bl CD_PARSE: keep a copy of the message, parse, redraw
+        'msg_hook:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('bl', 'diag_init'),
+        ('ldr_lit', 'r0', 'lit_flags'),
+        ('ldr', 'r0', 'r0', 0),
+        ('ldr_lit', 'r1', 'lit_bit16'),
+        ('tst', 'r0', 'r1'),
+        ('beq', 'parse'),
+        ('ldr_lit', 'r4', 'lit_msg'),
+        ('ldrb', 'r5', 'r4', 0),
+        ('cmp', 'r5', 100),
+        ('bhs', 'parse'),
+        ('cmp', 'r5', 3),
+        ('blo', 'parse'),
+        ('subs_i3', 'r5', 'r5', 1),      # n = len - 1 (class .. last data byte)
+        ('cmp', 'r5', 18),
+        ('bls', 'n_ok'),
+        ('movs', 'r5', 18),
+        'n_ok:',
+        ('movs', 'r7', 8),               # slot 3: other class
+        ('movs', 'r1', 3 * DIAG_SLOT),
+        ('ldrb', 'r0', 'r4', 1),
+        ('cmp', 'r0', 4),
+        ('bne', 'got_slot'),
+        ('movs', 'r7', 4),               # slot 2: other class-4
+        ('movs', 'r1', 2 * DIAG_SLOT),
+        ('ldrb', 'r0', 'r4', 2),
+        ('cmp', 'r0', 0x20),
+        ('bne', 'not20'),
+        ('movs', 'r7', 2),               # slot 1: length
+        ('movs', 'r1', 1 * DIAG_SLOT),
+        ('b', 'got_slot'),
+        'not20:',
+        ('cmp', 'r0', 0x21),
+        ('bne', 'got_slot'),
+        ('movs', 'r7', 1),               # slot 0: time
+        ('movs', 'r1', 0),
+        'got_slot:',
+        ('ldr_lit', 'r0', 'lit_dirty'),
+        ('cmp', 'r7', 1),
+        ('bne', 'cnt_not21'),
+        ('ldrb', 'r2', 'r0', 3),         # r1 = slot offset: keep it
+        ('adds_i8', 'r2', 1),
+        ('strb', 'r2', 'r0', 3),
+        'cnt_not21:',
+        ('cmp', 'r7', 2),
+        ('bne', 'cnt_not20'),
+        ('ldrb', 'r2', 'r0', 2),
+        ('adds_i8', 'r2', 1),
+        ('strb', 'r2', 'r0', 2),
+        'cnt_not20:',
+        ('ldrb', 'r2', 'r0', 0),
+        ('movs', 'r3', 0x10),
+        ('orrs', 'r2', 'r3'),
+        ('strb', 'r2', 'r0', 0),
+        ('ldr_lit', 'r6', 'lit_diag'),
+        ('adds', 'r6', 'r6', 'r1'),
+        ('movs', 'r3', 0),               # changed
+        ('ldrb', 'r0', 'r6', 0),
+        ('cmp', 'r0', 'r5'),
+        ('beq', 'n_same'),
+        ('strb', 'r5', 'r6', 0),
+        ('movs', 'r3', 1),
+        'n_same:',
+        ('movs', 'r2', 0),
+        'copy_loop:',
+        ('cmp', 'r2', 18),
+        ('bhs', 'copied'),
+        ('movs', 'r0', 0),
+        ('cmp', 'r2', 'r5'),
+        ('bhs', 'have_src'),
+        ('adds', 'r1', 'r4', 'r2'),
+        ('ldrb', 'r0', 'r1', 1),
+        'have_src:',
+        ('adds', 'r1', 'r6', 'r2'),
+        ('ldrb', 'r1', 'r1', 1),
+        ('cmp', 'r1', 'r0'),
+        ('beq', 'same_byte'),
+        ('adds', 'r1', 'r6', 'r2'),
+        ('strb', 'r0', 'r1', 1),
+        ('movs', 'r3', 1),
+        'same_byte:',
+        ('adds_i8', 'r2', 1),
+        ('b', 'copy_loop'),
+        'copied:',
+        ('cmp', 'r3', 0),
+        ('beq', 'parse'),
+        ('ldr_lit', 'r0', 'lit_dirty'),
+        ('ldrb', 'r1', 'r0', 0),
+        ('orrs', 'r1', 'r7'),
+        ('movs', 'r2', 0x10),            # counters along with it
+        ('orrs', 'r1', 'r2'),
+        ('strb', 'r1', 'r0', 0),
+        'parse:',
+        ('bl', CD_PARSE),
+        # experiment: request the length whenever the track number changes
+        ('ldr_lit', 'r0', 'lit_track'),
+        ('ldr', 'r0', 'r0', 0),
+        ('ldr_lit', 'r1', 'lit_diag'),
+        ('ldrb', 'r2', 'r1', DIAG_LAST_TRACK),
+        ('cmp', 'r0', 'r2'),
+        ('beq', 'no_request'),
+        ('strb', 'r0', 'r1', DIAG_LAST_TRACK),
+        ('cmp', 'r0', 0),
+        ('beq', 'no_request'),
+        ('ldr_lit', 'r1', 'lit_reqs'),
+        ('ldr', 'r2', 'r1', 0),
+        ('adds_i8', 'r2', 1),
+        ('str', 'r2', 'r1', 0),
+        ('ldr_lit', 'r0', 'lit_dirty'),
+        ('ldrb', 'r1', 'r0', 0),
+        ('movs', 'r2', 0x10),
+        ('orrs', 'r1', 'r2'),
+        ('strb', 'r1', 'r0', 0),
+        ('movs', 'r0', CMD_REQ_LENGTH),
+        ('bl', CD_QUEUE),
+        'no_request:',
+        ('bl', 'diag_draw'),
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        # hexline(r0 = bytes, r1 = valid count, r2 = col): 9 bytes, blanks after valid
+        'hexline:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('sub_sp', 16),
+        ('movs', 'r3', 0),
+        ('str_sp', 'r3', 0),             # background for draw_char
+        ('str_sp', 'r1', 8),             # valid bytes left
+        ('movs', 'r3', 9),
+        ('str_sp', 'r3', 4),             # bytes left on the line
+        ('mov', 'r4', 'r0'),
+        ('mov', 'r6', 'r2'),
+        ('movs', 'r7', DIAG_ROW0),
+        'hl_loop:',
+        ('ldr_sp', 'r0', 4),
+        ('cmp', 'r0', 0),
+        ('beq', 'hl_done'),
+        ('subs_i3', 'r0', 'r0', 1),
+        ('str_sp', 'r0', 4),
+        ('ldr_lit', 'r5', 'lit_white'),
+        ('movs', 'r1', 1),
+        ('tst', 'r0', 'r1'),
+        ('beq', 'hl_fg'),
+        ('ldr_lit', 'r5', 'lit_yellow'),
+        'hl_fg:',
+        ('ldr_sp', 'r0', 8),
+        ('cmp', 'r0', 0),
+        ('beq', 'hl_blank'),
+        ('subs_i3', 'r0', 'r0', 1),
+        ('str_sp', 'r0', 8),
+        ('ldrb', 'r0', 'r4', 0),
+        ('lsrs', 'r2', 'r0', 4),
+    ] + hexchar() + dch() + [
+        ('ldrb', 'r0', 'r4', 0),
+        ('movs', 'r2', 15),
+        ('ands', 'r2', 'r0'),
+    ] + hexchar() + dch() + [
+        ('b', 'hl_next'),
+        'hl_blank:',
+    ] + ch(' ') + ch(' ') + [
+        'hl_next:',
+        ('adds_i8', 'r4', 1),
+        ('b', 'hl_loop'),
+        'hl_done:',
+        ('add_sp', 16),
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        # diag_draw: clear after wake/reset, redraw dirty slots and counters
+        'diag_draw:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('sub_sp', 8),
+        ('movs', 'r0', 0),
+        ('str_sp', 'r0', 0),
+        ('ldr_lit', 'r4', 'lit_dirty'),
+        ('ldrb', 'r0', 'r4', 1),
+        ('cmp', 'r0', 1),
+        ('beq', 'scr_ok'),
+        ('bl', LCD_CLEAR),
+        ('movs', 'r0', 1),
+        ('strb', 'r0', 'r4', 1),
+        ('movs', 'r0', 0x1F),
+        ('strb', 'r0', 'r4', 0),
+        'scr_ok:',
+    ]
+    for k, (mask, lines) in enumerate(((1, 2), (2, 2), (4, 2))):
+        skip = lbl('skip')
+        prog += [
+            ('ldr_lit', 'r4', 'lit_dirty'),
+            ('ldrb', 'r0', 'r4', 0),
+            ('movs', 'r1', mask),
+            ('tst', 'r0', 'r1'),
+            ('beq', skip),
+            ('bics', 'r0', 'r1'),
+            ('strb', 'r0', 'r4', 0),
+        ]
+        for l in range(lines):
+            line = 2 * k + l
+            prog += [('ldr_lit', 'r0', 'lit_diag'),
+                     ('adds_i8', 'r0', k * DIAG_SLOT),
+                     ('ldrb', 'r1', 'r0', 0)]
+            if l:
+                pos, sub = lbl('pos'), lbl('cnt')
+                prog += [('cmp', 'r1', 9), ('bhs', pos), ('movs', 'r1', 9), pos + ':',
+                         ('movs', 'r2', 9), ('subs', 'r1', 'r1', 'r2')]
+            prog += [('adds_i8', 'r0', 1 + 9 * l),
+                     ('movs', 'r2', 3 + 16 * line),
+                     ('bl', 'hexline')]
+        prog += [skip + ':']
+    prog += [
+        ('ldr_lit', 'r4', 'lit_dirty'),
+        ('ldrb', 'r0', 'r4', 0),
+        ('movs', 'r1', 0x10),
+        ('tst', 'r0', 'r1'),
+        ('bne', 'cnt_draw'),
+        ('b', 'draw_done'),
+        'cnt_draw:',
+        ('bics', 'r0', 'r1'),
+        ('strb', 'r0', 'r4', 0),
+        ('movs', 'r6', 3 + 16 * 6),
+        ('movs', 'r7', DIAG_ROW0),
+        ('ldr_lit', 'r5', 'lit_cyan'),
+    ] + ch('2') + ch('0') + ch('=') + [
+        ('ldr_lit', 'r4', 'lit_dirty'),
+        ('ldrb', 'r4', 'r4', 2),
+    ] + hex8() + ch(' ') + ch('2') + ch('1') + ch('=') + [
+        ('ldr_lit', 'r4', 'lit_dirty'),
+        ('ldrb', 'r4', 'r4', 3),
+    ] + hex8() + ch(' ') + ch('E') + [
+        ('ldr_lit', 'r4', 'lit_err'),
+        ('ldr', 'r4', 'r4', 0),
+    ] + hex8() + ch(' ') + ch('R') + [
+        ('ldr_lit', 'r4', 'lit_reqs'),
+        ('ldr', 'r4', 'r4', 0),
+        ('movs', 'r2', 15),
+        ('ands', 'r2', 'r4'),
+    ] + hexchar() + dch() + [
+        ('movs', 'r6', 3 + 16 * 7),
+        ('movs', 'r7', DIAG_ROW0),
+        ('ldr_lit', 'r5', 'lit_green'),
+    ] + ch('T') + ch('R') + ch(' ') + [
+        ('ldr_lit', 'r4', 'lit_len'),
+        ('ldr', 'r4', 'r4', 0),
+    ] + dec2() + ch(':') + [
+        ('ldr_lit', 'r4', 'lit_len'),
+        ('ldrb', 'r4', 'r4', 4),
+    ] + dec2() + ch(' ') + ch('D') + ch('I') + ch(' ') + [
+        ('ldr_lit', 'r4', 'lit_len'),
+        ('ldr', 'r4', 'r4', 8),
+    ] + dec2() + ch(':') + [
+        ('ldr_lit', 'r4', 'lit_len'),
+        ('ldrb', 'r4', 'r4', 12),
+    ] + dec2() + [
+        'draw_done:',
+        ('add_sp', 8),
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+        ('align',),
+    ]
+    lits = {'lit_dirty': DIAG_DIRTY, 'lit_magic_addr': DIAG_MAGIC, 'lit_magic': 0x47414944,
+            'lit_diag': DIAG, 'lit_flags': CD_FLAGS, 'lit_bit16': 1 << 16, 'lit_msg': CD_MSG,
+            'lit_reqs': DIAG_REQS, 'lit_err': DIAG_ERR, 'lit_white': WHITE, 'lit_yellow': YELLOW,
+            'lit_cyan': CYAN, 'lit_green': GREEN, 'lit_len': CD_STATE + 0x108,
+            'lit_track': CD_STATE + 0xFC}
+    for name, val in lits.items():
+        prog += [name + ':', ('word', val)]
+    # ldr literal reaches only 1 KB forward: the hooks and hexline each get
+    # their own copy of the pool, placed right after them
+    out, start = [], 0
+    for n, label in enumerate(('hexline:', 'diag_draw:'), 1):
+        split = prog.index(label)
+        out += [(ins[0], ins[1], f'{ins[2]}_{n}') if isinstance(ins, tuple) and ins[0] == 'ldr_lit' else ins
+                for ins in prog[start:split]]
+        out += [('align',)] + [x for name, val in lits.items() for x in (f'{name}_{n}:', ('word', val))]
+        start = split
+    return out + prog[start:]
+
+
+def patch_cd_diag(img):
+    cave, lab = assemble(cd_diag(), cave_addr(img))
+    for site, orig, new in ((0x0800E08C, CD_READ, 'read_hook'), (0x0800E0A2, CD_PARSE, 'msg_hook'),
+                            (0x0800A868, SPLASH, 'diag_wake')):
+        old, _ = assemble([('bl', orig)], site)
+        code, _ = assemble([('bl', lab[new])], site)
+        patch(img, site, old, code)
+    patch(img, LV_FLUSH_PTR, struct.pack('<I', 0x08028065), struct.pack('<I', lab['flush_stub'] | 1))
+    put(img, lab['flush_stub'], cave)
+    print(f"cd-diag: at {lab['flush_stub']:#x}, {len(cave)} bytes (DIAGNOSTIC BUILD: normal display replaced)")
+
+
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'play': patch_play, 'remaining': patch_remaining, 'brightness': patch_brightness}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens
@@ -800,6 +1206,8 @@ def main():
     ap.add_argument('dst')
     ap.add_argument('patches', nargs='?', default=','.join(PATCHES))
     ap.add_argument('--version', help='show "patch VERSION" on the boot screen, e.g. v2026-10-25')
+    ap.add_argument('--cd-diag', action='store_true',
+                    help='diagnostic build: show raw CD module messages instead of the normal display')
     args = ap.parse_args()
 
     names = args.patches.split(',')
@@ -814,6 +1222,8 @@ def main():
         PATCHES[name](img)
     if args.version:
         patch_splash(img, args.version)
+    if args.cd_diag:
+        patch_cd_diag(img)
     # ispV2.4 fails ("Index was outside the bounds of the array") on an image
     # that is not a whole number of 32-bit words; pad with erased-flash 0xFF
     img.extend(b'\xff' * (-len(img) % 4))
