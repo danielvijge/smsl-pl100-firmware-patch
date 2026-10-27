@@ -92,6 +92,12 @@ def assemble(prog, base):
             elif op == 'ldrb':  # ldrb rt, [rn, #imm]
                 assert a[2] < 32
                 h = 0x7800 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
+            elif op == 'ldrh':  # ldrh rt, [rn, #imm]
+                assert a[2] % 2 == 0 and a[2] < 64
+                h = 0x8800 | (a[2] >> 1) << 6 | reg(a[1]) << 3 | reg(a[0])
+            elif op == 'strh':  # strh rt, [rn, #imm]
+                assert a[2] % 2 == 0 and a[2] < 64
+                h = 0x8000 | (a[2] >> 1) << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'tst':
                 h = 0x4200 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'bics':

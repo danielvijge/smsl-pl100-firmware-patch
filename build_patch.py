@@ -39,9 +39,9 @@ Patch 4 - Play pressed while the disc is still loading is lost.
     standby cancels it. Needs disctime (added automatically).
 
 Patch 5 - track time remaining, with an hourglass icon.
-  * Remote key FN (IR 0x08) toggles line 2 between elapsed track time and
+  * Remote key DISP (TIME_IR) toggles line 2 between elapsed track time and
     track time remaining = track length (+0x108/+0x10C) - elapsed. MENU
-    (IR 0x04) is mapped to a no-op key so it stays unused.
+    (IR 0x04) natively gives the same key code and is mapped to a no-op key.
   * Indicator: the unused shuffle icon object (ui+0x24, always hidden) gets a
     30x30 hourglass (icons.py, same format and colour as the repeat icons) and
     is moved to (52,8), right of the play/pause icon. A hook before every
@@ -49,13 +49,20 @@ Patch 5 - track time remaining, with an hourglass icon.
     REMAINING_ICON_ON = False leaves the icon (code, image and hooks) out.
   * The mode lives in spare byte 0x20000239.
 
-Patch 6 - DISP cycles the backlight brightness.
-  * DISP (IR 0x0C, key 0x14) has no function on the PL100. A hook on the main
-    loop's get_key steps the brightness setting (0x200004A5) through levels
+Patch 6 - FN cycles the backlight brightness.
+  * FN (BRIGHT_IR) has no function on the PL100. It is mapped to key 0x14,
+    and a hook on the main loop's get_key then steps the brightness setting
+    (0x200004A5) through levels
     5,4,3,2,1,0 = 10/20/35/55/65/100 % (the backlight is active-low, so the
     menu's levels run backwards) and saves it like the settings menu would.
   * The settings load clamps brightness to 1..6, which would turn level 0
     into 1; brightness gets its own check instead (0..5 valid, else 3).
+  * After each press line 1 shows the new level as "10%".."100%" for about
+    2.5 s, like the firmware shows the volume: a hook on the timer check that
+    follows every display update (0x0800E0BC) puts the text into the line 1
+    label after the display update has written it. The duration is measured
+    on the firmware's 75 ms clock (0x20000560, counted in the TIM1 interrupt),
+    not in display updates: those run once per main-loop pass (~40 ms).
   * IR_DIAG_ON (off by default): show the last received IR command as
     "IRxx" on line 1, e.g. to identify remote buttons.
 
@@ -94,6 +101,10 @@ PUT_NUM_L2 = 0x08006090    # (pos, value, ndigits) -> zero-padded digits into li
 DISPLAY_UPDATE = 0x0800D4E4
 LAST_SHOWN_MIN = 0x20000620  # minutes last written to the time label
 IR_TABLE = 0x0802D213      # IR command -> key code
+IR_TABLE_LEN = 0x58
+TIME_KEY = 0x26            # key case patched to time_toggle (natively MENU, no-op)
+BRIGHT_KEY = 0x14          # key caught by key_hook (natively DISP, no function)
+NOOP_KEY = 0x5C            # key with no function (natively FN)
 SETUP_UI = 0x08028FD8      # GUI-Guider setup_ui(&ui), called once from main
 IMG_SET_SRC = 0x0802600E   # lv_img_set_src(obj, src)
 OBJ_SET_POS = 0x08013F2E   # lv_obj_set_pos(obj, x, y)
@@ -111,6 +122,12 @@ POWER_ON = 0x2000004C      # 1 = on, 0 = standby
 BRIGHTNESS = 0x200004A5    # setting, level 0..6 (saved)
 SET_BRIGHTNESS = 0x08005F70
 SCHEDULE_SAVE = 0x0800A798  # save settings to flash after a short delay
+TIMER_EXPIRED = 0x0800AA7C  # (u16 *t): count down, 1 when it reaches 0
+CLOCK_75MS = 0x20000560    # u16, +1 every 10 TIM1 ticks (96 MHz / 72 / 10000 = 7.5 ms)
+BRIGHT_OSD = 0x20000294    # spare: dead settings menu cursor bytes, 0 after boot
+                           # +0 u16 end time (CLOCK_75MS), +2 u8 active
+BRIGHT_OSD_STEPS = 33      # show the level for 33 x 75 ms = 2.5 s
+BRIGHT_OSD_TEXT = ['100%', '65%', '55%', '35%', '20%', '10%']   # levels 0..5
 DRAW_STR = 0x08009A42      # boot screen: (col, row, str, fg, [sp] bg), 13 px per char
 DRAW_CHAR = 0x0800994A     # boot screen: (col, row, ch, fg, [sp] bg), 12x16 glyph
 SPLASH_VER_COL_ORIG, SPLASH_VER_COL = 100, 82  # "Ver 1.1" line (panel column = y)
@@ -120,7 +137,9 @@ SPLASH_ADVANCE = 12        # px per char; draw_str's 13 makes "patch v2026-10-25
 SPLASH_MAX_CHARS = 18      # 216 px; the screen edge beyond ~x 230 is hidden
 SPLASH_CHARS = set(' .:-+=<>/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
 
-FN_IR = 0x08               # IR command of the FN key (MENU 0x04, FN 0x08, DISP 0x0C; tested)
+# Remote buttons (IR commands, tested): MENU 0x04, FN 0x08, DISP 0x0C
+TIME_IR = 0x0C             # elapsed / remaining time toggle: DISP
+BRIGHT_IR = 0x08           # brightness cycle: FN
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 
@@ -564,7 +583,7 @@ FMT_TIME = [
     ('bl', PUT_NUM_L2),
     ('pop', reglist('r4', 'r5', pc=True)),
 
-    # time_toggle(): DISP/MENU/FN key - flip elapsed <-> remaining, force the
+    # time_toggle(): key 0x26 (TIME_IR) - flip elapsed <-> remaining, force the
     # time label to be rewritten and the screen redrawn.
     'time_toggle:',
     ('ldr_lit', 'r1', 'lit_mode'),
@@ -617,8 +636,9 @@ FMT_TIME = [
 
 
 # key_hook(): replaces the main loop's call to get_key (0x0800882C).
-# DISP (key 0x14, no function on the PL100) cycles the backlight brightness
-# while powered on. With IR_DIAG_ON, also records the last IR command.
+# Key 0x14 (BRIGHT_IR; natively DISP, no function on the PL100) cycles the
+# backlight brightness while powered on. With IR_DIAG_ON, also records the
+# last IR command.
 KEY_HOOK = [
     'key_hook:',
     ('push', reglist('r4', lr=True)),
@@ -634,7 +654,7 @@ KEY_HOOK = [
     ('strb', 'r0', 'r1', 0),
     'no_diag:',
 ] if IR_DIAG_ON else []) + [
-    ('cmp', 'r4', 0x14),
+    ('cmp', 'r4', BRIGHT_KEY),
     ('bne', 'key_ret'),
     ('ldr_lit', 'r1', 'lit_power'),
     ('ldrb', 'r0', 'r1', 0),
@@ -663,6 +683,49 @@ KEY_HOOK = [
     ('strb', 'r0', 'r4', 0),
     ('bl', SET_BRIGHTNESS),
     ('bl', SCHEDULE_SAVE),
+    ('ldr_lit', 'r1', 'lit_clock'),  # show the new level on line 1
+    ('ldrh', 'r0', 'r1', 0),
+    ('adds_i8', 'r0', BRIGHT_OSD_STEPS),
+    ('ldr_lit', 'r1', 'lit_osd'),
+    ('strh', 'r0', 'r1', 0),         # end time
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 2),         # active
+    ('pop', reglist('r4', pc=True)),
+
+    # bright_tick(): replaces the timer check right after the display update
+    # (once per tick). While the OSD timer runs, line 1 shows the level.
+    'bright_tick:',
+    ('push', reglist('r4', lr=True)),
+    ('mov', 'r4', 'r0'),
+    ('ldr_lit', 'r3', 'lit_osd'),
+    ('ldrb', 'r0', 'r3', 2),
+    ('cbz', 'r0', 'osd_done'),       # not active
+    ('ldrh', 'r0', 'r3', 0),
+    ('ldr_lit', 'r1', 'lit_clock'),
+    ('ldrh', 'r1', 'r1', 0),
+    ('subs', 'r0', 'r0', 'r1'),
+    ('uxth', 'r0', 'r0'),            # time left (75 ms steps), 16-bit wrap
+    ('cbz', 'r0', 'osd_end'),
+    ('cmp', 'r0', BRIGHT_OSD_STEPS),
+    ('bhi', 'osd_end'),
+    ('ldr_lit', 'r1', 'lit_bright'),
+    ('ldrb', 'r1', 'r1', 0),
+    ('cmp', 'r1', 5),
+    ('bhi', 'osd_done'),
+    ('lsls', 'r1', 'r1', 2),
+    ('ldr_lit', 'r0', 'lit_osd_text'),
+    ('adds', 'r1', 'r0', 'r1'),
+    ('ldr', 'r1', 'r1', 0),          # text for this level
+    ('ldr_lit', 'r0', 'lit_ui_osd'),
+    ('ldr', 'r0', 'r0', 8),          # line 1 label
+    ('bl', LABEL_SET_TEXT),
+    ('b', 'osd_done'),
+    'osd_end:',                      # time is up: the next display update
+    ('movs', 'r0', 0),               # shows the track again
+    ('strb', 'r0', 'r3', 2),
+    'osd_done:',
+    ('mov', 'r0', 'r4'),
+    ('bl', TIMER_EXPIRED),
     ('pop', reglist('r4', pc=True)),
 
     # bright_load(): replaces the generic 1..6 clamp when the saved brightness
@@ -682,6 +745,17 @@ KEY_HOOK = [
     ('word', POWER_ON),
     'lit_bright:',
     ('word', BRIGHTNESS),
+    'lit_osd:',
+    ('word', BRIGHT_OSD),
+    'lit_clock:',
+    ('word', CLOCK_75MS),
+    'lit_ui_osd:',
+    ('word', UI),
+    'lit_osd_text:',
+    ('word', 'osd_text'),
+    'osd_text:',                     # text pointer per level
+    *[('word', f'osd_text_{i}') for i in range(len(BRIGHT_OSD_TEXT))],
+    *[x for i, t in enumerate(BRIGHT_OSD_TEXT) for x in (f'osd_text_{i}:', ('bytes', t.encode() + b'\0'))],
 ]
 
 
@@ -693,6 +767,10 @@ def patch_brightness(img):
     # settings load: brightness clamp(val, 7) -> bright_load
     code, _ = assemble([('bl', lab['bright_load'])], 0x08006EBC)
     patch(img, 0x08006EBC, bytes.fromhex('fff778fe'), code)
+    # timer check right after the display update -> bright_tick (level on line 1)
+    old, _ = assemble([('bl', TIMER_EXPIRED)], 0x0800E0BC)
+    code, _ = assemble([('bl', lab['bright_tick'])], 0x0800E0BC)
+    patch(img, 0x0800E0BC, old, code)
     put(img, lab['key_hook'], cave)
     print(f"brightness: key_hook at {lab['key_hook']:#x}, {len(cave)} bytes"
           + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
@@ -709,17 +787,6 @@ def patch_remaining(img):
     # key 0x26 case (did only "0x20000186 = 2") -> time_toggle
     code, _ = assemble([('bl', lab['time_toggle']), ('b', 0x0800ED4C), ('nop',)], 0x0800ED42)
     patch(img, 0x0800ED42, bytes.fromhex('02200f49088000e0'), code)
-    # MENU and FN are two of IR commands 0x04 / 0x08 / 0x1B (tested: both
-    # toggle when all three give key 0x26; DISP is 0x0C). Until FN_IR is known,
-    # all three toggle; then only FN does and MENU goes back to doing nothing.
-    originals = {0x04: 0x26, 0x08: 0x5C, 0x1B: 0x31}  # 0x5C, 0x31: no-op keys
-    for ir, key in originals.items():
-        if FN_IR is None or ir == FN_IR:
-            new = 0x26
-        else:
-            new = 0x5C if key == 0x26 else key   # 0x04 is natively 0x26: make it a no-op key
-        if new != key:
-            patch(img, IR_TABLE + ir, bytes([key]), bytes([new]))
     if DISP_HOOK_ON:
         # display update call in the main task -> disp_hook
         code, _ = assemble([('bl', lab['disp_hook'])], 0x0800E0B6)
@@ -788,6 +855,23 @@ def patch_splash(img, version):
     print(f"splash: \"{text}\" at {lab['splash_hook']:#x}, {len(cave)} bytes")
 
 
+def remap_buttons(img, names):
+    """IR command -> key table: TIME_IR gives the time toggle key, BRIGHT_IR
+    the brightness key; any other button that natively gives one of those
+    keys (MENU gives 0x26, DISP 0x14) gets a no-op key instead."""
+    want = {}
+    if 'remaining' in names:
+        want[TIME_IR] = TIME_KEY
+    if 'brightness' in names:
+        want[BRIGHT_IR] = BRIGHT_KEY
+    used = set(want.values())
+    for ir in range(IR_TABLE_LEN):
+        key = img[IR_TABLE + ir - BASE]
+        new = want.get(ir, NOOP_KEY if key in used else key)
+        if new != key:
+            patch(img, IR_TABLE + ir, bytes([key]), bytes([new]))
+
+
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'play': patch_play, 'remaining': patch_remaining, 'brightness': patch_brightness}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens
@@ -812,6 +896,7 @@ def main():
     img = read_hex(args.src)
     for name in names:
         PATCHES[name](img)
+    remap_buttons(img, names)
     if args.version:
         patch_splash(img, args.version)
     # ispV2.4 fails ("Index was outside the bounds of the array") on an image
