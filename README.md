@@ -8,12 +8,11 @@ It adds the following fixes and enhancements:
 2. Option to change the brightness of the display using six settings using the remote's FN button. The brightness
 percentage is shown on the screen, briefly replacing the track number, similar to the volume indicator.
 3. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining time it displays an hourglass icon. (If you don't like the icon, it can be toggled off in the python script.)
-
-There are a couple of bugs/weird things with the time remaining display:
-* It can take anywhere between 0 and 60+ seconds for the remaining time to show. Until that time the elapsed time is displayed.
-* On track change it might first count down from the time of the previous track. Again, after a while it becomes correct.
-* Powering on the player with a disc inserted and playing it will first count down from the total disc time, not the track time.
-All this is not a bug in this firmware, but is inherent to how the hardware is implemented. This only sends a track
+   * There are a couple of bugs/weird things with the time remaining display:
+      * It can take anywhere between 0 and 60+ seconds for the remaining time to show. Until that time the elapsed time is displayed.
+      * On track change it might first count down from the time of the previous track. Again, after a while it becomes correct.
+      * Powering on the player with a disc inserted and playing it will first count down from the total disc time, not the track time.
+   * All this is not a bug in this firmware, but is inherent to how the hardware is implemented. This only sends a track
 update around every 22 seconds. And a message can be corrupted, missing an update.
 Corrupted messages are also the reason that sometimes a time change is not shown, and it can jump from 00:31 to 00:33.
 I did quite some diagnostics to try to find out if this could be changed, and apparently the answer is no. The full
@@ -21,7 +20,7 @@ results can be read in [claude-pl100-patch-chat.md](claude-pl100-patch-chat.md) 
 build script is available in the `diagnostic-remaining-time` git branch.
 
 **Bug fixes:**
-1. When the device is in standby the display is fully off instead of the lowest standby.
+1. When the device is in standby the display is fully off instead of the lowest brightness.
 2. Always display the correct time of the disc when inserting it. Sometimes it would display the time of the previous disc.
 3. Pressing play while the disc is still loading (power on or inserting a new disc) queues the play action. Previously it would just hang and do nothing.
 
@@ -34,7 +33,7 @@ The original firmware is added to this repository as [IAP_PL100_1v1_b250219.hex]
 
 ## Patching the original firmware
 
-⚠ All patches are written by AI (Claude Opus 5.5). It has been tested but the code is not reviewed.
+:warning: All patches are written by AI (Claude Opus 5.5). It has been tested but the code is not reviewed.
 
 With the help of AI the original firmware was analysed. AI then patched the firmware based on the instructions.
 Instead of directly patching the firmware it produced a python script to patch the firmware. This allows anyone
@@ -71,7 +70,7 @@ version 1.1. The version installed is shown when powering on the player, below t
 
 ## Steps to flash the patched firmware
 
-⚠ Flash firmware at your own risk. In my testing it was all safe. The firmware itself does not contain the code
+:warning: Flash firmware at your own risk. In my testing it was all safe. The firmware itself does not contain the code
 to flash the firmware, this is on a different chip. So even if flashing fails you should always be able to flash
 the original firmware again. However, do understand that this is not a guarantee. You accept the risk by flashing
 this patched firmware.
