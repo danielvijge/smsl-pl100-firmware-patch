@@ -143,6 +143,7 @@ BRIGHT_IR = 0x08           # brightness cycle: FN
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 
+EXPORTS = {}               # cave addresses one patch provides for another
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
 
 
@@ -280,11 +281,20 @@ def patch_backlight(img):
 
 # tray_open(): status 0x21 handler - [+7] = 2 ("Eject") as before, then clear
 # the disc info like the Open/Close key does (0x0800E6F0..0x0800E714).
+# disc_reset(): same for standby entry (the CD module is switched off and
+# reloads the disc at power-on): play state 1 (stopped), tray status 1 (Load).
 TRAY_OPEN = [
     'tray_open:',
     ('ldr_lit', 'r1', 'lit_state'),
     ('movs', 'r0', 2),
     ('strb', 'r0', 'r1', 7),         # tray status = Eject
+    ('b', 'disc_clear'),
+    'disc_reset:',
+    ('ldr_lit', 'r1', 'lit_state'),
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 4),         # play state = stopped
+    ('strb', 'r0', 'r1', 7),         # tray status = Load
+    'disc_clear:',
     ('adds_i8', 'r1', 0xF4),         # r1 = state + 0xF4
     ('movs', 'r0', 0),
     ('movs', 'r2', 1),
@@ -395,13 +405,18 @@ PLAY_KEY = [
     ('strb', 'r0', 'r4', 0),
     ('pop', reglist('r4', pc=True)),
 
-    # play_standby(): standby entry - forget a pending Play, then continue
-    # with the original first call of the standby routine.
+    # play_standby(): standby entry (also once at cold start) - forget a
+    # pending Play and the disc state: the CD module is switched off and
+    # reloads the disc at power-on, so Play must be queued again until it is
+    # ready. Then the original first call of the standby routine.
     'play_standby:',
+    ('push', reglist('r4', lr=True)),
     ('ldr_lit', 'r1', 'lit_pending'),
     ('movs', 'r0', 0),
     ('strb', 'r0', 'r1', 0),
-    ('b.w', STANDBY_FIRST_CALL),
+    ('bl', 'DISC_RESET'),            # disctime's disc_reset (filled in by patch_play)
+    ('bl', STANDBY_FIRST_CALL),
+    ('pop', reglist('r4', pc=True)),
 ] + DISC_READY + [
     ('align',),
     'lit_state:',
@@ -422,11 +437,13 @@ def patch_disctime(img):
     site, _ = assemble([('bl', fn), ('b', 0x0800DD3A), ('nop',)], 0x0800DCDE)
     patch(img, 0x0800DCDE, bytes.fromhex('0220e649c87129e0'), site)
     put(img, fn, cave)
+    EXPORTS['disc_reset'] = labels['disc_reset']
     print(f'disctime: tray_open at {fn:#x}, {len(cave)} bytes')
 
 
 def patch_play(img):
-    cave, labels = assemble(PLAY_KEY, cave_addr(img))
+    prog = [('bl', EXPORTS['disc_reset']) if ins == ('bl', 'DISC_RESET') else ins for ins in PLAY_KEY]
+    cave, labels = assemble(prog, cave_addr(img))
     # key 0x2F case in the dispatcher: bl 0x0800E10E -> bl play_key
     site, _ = assemble([('bl', labels['play_key'])], 0x0800E766)
     patch(img, 0x0800E766, bytes.fromhex('fff7d2fc'), site)
