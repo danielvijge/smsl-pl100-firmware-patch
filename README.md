@@ -23,7 +23,7 @@ build script is available in the `diagnostic-remaining-time` git branch.
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest standby.
 2. Always display the correct time of the disc when inserting it. Sometimes it would display the time of the previous disc.
-3. Pressing play while the disc is still loading queues the play action. Previously it would just hang and do nothing.
+3. Pressing play while the disc is still loading (power on or inserting a new disc) queues the play action. Previously it would just hang and do nothing.
 
 ## Original firmware
 

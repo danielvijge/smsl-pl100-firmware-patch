@@ -2064,3 +2064,52 @@ Opus 5.5 · Claude Team
 
   To change the duration, adjust BRIGHT_OSD_STEPS = 33 (steps of 75 ms). Nothing
   is committed.
+
+❯ There is a small issue with "Patch 4 - Play pressed while the disc is still   
+  loading is lost." when booting the player. It first shows the SMSL logo boot  
+  screen, and then Load, and Read. If play is pressed during Load/Read, the     
+  play icon does appear on the screen when loading is finished, but it never    
+  actually starts playing. The screen just has the total disc time and the play 
+  icon. That is similar to the behaviour that was previously there when         
+  inserting a new disc.                                                         
+
+⏺ This was a gap in patch 4, and it's fixed in
+  patch/IAP_PL100_1v1_b250219_all_v5.hex. I tested it in the emulator; it hasn't
+  run on the player yet.
+
+  The cause
+  - Standby: it doesn't just turn off the screen. It switches off the CD module
+    completely, and switching on powers it up again, which is why it reloads the
+    disc ("Load", "Read").
+  - The MCU's memory: standby doesn't reset it. So after switching on, it still
+    held the state from before: "disc ready", track count and disc total, and a
+    play state of "playing" if you were playing.
+  - Result: patch 4 thought the disc was ready and let Play through straight
+    away. The module was still loading and ignored it, the same as the original
+    bug.
+  - Cold start: switching on at the mains goes through the same path. The
+    firmware runs the standby routine once at start‑up.
+
+  The fix
+  On entering standby, which patch 4 already hooks, the CD state is reset:
+  - Play state "stopped", tray status "Load".
+  - The same disc‑info reset patch 3 does when the tray opens; I reused that
+    code through a second entry point.
+
+  After switching on, a Play press is queued exactly as after inserting a new
+  disc, and it starts once the reloaded disc is ready.
+
+  Emulator results (state as left by playing, then standby, then Play during
+  Load):
+  - v4: Play goes out immediately and is lost, which reproduces your bug.
+  - v5: Play is queued and goes out once the module has reported TOC done, the
+    track count and the disc total.
+  - Patch 3: opening the tray still behaves as before.
+  - Build: Python 3.9 gives the same output.
+
+  Probably also fixed: after switching on, the countdown showed the whole disc's
+  remaining time (case 3). The disc total is now stored fresh after power‑on
+  instead of being taken for the track length. Please keep an eye on it; it's a
+  side effect I haven't seen on the device yet.
+
+  The change is only in build_patch.py and isn't committed.
