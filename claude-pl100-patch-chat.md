@@ -2113,3 +2113,250 @@ Opus 5.5 · Claude Team
   side effect I haven't seen on the device yet.
 
   The change is only in build_patch.py and isn't committed.
+
+❯ Are there any other changes or improvements to the firmware that could make   
+  sense?                                                                        
+
+⏺ Yes, several. Ordered by how useful I think they are and how much is already
+  known:
+
+  Worth doing
+
+  1. Fix the one‑second time skips. The diagnostic showed about 7 % of CD‑module
+     messages failing the checksum, so every lost time message makes the
+     display jump 2 s. The MCU reads the module through software‑driven I2C with
+     hard‑coded delays. Two possible fixes:
+     - Cause: slow the bit timing slightly, if the failures come from marginal
+       timing.
+     - Symptom: if a time message is missing, advance the displayed time by one
+       second itself; the next good message corrects it anyway.
+
+     The first needs a short test with the diagnostic (count E before and
+     after). The second is simple and certain to work.
+  2. Show the gap between tracks as negative time. Before each track the module
+     counts down 0:02/0:03 → 0:00 (we saw that in the videos), and the display
+     shows it as ordinary time counting backwards. Showing -0:03 … -0:01 would
+     make clear the next track hasn't started yet. It's small and low‑risk,
+     since the information is already in the time message.
+  3. Resume after standby. The module forgets everything when switched off. The
+     patch could remember track and position at standby, and after power‑on and
+     Play continue there. The firmware already has a "play from track/time"
+     command (cmd 4, with track, min, sec). It needs one test of whether the
+     module honours the time part. A setting could switch it off.
+
+  Possible, with some uncertainty
+
+  4. Screen dims after a while. The firmware has a working but switched‑off
+     "Dimmer" (display timeout, setting 0x200004D5, default "Display always
+     ON"). A build option could turn it on, e.g. off after 1 minute while
+     stopped or paused, and on again with any key. Untested on the PL100, and
+     how it interacts with the new brightness levels needs checking.
+  5. Give MENU a function. It's the last unused button. Candidates:
+     - Screen off / on while playing (complements 4).
+     - Repeat or shuffle, if the module supports them; there's an unused shuffle
+       icon in the UI. That needs finding the module command, so it's more
+       investigation.
+  6. Start playing automatically after loading a disc. This would be a build
+     option. Patch 4's queue already does most of the work.
+
+  Not recommended
+
+  - Remaining time for the whole disc: the module never reports the position on
+    the disc.
+  - Faster countdown start: shown to be impossible; the module only sends track
+    lengths every ~22 s.
+  - The settings menu: half‑ported DAC code with mostly irrelevant settings.
+
+  My suggestion: 1 and 2 first, because they fix things you see every day. Which
+  ones interest you?
+
+❯ #1 (always advance 1s when missing), #2, and #6 are nice additions to have.   
+  please add them to the patch, again each with a config option to switch them  
+  off                                                                           
+
+⏺ I've added all three features, each with its own on/off setting. The build is
+  patch/IAP_PL100_1v1_b250219_all_v6.hex. I tested it in the emulator only, not
+  yet on the player.
+
+  The new settings sit next to the existing ones in build_patch.py:
+  TIME_FILL_ON = True        # advance the time by 1 s when a time message of 
+  the CD module is lost
+  PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the
+  remaining patch)
+  AUTOPLAY_ON = True         # start playing when a disc has loaded after the 
+  tray was opened
+
+  1. No more 2‑second jumps (new patch cdtime)
+  - How it works: the patch notes when each time message from the CD module
+    arrives. If it's playing and no message has come for 1.275 s, the display
+    advances one second, and again every second while messages stay missing. The
+    next message that arrives sets the module's own time again.
+  - When it doesn't act: paused, seeking, or before the first time message after
+    pressing Play.
+
+  2. The gap before a track as negative time
+  - What you see: while the module counts down to the next track, the display
+    shows -0.03, -0.02, -0.01, then 00.00 when the track starts. The value is
+    rounded up, so the last one is -0.01. This applies in both elapsed and
+    remaining mode.
+  - How a gap is recognised: the videos showed that only time messages from the
+    gap carry a non‑zero "frames" byte; I also require minutes = 0. That's based
+    on the two discs we filmed. If another disc behaves differently, the worst
+    case is a missing or brief stray -.
+  - Dependency: it's part of the time display in the remaining patch, which
+    pulls in cdtime automatically.
+
+  6. Autoplay after loading a disc
+  - How it works: opening the tray arms it. When the next disc load starts, a
+    Play is queued, and the existing queue from patch 4 starts playback once the
+    disc is ready.
+  - Power‑on: switching on from standby or at the mains doesn't autoplay; only
+    opening the tray arms it.
+  - Limitation: pressing Stop while the disc loads doesn't cancel the autoplay.
+    A queued Play from patch 4 behaves the same way.
+
+  Change to the structure: the brightness percentage and the time fill both need
+  to run after every display update, and only one patch can hook that spot.
+  That spot is now a small chain that the script builds from whichever patches
+  register for it.
+
+  Checks:
+  - Emulator, all features on:
+    - Lost messages at 2, 5 and 6 s are filled, so 10…18 counts up by one second
+      at a time. The minute rollover (0:59 → 1:00) works.
+    - Pause and "no message yet" leave the time alone, and in the gap it counts
+      down.
+    - The display shows 01.23 normally, 02.18 in remaining mode, and -0.03 and
+      -0.01 in the gap.
+    - Autoplay: tray open → close → load queues Play, and it's sent once the
+      disc is ready. Power‑on doesn't.
+    - Brightness still shows 55% for 2.475 s.
+  - Each option off, and all off: the build and the emulator show that feature's
+    old behaviour. With all three off, the time‑message code stays original.
+  - Builds: selecting patches individually works, and dependencies are added
+    automatically. --version works, and Python 3.9 gives the same output.
+  - Not checked: the RAM‑write check covers the new code, but an allow‑list
+    error in my test hid the result for the all‑on build. The four single‑option
+    builds with the corrected test all came out clean.
+
+  Worth checking on the device:
+  1. Do the occasional 2‑second jumps disappear?
+  2. Does the gap show as -0.0x between tracks?
+  3. Does it start playing by itself after inserting a disc, but not after
+     switching on?
+
+  There's a new patch name (cdtime) and three new options, which you may want to
+  mention in the README. The change is in build_patch.py only and isn't
+  committed.
+
+❯ For the negative time, this does also show occasioanlly during normal play.   
+  E.g. the display has 00.09, 00:10, -0:10, 00:11.                              
+  And for the auto play when inserting, one missing use case is switching on    
+  the player without a disc, and then insering a disc. It doesn't start, but    
+  logically I feel it should start.                                             
+
+⏺ Both issues are fixed in patch/IAP_PL100_1v1_b250219_all_v7.hex. I've tested
+  it in the emulator, not yet on the player.
+
+  1. Stray -0:10 during normal play
+  - Cause: the module sometimes sends a second message for the same second, and
+    that second message carries a non‑zero frame count. My gap detection treated
+    that as a gap.
+  - Fix: a message only counts as gap time if it also counts down:
+    - the player is playing, minutes are 0, and the frame count isn't 0;
+    - and either the track number has just changed, or the seconds are lower
+      than in the previous message.
+    - A repeat of the same second keeps whatever state it had.
+  - Emulator: your sequence 0:09, 0:10, 0:10 (with frames), 0:11 shows no -. A
+    real gap before a track still shows -0.03 … -0.01, including when a second
+    repeats in the gap.
+  - Remaining edge case: if the first message after pressing Next happens to
+    carry a frame count, -0.01 can flash for one second.
+
+  2. Autoplay after switching on without a disc
+  - Cause: the PL100 has a slot, not a tray, which I hadn't taken into account.
+    "Eject" only happens when a disc is ejected, so with an empty slot at
+    power‑on, autoplay was never armed.
+  - Fix: an empty slot now also arms autoplay. The firmware shows that state as
+    "Disc", status 3. It only counts once it has lasted a second, so a brief "no
+    disc" while loading a disc that's already inside doesn't make the player
+    autoplay at power‑on.
+  - Emulator:
+    - Switch on without a disc → after 1 s armed → insert a disc → Load/Read →
+      plays once ready.
+    - Switch on with a disc and a brief "no disc" → no autoplay.
+    - Eject → insert the next disc → plays, as before.
+
+  Checks:
+  - Time fill: still works.
+  - Each option off: gives the old behaviour.
+  - Builds: the written file matches the tested build, and Python 3.9 gives the
+    same output.
+
+  Worth checking on the device:
+  1. No more stray - during normal play, but still -0.0x between tracks.
+  2. Switch on without a disc, insert one: it should start by itself.
+  3. Switch on with a disc inside: it should not start by itself. That relies on
+     the module not reporting "no disc" for a full second while loading. If it
+     does autoplay, tell me and I'll make the arming stricter.
+
+  The change is only in build_patch.py and isn't committed.
+
+❯ Switching on with no disc and then inserting a disc doesn't start playing     
+  yet.
+
+⏺ I've changed how autoplay arms for an empty slot. The new build is
+  patch/IAP_PL100_1v1_b250219_all_v8.hex, tested in the emulator only.
+
+  The cause
+  The firmware shows "Disc" for two different states. Status 3 comes from an
+  ordinary status message. Status 6 is set when the module reports an error
+  code, which an empty slot most likely is. v7 only armed on status 3. It also
+  restarted the 1‑second wait whenever another status came in between, which
+  also fails if the module keeps retrying with an empty slot.
+
+  The fix: new arming rule
+  - Start: the first "Disc" (status 3 or 6) starts the timer.
+  - Arm: a "Disc" at least 1 second later arms autoplay. "Load" or "Read" in
+    between, from retries, doesn't reset the timer.
+  - Cancel: if a disc becomes ready while the timer is running, autoplay isn't
+    armed. That's the case when you switch on with a disc inside and "Disc" only
+    flashes briefly.
+  - Eject: still arms immediately, as before.
+
+  Emulator results
+
+  ┌──────────────────────────────────────┬──────────────────────────────────┐
+  │               Scenario               │              Result              │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Switched on, empty slot (status 6),  │ armed after 1.3 s, Play queued   │
+  │ disc inserted 5 s later              │ at Load, plays once ready        │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Empty slot with retries (Disc/Load   │ armed, plays                     │
+  │ alternating)                         │                                  │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Empty slot reported as status 3      │ armed, plays                     │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Switched on with a disc, brief       │ no autoplay                      │
+  │ "Disc" while loading                 │                                  │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Eject → insert the next disc         │ plays                            │
+  ├──────────────────────────────────────┼──────────────────────────────────┤
+  │ Autoplay switched off                │ never queues                     │
+  └──────────────────────────────────────┴──────────────────────────────────┘
+
+  The gap detection and time fill behave as before, and Python 3.9 gives the
+  same output.
+
+  One limit to watch: if the module shows "Disc" twice, more than a second
+  apart, while loading a disc that's already inside, the player would autoplay
+  at power‑on. If you see that, tell me. The fix would then be to only arm after
+  "Disc" has lasted longer, or to arm only when no disc was present at
+  power‑on.
+
+  To test on the device:
+  1. Switch on without a disc, wait until "Disc" shows, insert a disc. It should
+     start by itself.
+  2. Switch on with a disc inside. It should not start by itself.
+
+  The change is only in build_patch.py and isn't committed.
