@@ -37,6 +37,13 @@ Patch 4 - Play pressed while the disc is still loading is lost.
     handler once the disc is ready (TOC done, tracks known, total time known
     for audio CDs). Opening the tray, no disc, any other play-state change or
     standby cancels it. Needs disctime (added automatically).
+  * Standby switches the CD module off; it reloads the disc at power-on (also
+    after a cold start, which runs the standby entry once). Standby entry
+    therefore resets the disc state (disctime's disc_reset), so Play during
+    that reload is queued too.
+  * AUTOPLAY_ON: after a disc has been ejected, or while the slot is empty
+    (e.g. switched on without a disc), the next disc load queues a Play by
+    itself. Not at power-on with a disc inside.
 
 Patch 5 - track time remaining, with an hourglass icon.
   * Remote key DISP (TIME_IR) toggles line 2 between elapsed track time and
@@ -48,6 +55,19 @@ Patch 5 - track time remaining, with an hourglass icon.
     display update shows it in remaining mode while playing/paused/seeking.
     REMAINING_ICON_ON = False leaves the icon (code, image and hooks) out.
   * The mode lives in spare byte 0x20000239.
+  * PREGAP_MINUS_ON: the gap before a track, which the module counts down,
+    is shown as "-0.03".."-0.01" (rounded up) in both modes. Needs cdtime's
+    gap detection (added automatically).
+
+Patch cdtime - time messages of the CD module.
+  * About 7 % of the module's messages fail the checksum and are dropped, so
+    the time sometimes jumps by 2 s. TIME_FILL_ON: when playing and no time
+    message came for 1.275 s, advance the elapsed time by 1 s (count down in
+    the gap); the next message sets the module's own time again.
+  * Notes for each time message whether it is from the gap before a track,
+    for PREGAP_MINUS_ON: the module counts the gap down, and those messages
+    have a non-zero frames byte (normal play does too, occasionally, so a
+    count down or a new track is required as well).
 
 Patch 6 - FN cycles the backlight brightness.
   * FN (BRIGHT_IR) has no function on the PL100. It is mapped to key 0x14,
@@ -58,9 +78,9 @@ Patch 6 - FN cycles the backlight brightness.
   * The settings load clamps brightness to 1..6, which would turn level 0
     into 1; brightness gets its own check instead (0..5 valid, else 3).
   * After each press line 1 shows the new level as "10%".."100%" for about
-    2.5 s, like the firmware shows the volume: a hook on the timer check that
-    follows every display update (0x0800E0BC) puts the text into the line 1
-    label after the display update has written it. The duration is measured
+    2.5 s, like the firmware shows the volume: a tick hook (see
+    install_tick_hooks) puts the text into the line 1 label after the display
+    update has written it. The duration is measured
     on the firmware's 75 ms clock (0x20000560, counted in the TIM1 interrupt),
     not in display updates: those run once per main-loop pass (~40 ms).
   * IR_DIAG_ON (off by default): show the last received IR command as
@@ -73,7 +93,7 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * Without --version the boot screen stays original.
 
 Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
-  patches: track, backlight, disctime, play, remaining, brightness (default: all)
+  patches: track, backlight, disctime, play, cdtime, remaining, brightness (default: all)
 """
 import argparse
 import struct
@@ -127,6 +147,18 @@ CLOCK_75MS = 0x20000560    # u16, +1 every 10 TIM1 ticks (96 MHz / 72 / 10000 = 
 BRIGHT_OSD = 0x20000294    # spare: dead settings menu cursor bytes, 0 after boot
                            # +0 u16 end time (CLOCK_75MS), +2 u8 active
 BRIGHT_OSD_STEPS = 33      # show the level for 33 x 75 ms = 2.5 s
+TIME_STAMP = 0x20000298    # u16 spare (dead menu table): CLOCK_75MS at the last time message
+TIME_ARMED = 0x20000297    # u8 spare (dead menu byte, 0 after boot): a time message arrived while playing
+PREGAP = 0x2000023A        # u8 spare (0 after boot): last time message was in the gap before a track
+AUTOPLAY_ARMED = 0x2000028E  # u8 spare (dead menu byte, 0 after boot): 1 armed, 2 timing "Disc"
+AUTOPLAY_SINCE = 0x2000029A  # u16 spare (dead menu table): CLOCK_75MS when "Disc" was first seen
+AUTOPLAY_NODISC_STEPS = 14   # "Disc" again 14 x 75 ms = 1 s later arms autoplay (not a brief one)
+TIME_PREV = 0x2000029C     # 3 x u8 spare (dead menu table): track, sec, min of the previous time message
+CD_MSG_TRACK = CD_STATE + 0x99  # time message: track number
+CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the gap before a track
+TIME_FILL_STEPS = 17       # no time message for 17 x 75 ms = 1.275 s: one was lost
+TIME_FILL_STEP = 13        # then again every ~1 s (13 x 75 ms) while they stay missing
+TICK_HOOKS = []            # cave functions to run after every display update (see install_tick_hooks)
 BRIGHT_OSD_TEXT = ['100%', '65%', '55%', '35%', '20%', '10%']   # levels 0..5
 DRAW_STR = 0x08009A42      # boot screen: (col, row, str, fg, [sp] bg), 13 px per char
 DRAW_CHAR = 0x0800994A     # boot screen: (col, row, ch, fg, [sp] bg), 12x16 glyph
@@ -142,6 +174,9 @@ TIME_IR = 0x0C             # elapsed / remaining time toggle: DISP
 BRIGHT_IR = 0x08           # brightness cycle: FN
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
+TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
+PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
+AUTOPLAY_ON = True         # start playing when a disc has loaded after the tray was opened
 
 EXPORTS = {}               # cave addresses one patch provides for another
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
@@ -379,6 +414,74 @@ PLAY_KEY = [
     'play_poll:',
     ('push', reglist('r4', lr=True)),
     ('bl', MAIN_TASK),
+    # autoplay: armed by a disc being ejected (status Eject) or by the slot
+    # being empty ("Disc": status 3, or 6 for a module error code), counted
+    # from the first "Disc" and confirmed by one at least 1 s later; other
+    # statuses in between (load retries) do not reset that, a disc becoming
+    # ready does (a brief "Disc" while a disc inside loads at power-on). When
+    # the next load starts (Load / Read, stopped), queue a Play like a key
+    # press would.
+    *([('ldr_lit', 'r3', 'lit_state'),
+       ('ldrb', 'r0', 'r3', 7),          # tray status
+       ('ldr_lit', 'r1', 'lit_autoplay'),
+       ('ldrb', 'r2', 'r1', 0),          # 0 idle, 1 armed, 2 timing "Disc"
+       ('cmp', 'r0', 2),
+       ('beq', 'ap_arm'),
+       ('cmp', 'r0', 3),
+       ('beq', 'ap_nodisc'),
+       ('cmp', 'r0', 6),
+       ('beq', 'ap_nodisc'),
+       ('cmp', 'r2', 1),
+       ('beq', 'ap_check'),
+       ('cmp', 'r2', 2),
+       ('bne', 'ap_done'),
+       ('bl', 'disc_ready'),             # timing, and a disc became ready:
+       ('cmp', 'r0', 0),                 # the "Disc" was only brief
+       ('beq', 'ap_done'),
+       ('ldr_lit', 'r1', 'lit_autoplay'),
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r1', 0),
+       ('b', 'ap_done'),
+       'ap_nodisc:',
+       ('cmp', 'r2', 0),
+       ('bne', 'ap_timing'),
+       ('movs', 'r2', 2),                # first "Disc": start timing
+       ('strb', 'r2', 'r1', 0),
+       ('ldr_lit', 'r0', 'lit_clock'),
+       ('ldrh', 'r0', 'r0', 0),
+       ('ldr_lit', 'r2', 'lit_ap_since'),
+       ('strh', 'r0', 'r2', 0),
+       ('b', 'ap_done'),
+       'ap_timing:',
+       ('cmp', 'r2', 2),
+       ('bne', 'ap_done'),
+       ('ldr_lit', 'r0', 'lit_clock'),
+       ('ldrh', 'r0', 'r0', 0),
+       ('ldr_lit', 'r2', 'lit_ap_since'),
+       ('ldrh', 'r2', 'r2', 0),
+       ('subs', 'r0', 'r0', 'r2'),
+       ('uxth', 'r0', 'r0'),
+       ('cmp', 'r0', AUTOPLAY_NODISC_STEPS),
+       ('blo', 'ap_done'),
+       'ap_arm:',
+       ('movs', 'r2', 1),
+       ('strb', 'r2', 'r1', 0),
+       ('b', 'ap_done'),
+       'ap_check:',
+       ('cmp', 'r0', 1),
+       ('beq', 'ap_load'),
+       ('cmp', 'r0', 5),
+       ('bne', 'ap_done'),
+       'ap_load:',
+       ('ldrb', 'r0', 'r3', 4),
+       ('cmp', 'r0', 1),
+       ('bne', 'ap_done'),
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r1', 0),
+       ('ldr_lit', 'r1', 'lit_pending'),
+       ('movs', 'r0', 1),
+       ('strb', 'r0', 'r1', 0),
+       'ap_done:'] if AUTOPLAY_ON else []),
     ('ldr_lit', 'r4', 'lit_pending'),
     ('ldrb', 'r0', 'r4', 0),
     ('cbz', 'r0', 'poll_done'),
@@ -414,6 +517,8 @@ PLAY_KEY = [
     ('ldr_lit', 'r1', 'lit_pending'),
     ('movs', 'r0', 0),
     ('strb', 'r0', 'r1', 0),
+    *([('ldr_lit', 'r1', 'lit_autoplay'),   # power-on reload: no autoplay
+       ('strb', 'r0', 'r1', 0)] if AUTOPLAY_ON else []),
     ('bl', 'DISC_RESET'),            # disctime's disc_reset (filled in by patch_play)
     ('bl', STANDBY_FIRST_CALL),
     ('pop', reglist('r4', pc=True)),
@@ -427,6 +532,12 @@ PLAY_KEY = [
     ('word', PLAY_PENDING),
     'lit_redraw:',
     ('word', DISPLAY_REDRAW),
+    'lit_autoplay:',
+    ('word', AUTOPLAY_ARMED),
+    'lit_ap_since:',
+    ('word', AUTOPLAY_SINCE),
+    'lit_clock:',
+    ('word', CLOCK_75MS),
 ]
 
 
@@ -568,6 +679,12 @@ FMT_TIME = [
     ('ldr_lit', 'r3', 'lit_state_f4'),
     ('ldr', 'r4', 'r3', 0x0C),       # +0x100 elapsed min
     ('ldrb', 'r5', 'r3', 0x10),      # +0x104 elapsed sec
+    *([('ldr_lit', 'r0', 'lit_pregap'),
+       ('ldrb', 'r0', 'r0', 0),
+       ('cbz', 'r0', 'not_gap'),
+       ('adds_i8', 'r5', 1),         # gap: whole seconds left, rounded up
+       ('b', 'show'),
+       'not_gap:'] if PREGAP_MINUS_ON else []),
     ('ldr_lit', 'r0', 'lit_mode'),
     ('ldrb', 'r0', 'r0', 0),
     ('cbz', 'r0', 'show'),
@@ -598,6 +715,13 @@ FMT_TIME = [
     ('uxth', 'r1', 'r5'),
     ('movs', 'r2', 2),
     ('bl', PUT_NUM_L2),
+    *([('ldr_lit', 'r0', 'lit_pregap'),
+       ('ldrb', 'r0', 'r0', 0),
+       ('cbz', 'r0', 'fmt_done'),
+       ('movs', 'r0', 0),
+       ('movs', 'r1', 0x2D),         # '-' over the minutes' tens digit: "-0.03"
+       ('bl', PUT_CHAR_L2),
+       'fmt_done:'] if PREGAP_MINUS_ON else []),
     ('pop', reglist('r4', 'r5', pc=True)),
 
     # time_toggle(): key 0x26 (TIME_IR) - flip elapsed <-> remaining, force the
@@ -642,6 +766,8 @@ FMT_TIME = [
     ('word', LAST_SHOWN_MIN),
     'lit_redraw:',
     ('word', DISPLAY_REDRAW),
+    'lit_pregap:',
+    ('word', PREGAP),
     *(['lit_ui:', ('word', UI)] if DISP_HOOK_ON else []),
     *(['lit_ir_diag:', ('word', IR_DIAG),
        'lit_line1:', ('word', LINE1_BUF)] if IR_DIAG_ON else []),
@@ -709,11 +835,10 @@ KEY_HOOK = [
     ('strb', 'r0', 'r1', 2),         # active
     ('pop', reglist('r4', pc=True)),
 
-    # bright_tick(): replaces the timer check right after the display update
-    # (once per tick). While the OSD timer runs, line 1 shows the level.
-    'bright_tick:',
+    # bright_osd(): runs after every display update (TICK_HOOKS). While the
+    # OSD timer runs, line 1 shows the level.
+    'bright_osd:',
     ('push', reglist('r4', lr=True)),
-    ('mov', 'r4', 'r0'),
     ('ldr_lit', 'r3', 'lit_osd'),
     ('ldrb', 'r0', 'r3', 2),
     ('cbz', 'r0', 'osd_done'),       # not active
@@ -741,8 +866,6 @@ KEY_HOOK = [
     ('movs', 'r0', 0),               # shows the track again
     ('strb', 'r0', 'r3', 2),
     'osd_done:',
-    ('mov', 'r0', 'r4'),
-    ('bl', TIMER_EXPIRED),
     ('pop', reglist('r4', pc=True)),
 
     # bright_load(): replaces the generic 1..6 clamp when the saved brightness
@@ -784,10 +907,7 @@ def patch_brightness(img):
     # settings load: brightness clamp(val, 7) -> bright_load
     code, _ = assemble([('bl', lab['bright_load'])], 0x08006EBC)
     patch(img, 0x08006EBC, bytes.fromhex('fff778fe'), code)
-    # timer check right after the display update -> bright_tick (level on line 1)
-    old, _ = assemble([('bl', TIMER_EXPIRED)], 0x0800E0BC)
-    code, _ = assemble([('bl', lab['bright_tick'])], 0x0800E0BC)
-    patch(img, 0x0800E0BC, old, code)
+    TICK_HOOKS.append(lab['bright_osd'])   # level on line 1 after each display update
     put(img, lab['key_hook'], cave)
     print(f"brightness: key_hook at {lab['key_hook']:#x}, {len(cave)} bytes"
           + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
@@ -815,6 +935,167 @@ def patch_remaining(img):
     put(img, lab['fmt_time'], cave)
     print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes"
           + (' (with hourglass icon)' if REMAINING_ICON_ON else ' (no icon)'))
+
+
+# time_msg(): replaces "strb.w r0, [r1, #0x104]" (elapsed seconds) in both
+# branches of the CD module's time message (0x21) handler. Does that store,
+# then notes the time of arrival and whether the message is from the gap
+# before a track, which the module counts down: while playing, minutes 0, a
+# non-zero frames byte (normal play mostly reports whole seconds, but not
+# always), and either a new track or fewer seconds than the previous message
+# (the same second again keeps the state). r1 (CD state) must survive.
+# time_fill(): tick hook. While playing, if no time message came for 1.275 s
+# one was lost (~7 % fail the checksum): advance the elapsed time by 1 s
+# (count down in the gap), then every ~1 s while they stay missing. The next
+# message overwrites it with the module's own time.
+def cd_time():
+    return [
+        'time_msg:',
+        ('push', reglist('r4', 'r5', lr=True)),
+        ('ldr_lit', 'r2', 'lit_elapsed'),
+        ('strb', 'r0', 'r2', 4),         # +0x104 elapsed sec (the replaced store)
+        ('movs', 'r4', 0),               # in the gap?
+        ('ldr', 'r3', 'r2', 0),          # +0x100 elapsed min
+        ('cbnz', 'r3', 'gap_set'),
+        ('ldr_lit', 'r3', 'lit_state'),
+        ('ldrb', 'r3', 'r3', 4),
+        ('cmp', 'r3', 6),                # playing
+        ('bne', 'gap_set'),
+        ('ldr_lit', 'r3', 'lit_frames'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('cbz', 'r3', 'gap_set'),
+        ('ldr_lit', 'r5', 'lit_prev'),
+        ('ldr_lit', 'r3', 'lit_msg_track'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('ldrb', 'r2', 'r5', 0),
+        ('cmp', 'r3', 'r2'),
+        ('bne', 'is_gap'),               # a new track that starts with a countdown
+        ('ldrb', 'r2', 'r5', 2),
+        ('cbnz', 'r2', 'gap_set'),       # previous message was past the first minute
+        ('ldrb', 'r2', 'r5', 1),
+        ('cmp', 'r0', 'r2'),
+        ('blo', 'is_gap'),               # counting down
+        ('bne', 'gap_set'),
+        ('ldr_lit', 'r2', 'lit_pregap'),
+        ('ldrb', 'r2', 'r2', 0),
+        ('cbz', 'r2', 'gap_set'),        # same second again: keep the state
+        'is_gap:',
+        ('movs', 'r4', 1),
+        'gap_set:',
+        ('ldr_lit', 'r2', 'lit_pregap'),
+        ('strb', 'r4', 'r2', 0),
+        ('ldr_lit', 'r5', 'lit_prev'),   # remember track, sec, min
+        ('ldr_lit', 'r3', 'lit_msg_track'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('strb', 'r3', 'r5', 0),
+        ('strb', 'r0', 'r5', 1),
+        ('ldr_lit', 'r3', 'lit_elapsed'),
+        ('ldr', 'r3', 'r3', 0),
+        ('strb', 'r3', 'r5', 2),
+        ('ldr_lit', 'r0', 'lit_clock'),
+        ('ldrh', 'r3', 'r0', 0),
+        ('ldr_lit', 'r0', 'lit_stamp'),
+        ('strh', 'r3', 'r0', 0),
+        ('ldr_lit', 'r0', 'lit_armed'),
+        ('movs', 'r3', 1),
+        ('strb', 'r3', 'r0', 0),
+        ('pop', reglist('r4', 'r5', pc=True)),
+
+        'time_fill:',
+        ('ldr_lit', 'r3', 'lit_state'),
+        ('ldrb', 'r0', 'r3', 4),         # play state
+        ('ldr_lit', 'r2', 'lit_armed'),
+        ('cmp', 'r0', 6),
+        ('beq', 'tf_play'),
+        ('movs', 'r0', 0),               # not playing: wait for a fresh message
+        ('strb', 'r0', 'r2', 0),
+        ('bx_lr',),
+        'tf_play:',
+        ('ldrb', 'r0', 'r2', 0),
+        ('cbz', 'r0', 'tf_ret'),         # no message yet since play started
+        ('ldr_lit', 'r2', 'lit_stamp'),
+        ('ldrh', 'r0', 'r2', 0),
+        ('ldr_lit', 'r1', 'lit_clock'),
+        ('ldrh', 'r1', 'r1', 0),
+        ('subs', 'r1', 'r1', 'r0'),
+        ('uxth', 'r1', 'r1'),            # 75 ms steps since the last message
+        ('cmp', 'r1', TIME_FILL_STEPS),
+        ('blo', 'tf_ret'),
+        ('adds_i8', 'r0', TIME_FILL_STEP),
+        ('strh', 'r0', 'r2', 0),
+        ('ldr_lit', 'r2', 'lit_elapsed'),
+        ('ldrb', 'r1', 'r2', 4),         # seconds
+        ('ldr_lit', 'r0', 'lit_pregap'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('cbnz', 'r0', 'tf_down'),
+        ('adds_i8', 'r1', 1),
+        ('cmp', 'r1', 60),
+        ('blo', 'tf_store'),
+        ('movs', 'r1', 0),
+        ('ldr', 'r0', 'r2', 0),
+        ('adds_i8', 'r0', 1),
+        ('str', 'r0', 'r2', 0),          # minutes
+        'tf_store:',
+        ('strb', 'r1', 'r2', 4),
+        'tf_ret:',
+        ('bx_lr',),
+        'tf_down:',
+        ('cmp', 'r1', 0),
+        ('beq', 'tf_ret'),
+        ('subs_i3', 'r1', 'r1', 1),
+        ('b', 'tf_store'),
+        ('align',),
+        'lit_elapsed:',
+        ('word', CD_STATE + 0x100),
+        'lit_frames:',
+        ('word', CD_FRAMES),
+        'lit_pregap:',
+        ('word', PREGAP),
+        'lit_clock:',
+        ('word', CLOCK_75MS),
+        'lit_stamp:',
+        ('word', TIME_STAMP),
+        'lit_armed:',
+        ('word', TIME_ARMED),
+        'lit_state:',
+        ('word', CD_STATE),
+        'lit_prev:',
+        ('word', TIME_PREV),
+        'lit_msg_track:',
+        ('word', CD_MSG_TRACK),
+    ]
+
+
+def patch_cdtime(img):
+    if not (TIME_FILL_ON or PREGAP_MINUS_ON):
+        print('cdtime: off (TIME_FILL_ON and PREGAP_MINUS_ON are False)')
+        return
+    cave, lab = assemble(cd_time(), cave_addr(img))
+    for site in (0x0800DDA6, 0x0800DDDC):      # seek / play branch of the time message
+        code, _ = assemble([('bl', lab['time_msg'])], site)
+        patch(img, site, bytes.fromhex('81f80401'), code)
+    if TIME_FILL_ON:
+        TICK_HOOKS.insert(0, lab['time_fill'])  # before the display text hooks
+    put(img, lab['time_msg'], cave)
+    print(f"cdtime: time_msg at {lab['time_msg']:#x}, {len(cave)} bytes"
+          + (' (time fill)' if TIME_FILL_ON else '') + (' (gap detection)' if PREGAP_MINUS_ON else ''))
+
+
+def install_tick_hooks(img):
+    """Run the TICK_HOOKS cave functions after every display update: they
+    replace the timer check that follows it in the main task (0x0800E0BC,
+    bl TIMER_EXPIRED with r0 = its timer), once per main-loop pass."""
+    if not TICK_HOOKS:
+        return
+    prog = ['tick_hooks:', ('push', reglist('r4', lr=True)), ('mov', 'r4', 'r0')]
+    prog += [('bl', fn) for fn in TICK_HOOKS]
+    prog += [('mov', 'r0', 'r4'), ('bl', TIMER_EXPIRED), ('pop', reglist('r4', pc=True))]
+    cave, lab = assemble(prog, cave_addr(img))
+    old, _ = assemble([('bl', TIMER_EXPIRED)], 0x0800E0BC)
+    code, _ = assemble([('bl', lab['tick_hooks'])], 0x0800E0BC)
+    patch(img, 0x0800E0BC, old, code)
+    put(img, lab['tick_hooks'], cave)
+    print(f"tick hooks: {len(TICK_HOOKS)} at {lab['tick_hooks']:#x}")
 
 
 # splash_hook(): draws the original "Ver 1.1" line, then the patch version
@@ -890,9 +1171,11 @@ def remap_buttons(img, names):
 
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
-           'play': patch_play, 'remaining': patch_remaining, 'brightness': patch_brightness}
-# 'play' relies on disctime clearing the disc-ready state when the tray opens
-REQUIRES = {'play': ['disctime']}
+           'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
+           'brightness': patch_brightness}
+# 'play' relies on disctime clearing the disc-ready state when the tray opens;
+# the gap display in 'remaining' needs cdtime's gap detection
+REQUIRES = {'play': ['disctime'], 'remaining': ['cdtime'] if PREGAP_MINUS_ON else []}
 
 
 def main():
@@ -913,6 +1196,7 @@ def main():
     img = read_hex(args.src)
     for name in names:
         PATCHES[name](img)
+    install_tick_hooks(img)
     remap_buttons(img, names)
     if args.version:
         patch_splash(img, args.version)
