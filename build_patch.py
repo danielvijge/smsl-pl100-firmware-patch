@@ -66,6 +66,23 @@ Patch 5 - track time remaining, with an hourglass icon.
     is shown as "-0.03".."-0.01" (rounded up) in both modes. Needs cdtime's
     gap detection (added automatically).
 
+Patch shuffle - true shuffle and a safer end-of-track check.
+  * Repeat and shuffle are one play mode (0x20000189: 0 normal, 1 repeat one,
+    2 repeat disc, 3 shuffle) shown by one icon, so they exclude each other.
+    The firmware's shuffle picks rand() % tracks + 1 at every track end, Next
+    and Previous: tracks repeat and it never ends.
+  * TRUE_SHUFFLE_ON: every track once in random order, then stop (shuffle
+    stays selected; Play starts a new round with a random first track).
+    Previous goes back through the order played; Stop + Play continues the
+    round. Switching shuffle on starts a new round and reseeds rand(). More
+    than 255 tracks: the firmware's behaviour.
+  * TRACK_END_FIX_ON: the firmware acts 2 s before the stored track length
+    ends (shuffle, repeat one, stop after the last track), but that length is
+    the previous track's until the module's next length message (~22 s). The
+    check now only runs with the playing track's own length. It also skipped
+    every length with 0 minutes or 0 seconds (tracks under 1 min, or x:00);
+    now only an unknown length (0:00).
+
 Patch cdtime - time messages of the CD module.
   * About 7 % of the module's messages fail the checksum and are dropped, so
     the time sometimes jumps by 2 s. TIME_FILL_ON: when playing and no time
@@ -100,7 +117,7 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * Without --version the boot screen stays original.
 
 Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
-  patches: track, backlight, disctime, play, cdtime, remaining, brightness (default: all)
+  patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness (default: all)
 """
 import argparse
 import struct
@@ -166,6 +183,22 @@ AUTOPLAY_SINCE = 0x2000029A    # u16 spare (dead menu table): CLOCK_75MS when "D
 AUTOPLAY_NODISC_STEPS = 14     # "Disc" again 14 x 75 ms = 1 s later: no disc after all
 AUTOPLAY_TEXT = ('AUTO', 'OFF')  # line 1 when auto-play is switched on / off
 DISPATCH = 0x0800E5C2          # key dispatcher, called from the main loop at 0x08004320
+CD_QUEUE = 0x0800D03A      # queue a command for the CD module (command number)
+RAND = 0x08029C14          # rand(): LCG, seed at RAND_SEED, returns seed >> 1
+RAND_SEED = 0x20000828
+TIM1_CNT = 0x40012C24      # TIM1 counter (1.33 MHz): entropy for a new seed
+PLAY_MODE = 0x20000189     # 0 normal, 1 repeat one, 2 repeat disc, 3 shuffle (one icon ui+0x28)
+NEXT_TRACK = 0x20000182    # u16 track the play handler plays when NEXT_FLAG is set
+NEXT_FLAG = 0x20000184
+END_CHECK = 0x0800D190     # each pass: 2 s before the stored track length ends, act on the play mode
+END_STOP = 0x0800D2A0      # in END_CHECK: stop as at the end of the disc (exits END_CHECK)
+SH = 0x200002A4            # spare (dead menu table): +0 track of the stored length, +1 history count,
+                           # +2 track seen last, +3 track asked for, +4 u16 time asked, +6 waiting
+SH_PLAYED = 0x200002B0     # 256 x u8 spare (dead menu table): track played in this shuffle round
+SH_HIST = 0x200003B0       # 128 x u8 spare (dead menu table): tracks in the order they played
+SH_HIST_MAX = 128
+SH_WAIT_STEPS = 100        # 7.5 s: the end check keeps firing until the asked-for track plays
+CD_LEN_KIND = CD_STATE + 0x93  # length message: 0 the disc, 1 a track; +0x95 its track number
 TIME_PREV = 0x2000029C     # 3 x u8 spare (dead menu table): track, sec, min of the previous time message
 CD_MSG_TRACK = CD_STATE + 0x99  # time message: track number
 CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the gap before a track
@@ -190,6 +223,8 @@ REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-t
 TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
+TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
+TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 
 EXPORTS = {}               # cave addresses one patch provides for another
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
@@ -420,6 +455,7 @@ PLAY_KEY = [
     ('strb', 'r0', 'r1', 0),
     ('pop', reglist('r4', pc=True)),
     'play_now:',
+    ('bl', 'SHUFFLE_START'),         # shuffle patch, if built: random first track
     ('bl', PLAY_HANDLER),
     ('pop', reglist('r4', pc=True)),
 
@@ -575,6 +611,7 @@ PLAY_KEY = [
     ('cbz', 'r0', 'poll_done'),
     ('movs', 'r0', 0),
     ('strb', 'r0', 'r4', 0),
+    ('bl', 'SHUFFLE_START'),
     ('bl', PLAY_HANDLER),
     ('ldr_lit', 'r1', 'lit_redraw'),
     ('movs', 'r0', 1),
@@ -1097,10 +1134,19 @@ def ensure_osd(img):
 
 
 def resolve(prog):
-    """Fill in placeholders for code another patch provides (see EXPORTS)."""
-    ext = {'DISC_RESET': 'disc_reset', 'OSD_SHOW': 'osd_show'}
-    return [(ins[0], EXPORTS[ext[ins[1]]]) if isinstance(ins, tuple) and len(ins) == 2 and ins[1] in ext
-            else ins for ins in prog]
+    """Fill in placeholders for code another patch provides (see EXPORTS);
+    optional ones are left out when that patch is not built."""
+    ext = {'DISC_RESET': 'disc_reset', 'OSD_SHOW': 'osd_show', 'SHUFFLE_START': 'sh_start'}
+    optional = {'SHUFFLE_START'}
+    out = []
+    for ins in prog:
+        if isinstance(ins, tuple) and len(ins) == 2 and ins[1] in ext:
+            if ext[ins[1]] in EXPORTS:
+                ins = (ins[0], EXPORTS[ext[ins[1]]])
+            elif ins[1] in optional:
+                continue
+        out.append(ins)
+    return out
 
 
 # time_msg(): replaces "strb.w r0, [r1, #0x104]" (elapsed seconds) in both
@@ -1247,6 +1293,400 @@ def patch_cdtime(img):
           + (' (time fill)' if TIME_FILL_ON else '') + (' (gap detection)' if PREGAP_MINUS_ON else ''))
 
 
+# Shuffle (play mode 3) picks a random track with rand() % tracks + 1 at the
+# end of a track (END_CHECK), on Next and on Previous, so tracks repeat and it
+# never ends. TRUE_SHUFFLE_ON replaces those rand() calls: a random track not
+# played yet in this round (SH_PLAYED), Previous goes back through the order
+# played (SH_HIST), and when all have played it stops like the end of a disc.
+# Switching shuffle on starts a new round and reseeds rand() (it is otherwise
+# seeded once at cold start with an almost constant value). A tick hook notes
+# every track that starts playing. More than 255 tracks: the old behaviour.
+# TRACK_END_FIX_ON: END_CHECK uses the stored track length (+0x108), which
+# keeps the previous track's length until the module's next length message
+# (~every 22 s), so a short previous track could end the next one early. The
+# length message says which track it is for (+0x93 = 1, track +0x95); END_CHECK
+# now only runs when that is the playing track.
+def shuffle_code():
+    prog = []
+    if TRACK_END_FIX_ON:
+        prog += [
+            'len_msg:',                  # replaces strb.w r0, [r1, #0x10c] (track length sec)
+            ('mov', 'r2', 'r1'),
+            ('adds_i8', 'r2', 0xFF),
+            ('adds_i8', 'r2', 0x0D),     # CD state + 0x10C
+            ('strb', 'r0', 'r2', 0),
+            ('ldr_lit', 'r2', 'lit_len_kind'),
+            ('ldrb', 'r0', 'r2', 0),
+            ('cmp', 'r0', 1),
+            ('bne', 'len_none'),
+            ('ldrb', 'r0', 'r2', 2),     # track number
+            ('b', 'len_set'),
+            'len_none:',
+            ('movs', 'r0', 0),           # the disc total, filed as a track length
+            'len_set:',
+            ('ldr_lit', 'r2', 'lit_sh'),
+            ('strb', 'r0', 'r2', 0),
+            ('bx_lr',),
+
+            'end_check:',                # replaces bl END_CHECK in the main task
+            ('ldr_lit', 'r2', 'lit_sh'),
+            ('ldrb', 'r0', 'r2', 0),
+            ('ldr_lit', 'r1', 'lit_cur'),
+            ('ldr', 'r1', 'r1', 0),
+            ('cmp', 'r0', 'r1'),
+            ('bne', 'ec_skip'),
+            ('b.w', END_CHECK),
+            'ec_skip:',
+            ('bx_lr',),
+        ]
+    if TRUE_SHUFFLE_ON:
+        prog += [
+            'sh_n:',                     # r0 = number of tracks if 1..255, else 0
+            ('ldr_lit', 'r0', 'lit_tracks'),
+            ('ldr', 'r0', 'r0', 0),
+            ('cmp', 'r0', 255),
+            ('bls', 'shn_ok'),
+            ('movs', 'r0', 0),
+            'shn_ok:',
+            ('bx_lr',),
+
+            'sh_pick:',                  # r0 = random unplayed track, marked played; 0 if none
+            ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+            ('bl', 'sh_n'),
+            ('mov', 'r5', 'r0'),
+            ('ldr_lit', 'r6', 'lit_played'),
+            ('movs', 'r4', 0),
+            ('movs', 'r7', 1),
+            'pk_count:',
+            ('cmp', 'r7', 'r5'),
+            ('bhi', 'pk_counted'),
+            ('adds', 'r2', 'r6', 'r7'),
+            ('ldrb', 'r2', 'r2', 0),
+            ('cbnz', 'r2', 'pk_c_next'),
+            ('adds_i8', 'r4', 1),
+            'pk_c_next:',
+            ('adds_i8', 'r7', 1),
+            ('b', 'pk_count'),
+            'pk_counted:',
+            ('movs', 'r0', 0),
+            ('cmp', 'r4', 0),
+            ('beq', 'pk_ret'),
+            ('bl', RAND),
+            ('udiv', 'r1', 'r0', 'r4'),
+            ('muls', 'r1', 'r4'),
+            ('subs', 'r0', 'r0', 'r1'),  # k = rand() % unplayed
+            ('movs', 'r7', 1),
+            'pk_find:',
+            ('adds', 'r2', 'r6', 'r7'),
+            ('ldrb', 'r2', 'r2', 0),
+            ('cbnz', 'r2', 'pk_f_next'),
+            ('cmp', 'r0', 0),
+            ('beq', 'pk_found'),
+            ('subs_i3', 'r0', 'r0', 1),
+            'pk_f_next:',
+            ('adds_i8', 'r7', 1),
+            ('b', 'pk_find'),
+            'pk_found:',
+            ('adds', 'r2', 'r6', 'r7'),
+            ('movs', 'r1', 1),
+            ('strb', 'r1', 'r2', 0),
+            ('mov', 'r0', 'r7'),
+            'pk_ret:',
+            ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+            'sh_reset:',                 # new round: nothing played, no history
+            ('ldr_lit', 'r0', 'lit_played'),
+            ('movs', 'r1', 0),
+            ('movs', 'r2', 64),
+            'rs_loop:',
+            ('str', 'r1', 'r0', 0),
+            ('adds_i8', 'r0', 4),
+            ('subs_i3', 'r2', 'r2', 1),
+            ('bne', 'rs_loop'),
+            ('ldr_lit', 'r0', 'lit_sh'),
+            ('strb', 'r1', 'r0', 1),
+            ('strb', 'r1', 'r0', 2),
+            ('strb', 'r1', 'r0', 6),
+            ('bx_lr',),
+
+            'sh_expect:',                # r0 = track asked for (kept); END_CHECK repeats it meanwhile
+            ('ldr_lit', 'r3', 'lit_sh'),
+            ('strb', 'r0', 'r3', 3),
+            ('ldr_lit', 'r1', 'lit_clock'),
+            ('ldrh', 'r1', 'r1', 0),
+            ('strh', 'r1', 'r3', 4),
+            ('movs', 'r1', 1),
+            ('strb', 'r1', 'r3', 6),
+            ('bx_lr',),
+
+            'sh_seen:',                  # r0 = track that started: played, add to the history
+            ('ldr_lit', 'r3', 'lit_sh'),
+            ('strb', 'r0', 'r3', 2),
+            ('ldrb', 'r1', 'r3', 3),
+            ('cmp', 'r1', 'r0'),
+            ('bne', 'ss_mark'),
+            ('movs', 'r1', 0),
+            ('strb', 'r1', 'r3', 6),     # the track asked for is playing
+            'ss_mark:',
+            ('ldr_lit', 'r2', 'lit_played'),
+            ('adds', 'r2', 'r2', 'r0'),
+            ('movs', 'r1', 1),
+            ('strb', 'r1', 'r2', 0),
+            ('ldrb', 'r1', 'r3', 1),
+            ('cbz', 'r1', 'ss_push'),
+            ('ldr_lit', 'r2', 'lit_hist'),
+            ('adds', 'r2', 'r2', 'r1'),
+            ('subs_i3', 'r2', 'r2', 1),
+            ('ldrb', 'r2', 'r2', 0),
+            ('cmp', 'r2', 'r0'),
+            ('beq', 'ss_done'),          # already the last one (Previous)
+            'ss_push:',
+            ('cmp', 'r1', SH_HIST_MAX),
+            ('bhs', 'ss_done'),
+            ('ldr_lit', 'r2', 'lit_hist'),
+            ('adds', 'r2', 'r2', 'r1'),
+            ('strb', 'r0', 'r2', 0),
+            ('adds_i8', 'r1', 1),
+            ('strb', 'r1', 'r3', 1),
+            'ss_done:',
+            ('bx_lr',),
+
+            'sh_stop:',                  # stop as at the end of the disc (like END_STOP)
+            ('ldr_lit', 'r1', 'lit_state'),
+            ('movs', 'r0', 1),
+            ('strb', 'r0', 'r1', 4),
+            ('ldr_lit', 'r1', 'lit_cur'),
+            ('str', 'r0', 'r1', 0),      # track 1
+            ('movs', 'r0', 0),
+            ('str', 'r0', 'r1', 4),      # 0:00
+            ('strb', 'r0', 'r1', 8),
+            ('movs', 'r0', 3),
+            ('b.w', CD_QUEUE),
+
+            'sh_tick:',                  # tick hook: note the track that is playing
+            ('push', reglist('r4', lr=True)),
+            ('ldr_lit', 'r0', 'lit_mode'),
+            ('ldrb', 'r0', 'r0', 0),
+            ('cmp', 'r0', 3),
+            ('bne', 'st_done'),
+            ('ldr_lit', 'r3', 'lit_state'),
+            ('ldrb', 'r0', 'r3', 4),
+            ('cmp', 'r0', 6),
+            ('bne', 'st_done'),
+            ('bl', 'sh_n'),
+            ('mov', 'r4', 'r0'),
+            ('ldr_lit', 'r0', 'lit_cur'),
+            ('ldr', 'r0', 'r0', 0),
+            ('cmp', 'r0', 0),
+            ('beq', 'st_done'),
+            ('cmp', 'r0', 'r4'),
+            ('bhi', 'st_done'),
+            ('ldr_lit', 'r3', 'lit_sh'),
+            ('ldrb', 'r1', 'r3', 2),
+            ('cmp', 'r0', 'r1'),
+            ('beq', 'st_done'),
+            ('bl', 'sh_seen'),
+            'st_done:',
+            ('pop', reglist('r4', pc=True)),
+
+            'sh_end:',                   # replaces rand() in END_CHECK's shuffle branch
+            ('push', reglist('r4', lr=True)),
+            ('bl', 'sh_n'),
+            ('cmp', 'r0', 0),
+            ('beq', 'se_fb'),
+            ('ldr_lit', 'r3', 'lit_sh'),
+            ('ldrb', 'r0', 'r3', 6),
+            ('cbz', 'r0', 'se_new'),
+            ('ldrh', 'r0', 'r3', 4),
+            ('ldr_lit', 'r1', 'lit_clock'),
+            ('ldrh', 'r1', 'r1', 0),
+            ('subs', 'r1', 'r1', 'r0'),
+            ('uxth', 'r1', 'r1'),
+            ('cmp', 'r1', SH_WAIT_STEPS),
+            ('bhs', 'se_new'),
+            ('ldrb', 'r0', 'r3', 3),     # still waiting for the track asked for
+            ('b', 'se_ret'),
+            'se_new:',
+            ('bl', 'sh_pick'),
+            ('cbz', 'r0', 'se_done'),
+            ('bl', 'sh_expect'),
+            'se_ret:',
+            ('subs_i3', 'r0', 'r0', 1),  # the firmware plays rand() % tracks + 1
+            ('pop', reglist('r4', pc=True)),
+            'se_done:',                  # all played: new round next time, stop
+            ('bl', 'sh_reset'),
+            ('pop', reglist('r4')),
+            ('add_sp', 4),
+            ('b.w', END_STOP),
+            'se_fb:',
+            ('bl', RAND),
+            ('pop', reglist('r4', pc=True)),
+
+            'sh_next:',                  # replaces rand() for Next in shuffle
+            ('push', reglist('r4', lr=True)),
+            ('bl', 'sh_n'),
+            ('cbz', 'r0', 'sn_fb'),
+            ('bl', 'sh_pick'),
+            ('cbz', 'r0', 'sn_done'),
+            ('bl', 'sh_expect'),
+            ('subs_i3', 'r0', 'r0', 1),
+            ('pop', reglist('r4', pc=True)),
+            'sn_done:',                  # all played: stop, new round next time
+            ('bl', 'sh_reset'),
+            ('bl', 'sh_stop'),
+            ('pop', reglist('r4')),
+            ('add_sp', 4),
+            ('b.w', 0x0800E822),         # skip the firmware's "play track" part
+            'sn_fb:',
+            ('bl', RAND),
+            ('pop', reglist('r4', pc=True)),
+
+            'sh_prev:',                  # replaces rand() for Previous in shuffle
+            ('push', reglist('r4', lr=True)),
+            ('bl', 'sh_n'),
+            ('cbz', 'r0', 'sp_fb'),
+            ('ldr_lit', 'r3', 'lit_sh'),
+            ('ldrb', 'r1', 'r3', 1),
+            ('cmp', 'r1', 2),
+            ('blo', 'sp_restart'),
+            ('subs_i3', 'r1', 'r1', 1),
+            ('strb', 'r1', 'r3', 1),     # drop the current track from the history
+            ('ldr_lit', 'r2', 'lit_hist'),
+            ('adds', 'r2', 'r2', 'r1'),
+            ('ldrb', 'r0', 'r2', 0),
+            ('ldr_lit', 'r2', 'lit_played'),
+            ('adds', 'r2', 'r2', 'r0'),
+            ('movs', 'r0', 0),
+            ('strb', 'r0', 'r2', 0),     # and put it back in the round
+            ('subs_i3', 'r1', 'r1', 1),
+            ('ldr_lit', 'r2', 'lit_hist'),
+            ('adds', 'r2', 'r2', 'r1'),
+            ('ldrb', 'r0', 'r2', 0),     # the track played before it
+            ('b', 'sp_ret'),
+            'sp_restart:',
+            ('ldr_lit', 'r0', 'lit_cur'),
+            ('ldr', 'r0', 'r0', 0),      # first of the round: restart it
+            'sp_ret:',
+            ('bl', 'sh_expect'),
+            ('subs_i3', 'r0', 'r0', 1),
+            ('pop', reglist('r4', pc=True)),
+            'sp_fb:',
+            ('bl', RAND),
+            ('pop', reglist('r4', pc=True)),
+
+            'sh_on:',                    # replaces queue(0x0D) when shuffle is switched on
+            ('push', reglist('r4', lr=True)),
+            ('mov', 'r4', 'r0'),
+            ('ldr_lit', 'r0', 'lit_tim1_cnt'),
+            ('ldr', 'r0', 'r0', 0),
+            ('ldr_lit', 'r1', 'lit_clock'),
+            ('ldrh', 'r1', 'r1', 0),
+            ('lsls', 'r1', 'r1', 16),
+            ('adds', 'r0', 'r0', 'r1'),
+            ('ldr_lit', 'r1', 'lit_seed'),
+            ('ldr', 'r2', 'r1', 0),
+            ('adds', 'r0', 'r0', 'r2'),
+            ('str', 'r0', 'r1', 0),      # new seed
+            ('bl', 'sh_reset'),
+            ('ldr_lit', 'r3', 'lit_state'),
+            ('ldrb', 'r0', 'r3', 4),
+            ('cmp', 'r0', 6),
+            ('beq', 'on_cur'),
+            ('cmp', 'r0', 3),
+            ('bne', 'on_done'),
+            'on_cur:',                   # playing / paused: this track counts as played
+            ('bl', 'sh_n'),
+            ('ldr_lit', 'r1', 'lit_cur'),
+            ('ldr', 'r1', 'r1', 0),
+            ('cmp', 'r1', 'r0'),
+            ('bhi', 'on_done'),
+            ('cmp', 'r1', 0),
+            ('beq', 'on_done'),
+            ('mov', 'r0', 'r1'),
+            ('bl', 'sh_seen'),
+            'on_done:',
+            ('mov', 'r0', 'r4'),
+            ('bl', CD_QUEUE),
+            ('pop', reglist('r4', pc=True)),
+
+            'sh_start:',                 # before the play handler (play patch): from stop in
+            ('push', reglist('r4', lr=True)),   # shuffle, start with a random track
+            ('ldr_lit', 'r0', 'lit_mode'),
+            ('ldrb', 'r0', 'r0', 0),
+            ('cmp', 'r0', 3),
+            ('bne', 'sst_out'),
+            ('ldr_lit', 'r3', 'lit_state'),
+            ('ldrb', 'r0', 'r3', 4),
+            ('cmp', 'r0', 1),
+            ('bne', 'sst_out'),
+            ('bl', 'sh_n'),
+            ('cbz', 'r0', 'sst_out'),
+            ('bl', 'sh_pick'),
+            ('cbnz', 'r0', 'sst_have'),
+            ('bl', 'sh_reset'),          # last round complete: a new one
+            ('bl', 'sh_pick'),
+            ('cbz', 'r0', 'sst_out'),
+            'sst_have:',
+            ('bl', 'sh_expect'),
+            ('ldr_lit', 'r1', 'lit_next_track'),
+            ('strh', 'r0', 'r1', 0),
+            ('ldr_lit', 'r1', 'lit_next_flag'),
+            ('movs', 'r0', 1),
+            ('strb', 'r0', 'r1', 0),
+            'sst_out:',
+            ('pop', reglist('r4', pc=True)),
+        ]
+    prog += [
+        ('align',),
+        'lit_sh:', ('word', SH),
+        'lit_cur:', ('word', CD_STATE + 0xFC),
+        'lit_len_kind:', ('word', CD_LEN_KIND),
+        'lit_tracks:', ('word', CD_STATE + 0xF4),
+        'lit_state:', ('word', CD_STATE),
+        'lit_played:', ('word', SH_PLAYED),
+        'lit_hist:', ('word', SH_HIST),
+        'lit_mode:', ('word', PLAY_MODE),
+        'lit_clock:', ('word', CLOCK_75MS),
+        'lit_seed:', ('word', RAND_SEED),
+        'lit_tim1_cnt:', ('word', TIM1_CNT),
+        'lit_next_track:', ('word', NEXT_TRACK),
+        'lit_next_flag:', ('word', NEXT_FLAG),
+    ]
+    return prog
+
+
+def patch_shuffle(img):
+    if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON):
+        print('shuffle: off (TRUE_SHUFFLE_ON and TRACK_END_FIX_ON are False)')
+        return
+    cave, lab = assemble(shuffle_code(), cave_addr(img))
+    def hook(site, old_target, new):
+        old, _ = assemble([('bl', old_target)], site)
+        code, _ = assemble([('bl', lab[new])], site)
+        patch(img, site, old, code)
+    if TRACK_END_FIX_ON:
+        code, _ = assemble([('bl', lab['len_msg'])], 0x0800DE34)
+        patch(img, 0x0800DE34, bytes.fromhex('81f80c01'), code)
+        hook(0x0800E0B2, END_CHECK, 'end_check')
+        # END_CHECK skipped when the length's minutes OR seconds were 0 (meant
+        # as "no length known"): tracks under 1 min or of x:00 never ended
+        # early. Skip only when both are 0: "minutes 0 -> skip" becomes
+        # "minutes not 0 -> skip the seconds test".
+        code, _ = assemble([('bne', 0x0800D1CE)], 0x0800D1C2)
+        patch(img, 0x0800D1C2, bytes.fromhex('7cd0'), code)
+    if TRUE_SHUFFLE_ON:
+        hook(0x0800D1F2, RAND, 'sh_end')
+        hook(0x0800E7D6, RAND, 'sh_next')
+        hook(0x0800E82C, RAND, 'sh_prev')
+        hook(0x0800E7B4, CD_QUEUE, 'sh_on')
+        TICK_HOOKS.append(lab['sh_tick'])
+        EXPORTS['sh_start'] = lab['sh_start']
+    first = min(lab[n] for n in ('len_msg', 'sh_n') if n in lab)
+    put(img, first, cave)
+    print(f'shuffle: at {first:#x}, {len(cave)} bytes'
+          + (' (true shuffle)' if TRUE_SHUFFLE_ON else '') + (' (track end fix)' if TRACK_END_FIX_ON else ''))
+
+
 def install_tick_hooks(img):
     """Run the TICK_HOOKS cave functions after every display update: they
     replace the timer check that follows it in the main task (0x0800E0BC,
@@ -1337,7 +1777,7 @@ def remap_buttons(img, names):
 
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
-           'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
+           'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
            'brightness': patch_brightness}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens;
 # the gap display in 'remaining' needs cdtime's gap detection
