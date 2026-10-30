@@ -21,12 +21,17 @@ results can be read in [claude-pl100-patch-chat.md](claude-pl100-patch-chat.md) 
 build script is available in the `diagnostic-remaining-time` git branch. While it cannot be really fix, it is somewhat
 mitigated. When no new time messages come the time is still increased by 1 second. The next time a real message is received
 it is updated. The result is that now it could show a specific time for less then a second, quickly advancing to the next.
-5. Autoplay when insering a disc.
+5. Option to automatically play when inserting a disc.
+   * When no disc is loaded (screen showing `Disc`) press the play button to enable auto play. The play icon is shown on
+   the screen, and in the top right is briefly shows `AUTO`. Inserting a disc will automatically start playing it. This
+   mode is remember, also when putting the player in standby mode or removing power altogether.
 
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest brightness.
 2. Always display the correct time of the disc when inserting it. Sometimes it would display the time of the previous disc.
-3. Pressing play while the disc is still loading (power on or inserting a new disc) queues the play action. Previously it would just hang and do nothing.
+3. Pressing play while the disc is still loading (power on or inserting a new disc) queues the play action. Previously it would just hang and do nothing. This is part of the patch for automatically playing described above. As soon as the play
+button is pressed, the icon is shown on the screen to indicate that the disc will start playing after the reading and loading
+is completed.
 
 ## Original firmware
 
@@ -56,7 +61,7 @@ Clone this repository and run:
 build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
 ```
 
-Options for patches are: track, backlight, disctime, play, remaining, brightness. When nothing is
+Options for patches are: track, backlight, disctime, play, remaining, brightness, cdtime. When nothing is
 specified, all patches are applied.
 
 Optionally a version can be supplied. When supplied this version is shown on the splash screen during
