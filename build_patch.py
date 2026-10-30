@@ -32,18 +32,25 @@ Patch 4 - Play pressed while the disc is still loading is lost.
   * The Play/Pause handler (0x0800E10E) sends "play track 1" while the module
     is still reading the TOC (ignored) and sets the play state to 6 anyway,
     so the player shows the play icon and stays on "Read" forever.
-  * Play while stopped and loading only sets a pending flag (spare byte
-    0x20000238). A hook on the main loop starts playback through the original
-    handler once the disc is ready (TOC done, tracks known, total time known
-    for audio CDs). Opening the tray, no disc, any other play-state change or
-    standby cancels it. Needs disctime (added automatically).
+  * Play while stopped and loading queues it (spare byte 0x20000238); Play
+    again or Stop cancels it (the first Stop only cancels; the firmware turns
+    Stop while stopped into Eject). A hook on the main loop starts playback
+    through the original handler once the disc is ready (TOC done, tracks
+    known, total time known for audio CDs). Eject, no disc, any other
+    play-state change or standby cancels it. Needs disctime (added
+    automatically).
+  * The play icon means "it is going to play": a tick hook shows it (and
+    hides the stop icon) while a Play is queued.
   * Standby switches the CD module off; it reloads the disc at power-on (also
     after a cold start, which runs the standby entry once). Standby entry
     therefore resets the disc state (disctime's disc_reset), so Play during
     that reload is queued too.
-  * AUTOPLAY_ON: after a disc has been ejected, or while the slot is empty
-    (e.g. switched on without a disc), the next disc load queues a Play by
-    itself. Not at power-on with a disc inside.
+  * AUTOPLAY_ON - auto-play on insert, switched on the player: Play at an
+    empty slot ("Disc", where the dispatcher drops Play) toggles it, shows
+    "AUTO" / "OFF" on line 1 for 2.5 s and saves it in a settings byte of the
+    dead settings menu (0x200004DA = 2, record +0x2C). While it is on, the
+    play icon shows at the empty slot, and a disc inserted later queues a Play
+    when it starts loading (once per disc). Not for the reload after power-on.
 
 Patch 5 - track time remaining, with an hourglass icon.
   * Remote key DISP (TIME_IR) toggles line 2 between elapsed track time and
@@ -144,15 +151,21 @@ SET_BRIGHTNESS = 0x08005F70
 SCHEDULE_SAVE = 0x0800A798  # save settings to flash after a short delay
 TIMER_EXPIRED = 0x0800AA7C  # (u16 *t): count down, 1 when it reaches 0
 CLOCK_75MS = 0x20000560    # u16, +1 every 10 TIM1 ticks (96 MHz / 72 / 10000 = 7.5 ms)
-BRIGHT_OSD = 0x20000294    # spare: dead settings menu cursor bytes, 0 after boot
+OSD = 0x20000294           # spare: dead settings menu cursor bytes, 0 after boot
                            # +0 u16 end time (CLOCK_75MS), +2 u8 active
-BRIGHT_OSD_STEPS = 33      # show the level for 33 x 75 ms = 2.5 s
+OSD_TEXT = 0x200002A0      # u32 spare (dead menu table): text the OSD shows on line 1
+OSD_STEPS = 33             # show an OSD text for 33 x 75 ms = 2.5 s
 TIME_STAMP = 0x20000298    # u16 spare (dead menu table): CLOCK_75MS at the last time message
 TIME_ARMED = 0x20000297    # u8 spare (dead menu byte, 0 after boot): a time message arrived while playing
 PREGAP = 0x2000023A        # u8 spare (0 after boot): last time message was in the gap before a track
-AUTOPLAY_ARMED = 0x2000028E  # u8 spare (dead menu byte, 0 after boot): 1 armed, 2 timing "Disc"
-AUTOPLAY_SINCE = 0x2000029A  # u16 spare (dead menu table): CLOCK_75MS when "Disc" was first seen
-AUTOPLAY_NODISC_STEPS = 14   # "Disc" again 14 x 75 ms = 1 s later arms autoplay (not a brief one)
+AUTOPLAY_SETTING = 0x200004DA  # saved setting byte of the dead settings menu (record +0x2C): 2 = on
+AUTOPLAY_RELOAD = 0x2000028E   # u8 spare (dead menu byte, 0 after boot): 1 reloading after power-on,
+                               # 2 same, "Disc" seen (timing)
+AUTOPLAY_LATCH = 0x2000028F    # u8 spare (dead menu byte, 0 after boot): auto-play queued for this disc
+AUTOPLAY_SINCE = 0x2000029A    # u16 spare (dead menu table): CLOCK_75MS when "Disc" was first seen
+AUTOPLAY_NODISC_STEPS = 14     # "Disc" again 14 x 75 ms = 1 s later: no disc after all
+AUTOPLAY_TEXT = ('AUTO', 'OFF')  # line 1 when auto-play is switched on / off
+DISPATCH = 0x0800E5C2          # key dispatcher, called from the main loop at 0x08004320
 TIME_PREV = 0x2000029C     # 3 x u8 spare (dead menu table): track, sec, min of the previous time message
 CD_MSG_TRACK = CD_STATE + 0x99  # time message: track number
 CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the gap before a track
@@ -176,7 +189,7 @@ IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagn
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
-AUTOPLAY_ON = True         # start playing when a disc has loaded after the tray was opened
+AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
 
 EXPORTS = {}               # cave addresses one patch provides for another
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
@@ -381,9 +394,9 @@ DISC_READY = [
     ('bx_lr',),
 ]
 
-# play_key(): Play/Pause pressed. While stopped and the disc is still loading
-# (tray status 0 Read / 1 Load / 5 Read, disc not ready) only remember it;
-# otherwise run the original handler.
+# play_key(): Play/Pause pressed (dispatcher case 0x2F). While stopped and the
+# disc is still loading (tray status 0 Read / 1 Load / 5 Read, disc not
+# ready) it toggles a queued Play; otherwise the original handler runs.
 PLAY_KEY = [
     'play_key:',
     ('push', reglist('r4', lr=True)),
@@ -401,11 +414,65 @@ PLAY_KEY = [
     ('bl', 'disc_ready'),
     ('cbnz', 'r0', 'play_now'),
     ('ldr_lit', 'r1', 'lit_pending'),
-    ('movs', 'r0', 1),
+    ('ldrb', 'r0', 'r1', 0),
+    ('movs', 'r2', 1),
+    ('subs', 'r0', 'r2', 'r0'),      # queue / cancel
     ('strb', 'r0', 'r1', 0),
     ('pop', reglist('r4', pc=True)),
     'play_now:',
     ('bl', PLAY_HANDLER),
+    ('pop', reglist('r4', pc=True)),
+
+    # play_dispatch(r0 = key): replaces the main loop's call to the key
+    # dispatcher, which drops most keys at "Eject" / "Disc".
+    #   Play at an empty slot ("Disc", stopped): switch auto-play on/off
+    #   (saved setting), "AUTO" / "OFF" on line 1.
+    #   Stop with a Play queued: only cancel the queue (the firmware turns
+    #   Stop while stopped into Eject; a second Stop still does that).
+    'play_dispatch:',
+    ('push', reglist('r4', lr=True)),
+    ('mov', 'r4', 'r0'),
+    *([('cmp', 'r4', 0x2F),          # Play/Pause
+       ('bne', 'pd_stop'),
+       ('ldr_lit', 'r3', 'lit_state'),
+       ('ldrb', 'r0', 'r3', 4),
+       ('cmp', 'r0', 1),
+       ('bne', 'pd_go'),
+       ('ldrb', 'r0', 'r3', 7),
+       ('cmp', 'r0', 3),
+       ('beq', 'pd_toggle'),
+       ('cmp', 'r0', 6),
+       ('bne', 'pd_go'),
+       'pd_toggle:',
+       ('ldr_lit', 'r1', 'lit_ap_setting'),
+       ('ldrb', 'r0', 'r1', 0),
+       ('cmp', 'r0', 2),
+       ('beq', 'pd_off'),
+       ('movs', 'r0', 2),
+       ('strb', 'r0', 'r1', 0),
+       ('ldr_lit', 'r0', 'lit_txt_on'),
+       ('b', 'pd_show'),
+       'pd_off:',
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r1', 0),
+       ('ldr_lit', 'r0', 'lit_txt_off'),
+       'pd_show:',
+       ('bl', 'OSD_SHOW'),
+       ('bl', SCHEDULE_SAVE),
+       ('movs', 'r4', 0xFF),         # consumed
+       ('b', 'pd_go')] if AUTOPLAY_ON else []),
+    'pd_stop:',
+    ('cmp', 'r4', 0x36),             # Stop/Eject
+    ('bne', 'pd_go'),
+    ('ldr_lit', 'r1', 'lit_pending'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'pd_go'),
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r1', 0),
+    ('movs', 'r4', 0xFF),            # consumed
+    'pd_go:',
+    ('mov', 'r0', 'r4'),
+    ('bl', DISPATCH),
     ('pop', reglist('r4', pc=True)),
 
     # play_poll(): replaces the main loop's call to 0x08007F30. Starts a
@@ -414,36 +481,28 @@ PLAY_KEY = [
     'play_poll:',
     ('push', reglist('r4', lr=True)),
     ('bl', MAIN_TASK),
-    # autoplay: armed by a disc being ejected (status Eject) or by the slot
-    # being empty ("Disc": status 3, or 6 for a module error code), counted
-    # from the first "Disc" and confirmed by one at least 1 s later; other
-    # statuses in between (load retries) do not reset that, a disc becoming
-    # ready does (a brief "Disc" while a disc inside loads at power-on). When
-    # the next load starts (Load / Read, stopped), queue a Play like a key
-    # press would.
+    # auto-play on insert: when a disc starts loading (Load / Read, stopped,
+    # not ready) and auto-play is on, queue a Play once for that disc (latch,
+    # cleared at "Eject" / "Disc"). Not for the reload after power-on: that
+    # ends when the disc is ready, at "Eject", or at a "Disc" seen 1 s after
+    # the first one (no disc after all; load retries in between are ignored).
     *([('ldr_lit', 'r3', 'lit_state'),
        ('ldrb', 'r0', 'r3', 7),          # tray status
-       ('ldr_lit', 'r1', 'lit_autoplay'),
-       ('ldrb', 'r2', 'r1', 0),          # 0 idle, 1 armed, 2 timing "Disc"
+       ('ldr_lit', 'r1', 'lit_reload'),
+       ('ldrb', 'r2', 'r1', 0),
+       ('cbz', 'r2', 'ap_insert'),
        ('cmp', 'r0', 2),
-       ('beq', 'ap_arm'),
+       ('beq', 'ap_reload_end'),
        ('cmp', 'r0', 3),
        ('beq', 'ap_nodisc'),
        ('cmp', 'r0', 6),
        ('beq', 'ap_nodisc'),
-       ('cmp', 'r2', 1),
-       ('beq', 'ap_check'),
-       ('cmp', 'r2', 2),
-       ('bne', 'ap_done'),
-       ('bl', 'disc_ready'),             # timing, and a disc became ready:
-       ('cmp', 'r0', 0),                 # the "Disc" was only brief
+       ('bl', 'disc_ready'),
+       ('cmp', 'r0', 0),
        ('beq', 'ap_done'),
-       ('ldr_lit', 'r1', 'lit_autoplay'),
-       ('movs', 'r0', 0),
-       ('strb', 'r0', 'r1', 0),
-       ('b', 'ap_done'),
+       ('b', 'ap_reload_end'),
        'ap_nodisc:',
-       ('cmp', 'r2', 0),
+       ('cmp', 'r2', 1),
        ('bne', 'ap_timing'),
        ('movs', 'r2', 2),                # first "Disc": start timing
        ('strb', 'r2', 'r1', 0),
@@ -453,8 +512,6 @@ PLAY_KEY = [
        ('strh', 'r0', 'r2', 0),
        ('b', 'ap_done'),
        'ap_timing:',
-       ('cmp', 'r2', 2),
-       ('bne', 'ap_done'),
        ('ldr_lit', 'r0', 'lit_clock'),
        ('ldrh', 'r0', 'r0', 0),
        ('ldr_lit', 'r2', 'lit_ap_since'),
@@ -463,11 +520,21 @@ PLAY_KEY = [
        ('uxth', 'r0', 'r0'),
        ('cmp', 'r0', AUTOPLAY_NODISC_STEPS),
        ('blo', 'ap_done'),
-       'ap_arm:',
-       ('movs', 'r2', 1),
-       ('strb', 'r2', 'r1', 0),
+       'ap_reload_end:',
+       ('ldr_lit', 'r1', 'lit_reload'),
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r1', 0),
        ('b', 'ap_done'),
-       'ap_check:',
+       'ap_insert:',
+       ('ldr_lit', 'r1', 'lit_latch'),
+       ('cmp', 'r0', 2),
+       ('beq', 'ap_unlatch'),
+       ('cmp', 'r0', 3),
+       ('beq', 'ap_unlatch'),
+       ('cmp', 'r0', 6),
+       ('beq', 'ap_unlatch'),
+       ('ldrb', 'r2', 'r1', 0),
+       ('cbnz', 'r2', 'ap_done'),        # already queued for this disc
        ('cmp', 'r0', 1),
        ('beq', 'ap_load'),
        ('cmp', 'r0', 5),
@@ -476,11 +543,22 @@ PLAY_KEY = [
        ('ldrb', 'r0', 'r3', 4),
        ('cmp', 'r0', 1),
        ('bne', 'ap_done'),
-       ('movs', 'r0', 0),
+       ('ldr_lit', 'r0', 'lit_ap_setting'),
+       ('ldrb', 'r0', 'r0', 0),
+       ('cmp', 'r0', 2),
+       ('bne', 'ap_done'),
+       ('bl', 'disc_ready'),
+       ('cmp', 'r0', 0),
+       ('bne', 'ap_done'),
+       ('movs', 'r0', 1),
+       ('ldr_lit', 'r1', 'lit_latch'),
        ('strb', 'r0', 'r1', 0),
        ('ldr_lit', 'r1', 'lit_pending'),
-       ('movs', 'r0', 1),
        ('strb', 'r0', 'r1', 0),
+       ('b', 'ap_done'),
+       'ap_unlatch:',
+       ('movs', 'r2', 0),
+       ('strb', 'r2', 'r1', 0),
        'ap_done:'] if AUTOPLAY_ON else []),
     ('ldr_lit', 'r4', 'lit_pending'),
     ('ldrb', 'r0', 'r4', 0),
@@ -508,16 +586,61 @@ PLAY_KEY = [
     ('strb', 'r0', 'r4', 0),
     ('pop', reglist('r4', pc=True)),
 
+    # play_icon(): tick hook. The play icon means "it is going to play":
+    # shown (and the stop icon hidden) while a Play is queued, and with
+    # auto-play on at an empty slot. Otherwise the firmware's icons stay.
+    'play_icon:',
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r0', 'lit_pending'),
+    ('ldrb', 'r0', 'r0', 0),
+    ('cbnz', 'r0', 'pi_show'),
+    *([('ldr_lit', 'r3', 'lit_state'),
+       ('ldrb', 'r0', 'r3', 4),
+       ('cmp', 'r0', 1),
+       ('bne', 'pi_done'),
+       ('ldrb', 'r0', 'r3', 7),
+       ('cmp', 'r0', 3),
+       ('beq', 'pi_ap'),
+       ('cmp', 'r0', 6),
+       ('bne', 'pi_done'),
+       'pi_ap:',
+       ('ldr_lit', 'r0', 'lit_ap_setting'),
+       ('ldrb', 'r0', 'r0', 0),
+       ('cmp', 'r0', 2),
+       ('beq', 'pi_show')] if AUTOPLAY_ON else []),
+    ('b', 'pi_done'),
+    'pi_show:',
+    ('ldr_lit', 'r4', 'lit_ui'),
+    ('ldr', 'r0', 'r4', 0x10),       # play icon
+    ('ldr', 'r1', 'r0', OBJ_FLAGS),
+    ('lsls', 'r1', 'r1', 27),        # hidden flag (bit 4) -> sign
+    ('bpl', 'pi_stop'),
+    ('movs', 'r1', 0),
+    ('bl', OBJ_SET_HIDDEN),
+    'pi_stop:',
+    ('ldr', 'r0', 'r4', 0x18),       # stop icon
+    ('ldr', 'r1', 'r0', OBJ_FLAGS),
+    ('lsls', 'r1', 'r1', 27),
+    ('bmi', 'pi_done'),
+    ('movs', 'r1', 1),
+    ('bl', OBJ_SET_HIDDEN),
+    'pi_done:',
+    ('pop', reglist('r4', pc=True)),
+
     # play_standby(): standby entry (also once at cold start) - forget a
     # pending Play and the disc state: the CD module is switched off and
     # reloads the disc at power-on, so Play must be queued again until it is
-    # ready. Then the original first call of the standby routine.
+    # ready; that reload is not an insert (no auto-play). Then the original
+    # first call of the standby routine.
     'play_standby:',
     ('push', reglist('r4', lr=True)),
     ('ldr_lit', 'r1', 'lit_pending'),
     ('movs', 'r0', 0),
     ('strb', 'r0', 'r1', 0),
-    *([('ldr_lit', 'r1', 'lit_autoplay'),   # power-on reload: no autoplay
+    *([('ldr_lit', 'r1', 'lit_latch'),
+       ('strb', 'r0', 'r1', 0),
+       ('ldr_lit', 'r1', 'lit_reload'),
+       ('movs', 'r0', 1),
        ('strb', 'r0', 'r1', 0)] if AUTOPLAY_ON else []),
     ('bl', 'DISC_RESET'),            # disctime's disc_reset (filled in by patch_play)
     ('bl', STANDBY_FIRST_CALL),
@@ -532,12 +655,17 @@ PLAY_KEY = [
     ('word', PLAY_PENDING),
     'lit_redraw:',
     ('word', DISPLAY_REDRAW),
-    'lit_autoplay:',
-    ('word', AUTOPLAY_ARMED),
-    'lit_ap_since:',
-    ('word', AUTOPLAY_SINCE),
-    'lit_clock:',
-    ('word', CLOCK_75MS),
+    'lit_ui:',
+    ('word', UI),
+    *(['lit_ap_setting:', ('word', AUTOPLAY_SETTING),
+       'lit_reload:', ('word', AUTOPLAY_RELOAD),
+       'lit_latch:', ('word', AUTOPLAY_LATCH),
+       'lit_ap_since:', ('word', AUTOPLAY_SINCE),
+       'lit_clock:', ('word', CLOCK_75MS),
+       'lit_txt_on:', ('word', 'txt_on'),
+       'lit_txt_off:', ('word', 'txt_off'),
+       'txt_on:', ('bytes', AUTOPLAY_TEXT[0].encode() + b'\0'),
+       'txt_off:', ('bytes', AUTOPLAY_TEXT[1].encode() + b'\0')] if AUTOPLAY_ON else []),
 ]
 
 
@@ -553,8 +681,9 @@ def patch_disctime(img):
 
 
 def patch_play(img):
-    prog = [('bl', EXPORTS['disc_reset']) if ins == ('bl', 'DISC_RESET') else ins for ins in PLAY_KEY]
-    cave, labels = assemble(prog, cave_addr(img))
+    if AUTOPLAY_ON:
+        ensure_osd(img)
+    cave, labels = assemble(resolve(PLAY_KEY), cave_addr(img))
     # key 0x2F case in the dispatcher: bl 0x0800E10E -> bl play_key
     site, _ = assemble([('bl', labels['play_key'])], 0x0800E766)
     patch(img, 0x0800E766, bytes.fromhex('fff7d2fc'), site)
@@ -564,8 +693,14 @@ def patch_play(img):
     # standby entry 0x0800A7E0: bl 0x08008B04 -> bl play_standby
     site, _ = assemble([('bl', labels['play_standby'])], 0x0800A7E2)
     patch(img, 0x0800A7E2, bytes.fromhex('fef78ff9'), site)
+    # main loop: bl key dispatcher -> bl play_dispatch
+    old, _ = assemble([('bl', DISPATCH)], 0x08004320)
+    site, _ = assemble([('bl', labels['play_dispatch'])], 0x08004320)
+    patch(img, 0x08004320, old, site)
+    TICK_HOOKS.append(labels['play_icon'])
     put(img, labels['play_key'], cave)
-    print(f"play: play_key at {labels['play_key']:#x}, {len(cave)} bytes")
+    print(f"play: play_key at {labels['play_key']:#x}, {len(cave)} bytes"
+          + (' (with auto-play on insert)' if AUTOPLAY_ON else ''))
 
 
 ICON_HEADER, ICON_DATA = lv_img_true_color_alpha(hourglass(ICON_SIZE), ICON_SIZE, ICON_SIZE)
@@ -826,46 +961,12 @@ KEY_HOOK = [
     ('strb', 'r0', 'r4', 0),
     ('bl', SET_BRIGHTNESS),
     ('bl', SCHEDULE_SAVE),
-    ('ldr_lit', 'r1', 'lit_clock'),  # show the new level on line 1
-    ('ldrh', 'r0', 'r1', 0),
-    ('adds_i8', 'r0', BRIGHT_OSD_STEPS),
-    ('ldr_lit', 'r1', 'lit_osd'),
-    ('strh', 'r0', 'r1', 0),         # end time
-    ('movs', 'r0', 1),
-    ('strb', 'r0', 'r1', 2),         # active
-    ('pop', reglist('r4', pc=True)),
-
-    # bright_osd(): runs after every display update (TICK_HOOKS). While the
-    # OSD timer runs, line 1 shows the level.
-    'bright_osd:',
-    ('push', reglist('r4', lr=True)),
-    ('ldr_lit', 'r3', 'lit_osd'),
-    ('ldrb', 'r0', 'r3', 2),
-    ('cbz', 'r0', 'osd_done'),       # not active
-    ('ldrh', 'r0', 'r3', 0),
-    ('ldr_lit', 'r1', 'lit_clock'),
-    ('ldrh', 'r1', 'r1', 0),
-    ('subs', 'r0', 'r0', 'r1'),
-    ('uxth', 'r0', 'r0'),            # time left (75 ms steps), 16-bit wrap
-    ('cbz', 'r0', 'osd_end'),
-    ('cmp', 'r0', BRIGHT_OSD_STEPS),
-    ('bhi', 'osd_end'),
-    ('ldr_lit', 'r1', 'lit_bright'),
-    ('ldrb', 'r1', 'r1', 0),
-    ('cmp', 'r1', 5),
-    ('bhi', 'osd_done'),
-    ('lsls', 'r1', 'r1', 2),
-    ('ldr_lit', 'r0', 'lit_osd_text'),
-    ('adds', 'r1', 'r0', 'r1'),
-    ('ldr', 'r1', 'r1', 0),          # text for this level
-    ('ldr_lit', 'r0', 'lit_ui_osd'),
-    ('ldr', 'r0', 'r0', 8),          # line 1 label
-    ('bl', LABEL_SET_TEXT),
-    ('b', 'osd_done'),
-    'osd_end:',                      # time is up: the next display update
-    ('movs', 'r0', 0),               # shows the track again
-    ('strb', 'r0', 'r3', 2),
-    'osd_done:',
+    ('ldrb', 'r0', 'r4', 0),         # show the new level on line 1
+    ('lsls', 'r0', 'r0', 2),
+    ('ldr_lit', 'r1', 'lit_level_text'),
+    ('adds', 'r1', 'r1', 'r0'),
+    ('ldr', 'r0', 'r1', 0),
+    ('bl', 'OSD_SHOW'),
     ('pop', reglist('r4', pc=True)),
 
     # bright_load(): replaces the generic 1..6 clamp when the saved brightness
@@ -885,13 +986,7 @@ KEY_HOOK = [
     ('word', POWER_ON),
     'lit_bright:',
     ('word', BRIGHTNESS),
-    'lit_osd:',
-    ('word', BRIGHT_OSD),
-    'lit_clock:',
-    ('word', CLOCK_75MS),
-    'lit_ui_osd:',
-    ('word', UI),
-    'lit_osd_text:',
+    'lit_level_text:',
     ('word', 'osd_text'),
     'osd_text:',                     # text pointer per level
     *[('word', f'osd_text_{i}') for i in range(len(BRIGHT_OSD_TEXT))],
@@ -900,14 +995,14 @@ KEY_HOOK = [
 
 
 def patch_brightness(img):
-    cave, lab = assemble(KEY_HOOK, cave_addr(img))
+    ensure_osd(img)
+    cave, lab = assemble(resolve(KEY_HOOK), cave_addr(img))
     # main loop: bl get_key -> bl key_hook
     code, _ = assemble([('bl', lab['key_hook'])], 0x08004300)
     patch(img, 0x08004300, bytes.fromhex('04f094fa'), code)
     # settings load: brightness clamp(val, 7) -> bright_load
     code, _ = assemble([('bl', lab['bright_load'])], 0x08006EBC)
     patch(img, 0x08006EBC, bytes.fromhex('fff778fe'), code)
-    TICK_HOOKS.append(lab['bright_osd'])   # level on line 1 after each display update
     put(img, lab['key_hook'], cave)
     print(f"brightness: key_hook at {lab['key_hook']:#x}, {len(cave)} bytes"
           + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
@@ -935,6 +1030,77 @@ def patch_remaining(img):
     put(img, lab['fmt_time'], cave)
     print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes"
           + (' (with hourglass icon)' if REMAINING_ICON_ON else ' (no icon)'))
+
+
+# osd_show(r0 = text): show the text on line 1 for OSD_STEPS (2.5 s), measured
+# on the 75 ms clock. osd_tick(): tick hook, puts the text into the line 1
+# label after every display update while the time runs; afterwards the next
+# display update shows the track again. Shared by brightness and auto-play.
+OSD_CODE = [
+    'osd_show:',
+    ('ldr_lit', 'r1', 'lit_osd_text'),
+    ('str', 'r0', 'r1', 0),
+    ('ldr_lit', 'r1', 'lit_clock'),
+    ('ldrh', 'r0', 'r1', 0),
+    ('adds_i8', 'r0', OSD_STEPS),
+    ('ldr_lit', 'r1', 'lit_osd'),
+    ('strh', 'r0', 'r1', 0),         # end time
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 2),         # active
+    ('bx_lr',),
+
+    'osd_tick:',
+    ('push', reglist('r4', lr=True)),
+    ('ldr_lit', 'r3', 'lit_osd'),
+    ('ldrb', 'r0', 'r3', 2),
+    ('cbz', 'r0', 'osd_done'),       # not active
+    ('ldrh', 'r0', 'r3', 0),
+    ('ldr_lit', 'r1', 'lit_clock'),
+    ('ldrh', 'r1', 'r1', 0),
+    ('subs', 'r0', 'r0', 'r1'),
+    ('uxth', 'r0', 'r0'),            # time left (75 ms steps), 16-bit wrap
+    ('cbz', 'r0', 'osd_end'),
+    ('cmp', 'r0', OSD_STEPS),
+    ('bhi', 'osd_end'),
+    ('ldr_lit', 'r1', 'lit_osd_text'),
+    ('ldr', 'r1', 'r1', 0),
+    ('ldr_lit', 'r0', 'lit_ui'),
+    ('ldr', 'r0', 'r0', 8),          # line 1 label
+    ('bl', LABEL_SET_TEXT),
+    ('b', 'osd_done'),
+    'osd_end:',                      # time is up: the next display update
+    ('movs', 'r0', 0),               # shows the track again
+    ('strb', 'r0', 'r3', 2),
+    'osd_done:',
+    ('pop', reglist('r4', pc=True)),
+    ('align',),
+    'lit_osd:',
+    ('word', OSD),
+    'lit_osd_text:',
+    ('word', OSD_TEXT),
+    'lit_clock:',
+    ('word', CLOCK_75MS),
+    'lit_ui:',
+    ('word', UI),
+]
+
+
+def ensure_osd(img):
+    """Put the shared OSD code in the cave once; returns osd_show."""
+    if 'osd_show' not in EXPORTS:
+        cave, lab = assemble(OSD_CODE, cave_addr(img))
+        put(img, lab['osd_show'], cave)
+        EXPORTS['osd_show'] = lab['osd_show']
+        TICK_HOOKS.append(lab['osd_tick'])
+        print(f"osd: osd_show at {lab['osd_show']:#x}, {len(cave)} bytes")
+    return EXPORTS['osd_show']
+
+
+def resolve(prog):
+    """Fill in placeholders for code another patch provides (see EXPORTS)."""
+    ext = {'DISC_RESET': 'disc_reset', 'OSD_SHOW': 'osd_show'}
+    return [(ins[0], EXPORTS[ext[ins[1]]]) if isinstance(ins, tuple) and len(ins) == 2 and ins[1] in ext
+            else ins for ins in prog]
 
 
 # time_msg(): replaces "strb.w r0, [r1, #0x104]" (elapsed seconds) in both

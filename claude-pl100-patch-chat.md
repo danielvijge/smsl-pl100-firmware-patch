@@ -2360,3 +2360,298 @@ Opus 5.5 · Claude Team
   2. Switch on with a disc inside. It should not start by itself.
 
   The change is only in build_patch.py and isn't committed.
+
+❯ Regarding the shuffle icon, the PL100 actually does have shuffle mode. The    
+  remote has buttons for repeat and shuffle. Repeat has the options no-repear,  
+  repeat-one, and repeat-disc. Pressing the button cycles throught them. For    
+  suffle it is on or off. However, both icons share the same space on the       
+  screen, so it appears all modes are mutualley exclusive. That is, it is not   
+  possible to have repeat-disc in suffle mode. Can this be confirmed in the     
+  code? No need to fix it.                                                      
+
+⏺ Confirmed. In the firmware, repeat and shuffle are a single setting, not two
+  that only happen to share a spot on the screen.
+
+  One variable for both
+  The play mode is one byte at 0x20000189:
+
+  ┌───────┬─────────────┬───────────────────────────┐
+  │ Value │   Meaning   │           Icon            │
+  ├───────┼─────────────┼───────────────────────────┤
+  │ 0     │ normal      │ hidden                    │
+  ├───────┼─────────────┼───────────────────────────┤
+  │ 1     │ repeat one  │ ui+0x28, image 0x0806F324 │
+  ├───────┼─────────────┼───────────────────────────┤
+  │ 2     │ repeat disc │ ui+0x28, image 0x080732A8 │
+  ├───────┼─────────────┼───────────────────────────┤
+  │ 3     │ shuffle     │ ui+0x28, image 0x0806FDBC │
+  └───────┴─────────────┴───────────────────────────┘
+
+  There's only one icon object (ui+0x28); each mode just gives it a different
+  image. The hourglass uses another object (ui+0x24), which the original
+  firmware never shows, so the two don't get in each other's way.
+
+  The buttons
+  - Repeat (0x0800E780): mode + 1, back to 0 from 3 upwards. That gives none →
+    one → disc → none. Pressing Repeat while shuffle is on gives "none", not a
+    repeat mode. It also sends command 0x22 to the CD module.
+  - Shuffle (0x0800E7A4): if the mode is 3, it goes to 0 (command 0x23).
+    Otherwise it becomes 3 (command 0x0D), which overwrites any repeat mode.
+
+  So "repeat disc + shuffle" can't exist; there's no place to store it.
+
+  What each mode does at the end of a track (0x0800D190, checked on every
+  display update)
+  The MCU decides 2 s before the end, based on the stored track length:
+  - Normal: on the last track, stop.
+  - Repeat one: play the same track again.
+  - Repeat disc: on the last track, go to track 1.
+  - Shuffle: pick a random track (rand() % tracks + 1). Next and Previous also
+    pick a random track in shuffle mode.
+
+  Shuffle is therefore done by the MCU picking random tracks one at a time, not
+  by the module. There's no shuffled play order, so a track can come up again
+  before all others have played. The mode is also saved with the settings, but
+  it's reset to "normal" whenever a disc is loaded (0x0800D122).
+
+  Possible original bug: the "2 s before the end" check uses the stored track
+  length. As we found, that's only updated by the module's ~22‑second message
+  and keeps the previous track's value until then. So:
+  - In shuffle or repeat‑one, if the previous track was very short (under ~24
+    s), the next track can be cut off too early.
+  - In normal mode, the last track of the disc can stop too early in the same
+    situation.
+
+  With normal discs this hardly ever happens. With the 50‑track test disc
+  (tracks around 0:30) it could. I'm not changing anything; just noting it in
+  case you ever see a track cut short.
+
+❯ For patch 4, queue play and autoplay, this might become a bit complex. I'm    
+  thinking of a different solution. Indicate if this would be a good solution,  
+  or if there are better ways. To goal is to have auto-play-on-insert a         
+  user-controlled setting, not a firmware setting. And to always indicate to    
+  the user what is going to happen.                                             
+                                                                                
+  What I'm thinking about is:                                                   
+  - when no disc is loaded (display shows "Disc") the user can press the play   
+  button. This shows the play icon on the screen, and stores this setting in a  
+  persistent bit. This indicates that autoplay is on. When the disc is          
+  inserted, the play icon stays on the screen the whole time through loading    
+  and total time, to indicate that it is going to start playing.                
+  - when no disc is loaded and the play icon is shown, pressing play again      
+  clears the auto-play mode. Again this is saved in a presistent bit. This      
+  makes the auto-play mode fully user-controllable on the player, not hardcoded 
+  in the firmware.                                                              
+  - when auto-play is off but a disc is inserted and then the user pressed play 
+  (which now queues the play action), immediately show the play icon to         
+  indicate that the disc is going to play. In this case, the auto-play settings 
+  bit is not updated.                                                           
+  - when the player is powered on and the user presses play (also now queueing  
+  the play action), same as above: immediately show the play icon but don't     
+  store the setting for auto play.                                              
+                                                                                
+  Would this be a good user interaction, or are there better ways to achieve    
+  something similar?                                                            
+
+⏺ The v8 auto-play is a firmware setting with guesswork: it arms on "Eject",
+  or on "Disc" lasting a second. It is unreliable, and the user can't see
+  whether it will start. The user proposed a design where the Play button 
+  controls auto-play on the player, and the play icon always shows that 
+  playback is coming. I reviewed it and it is a good fit: one consistent
+  rule, and it removes the Eject/timing heuristics.
+
+  User decisions:
+  - Power-on: auto-play applies only to a disc inserted into the empty slot.
+    Switching on with a disc inside never auto-plays; pressing Play during
+    that load queues it as now.
+  - Feedback: the icon, plus "AUTO" / "OFF" on line 1 for ~2.5 s when
+    toggling, reusing the brightness percentage mechanism.
+
+  Additions I recommend, kept in the plan:
+  - Cancelling a queued play: pressing Play again cancels it. This is
+    consistent with the toggle at "Disc".
+  - Stop: also cancels a queued play. It doesn't change the setting.
+
+  Behaviour
+
+  ┌──────────────────────┬────────────────────────────┬────────────────────┐
+  │ Situation (stopped)  │        Play button         │     Play icon      │
+  ├──────────────────────┼────────────────────────────┼────────────────────┤
+  │ Slot empty ("Disc",  │ toggles auto-play (saved), │ shown while        │
+  │ tray 3/6)            │  line 1 "AUTO"/"OFF" 2.5 s │ auto-play is on    │
+  ├──────────────────────┼────────────────────────────┼────────────────────┤
+  │ Disc inserted,       │ (a Play is queued          │ shown from load    │
+  │ auto-play on         │ automatically when loading │ start until it     │
+  │                      │  starts)                   │ plays              │
+  ├──────────────────────┼────────────────────────────┼────────────────────┤
+  │ Loading, auto-play   │ queues Play / press again  │                    │
+  │ off (insert or       │ cancels                    │ shown while queued │
+  │ power-on)            │                            │                    │
+  ├──────────────────────┼────────────────────────────┼────────────────────┤
+  │ Power-on with disc,  │ nothing automatic          │ only if Play       │
+  │ auto-play on         │                            │ pressed            │
+  ├──────────────────────┼────────────────────────────┼────────────────────┤
+  │ Stop / eject /       │ —                          │ queue cancelled,   │
+  │ standby while queued │                            │ icon goes          │
+  └──────────────────────┴────────────────────────────┴────────────────────┘
+
+  Findings used (firmware)
+
+  - Persistent bit: byte 0x200004DA.
+    - It is saved in the settings record at offset 0x2C (0x0800705C) and
+      loaded from it (0x08006D96).
+    - It is only used otherwise by the dead settings menu (0x0800787E,
+      0x08007B12, 0x08007D6E).
+    - Its defaults are 0/1. Auto-play on = value 2, anything else off.
+      Factory reset therefore means off.
+    - Save it with SCHEDULE_SAVE (0x0800A798), as brightness does.
+  - Play icon: ui+0x10. The display update hides it every pass while stopped
+    or loading (0x0800D578, and the icon routine 0x0800D2C0 called from
+    0x0800D5D2). A tick hook (install_tick_hooks chain, after every display
+    update) shows it again when "will play" is true.
+  - Tray status: 1 Load, 2 Eject, 3/6 "Disc" (empty slot / error), 5 Read.
+  - Play key: hook play_key (0x0800E766). Stop key 0x36 is handled in the
+    dispatcher's TBH table at 0x0800E646; its case site still needs to be
+    located.
+
+  Changes: patch/build_patch.py (only file; thumbasm.py if an encoding is 
+  missing)
+
+  1. Remove the v8 heuristics: the Eject/"Disc"-timing arming in play_poll
+     and its RAM uses. Keep AUTOPLAY_ON as a build option, so the feature can
+     be left out entirely.
+  2. New RAM state:
+     - AUTOPLAY = 0x200004DA (persistent, 2 = on).
+     - Reuse AUTOPLAY_ARMED (0x2000028E) as a "reloading after power-on"
+       flag.
+       - It is set by play_standby (which runs at standby and cold start).
+       - It is cleared when the disc is ready, on Eject, or when "Disc" lasts
+         ≥ 1 s (reuse AUTOPLAY_SINCE timing). The last condition means "no
+         disc after all", so the next load is an insertion.
+  3. play_key:
+     - Tray 3/6 and stopped: toggle AUTOPLAY (0 ↔ 2), call SCHEDULE_SAVE,
+       show OSD "AUTO"/"OFF". Don't call the original handler.
+     - Loading (state 1, tray 0/1/5, not ready): toggle PLAY_PENDING instead
+       of setting it.
+     - Otherwise: the original handler.
+  4. play_poll: when a load starts (tray 1/5, state 1), auto-play is on and
+     it is not a power-on reload, queue Play once per insertion. That needs a
+     "queued for this load" latch, cleared at "Disc"/Eject. Clear the
+     power-on flag as described in 2.
+  5. Stop cancels the queue: hook the Stop/Eject key (0x36) case so it clears
+     PLAY_PENDING and then runs the original.
+  6. Icon tick hook play_icon: if PLAY_PENDING, or (auto-play on and tray 3/6
+     and stopped), show ui+0x10 and hide the stop icon ui+0x18, using
+     OBJ_SET_HIDDEN 0x08015F4A. Register it in TICK_HOOKS.
+  7. Shared line-1 OSD:
+     - Generalise the brightness OSD (end time on CLOCK_75MS, active flag) to
+       show a text pointer.
+     - Brightness sets the level text, and auto-play sets "AUTO"/"OFF".
+     - One OSD tick hook. The OSD helper is put in the cave by whichever of
+       play/brightness comes first and shared via EXPORTS, like disc_reset.
+  8. Docstring: describe the new patch 4 behaviour. The README is left to the
+     user, so I'll mention the changes there.
+
+  Verification
+
+  - Emulator (scratchpad venv, same style as feat3_emu.py, routines found via
+    the hooks in the built image). Scenarios:
+    - Toggle at "Disc": value 0↔2, save scheduled, OSD text "AUTO"/"OFF" for
+      33 steps, icon shown/hidden.
+    - Auto-play on, insert: Load → queued → icon during Load/Read → Play when
+      ready.
+    - Auto-play off, insert, Play → queued with icon. Play again → cancelled,
+      icon off.
+    - Power-on with disc and auto-play on: no queue, no icon. Play → queued.
+    - Power-on with empty slot and auto-play on: icon shows. Insert → plays.
+    - Stop / eject / standby while queued → cancelled.
+    - Settings load with record byte 0x2C = 2 → stays 2 (emulate the load
+      routine 0x08006C76 with a fake record from 0x080065BA).
+    - The brightness OSD still works. Time fill, gap display and the IR remap
+      are unchanged.
+    - Every RAM write stays within the expected addresses.
+  - Builds: AUTOPLAY_ON = False gives the old patch-4 queue only. Python 3.9
+    gives identical output. Write IAP_PL100_1v1_b250219_all_v9.hex; no
+    commit.
+  - On the device (the user does this):
+    - Toggle at "Disc" and switch off/on: the setting persists.
+    - Insert with auto-play on/off.
+    - Power-on with disc and auto-play on: no autoplay.
+    - Play/Stop while loading.
+
+⏺ Your auto‑play design is built: patch/IAP_PL100_1v1_b250219_all_v9.hex. I've
+  tested it in the emulator, not yet on the player.
+
+  How it works now
+
+  ┌──────────────────────┬────────────────────────────────┬─────────────────┐
+  │      Situation       │          Play button           │    Play icon    │
+  ├──────────────────────┼────────────────────────────────┼─────────────────┤
+  │                      │ switches auto‑play on/off      │ shown while     │
+  │ Slot empty ("Disc")  │ (saved), line 1 shows AUTO /   │ auto‑play is on │
+  │                      │ OFF for 2.5 s                  │                 │
+  ├──────────────────────┼────────────────────────────────┼─────────────────┤
+  │ Disc inserted,       │ Play queued automatically when │ from load start │
+  │ auto‑play on         │  loading starts, once per disc │  until it plays │
+  ├──────────────────────┼────────────────────────────────┼─────────────────┤
+  │ Loading (insert or   │                                │                 │
+  │ power‑on), auto‑play │ queues; pressing again cancels │ while queued    │
+  │  off                 │                                │                 │
+  ├──────────────────────┼────────────────────────────────┼─────────────────┤
+  │ Switched on with a   │ never automatic, even with     │ only after you  │
+  │ disc inside          │ auto‑play on                   │ press Play      │
+  ├──────────────────────┼────────────────────────────────┼─────────────────┤
+  │ Stop while a Play is │ the first Stop only cancels    │                 │
+  │  queued              │ the queue; the next one ejects │ goes away       │
+  │                      │  as usual                      │                 │
+  └──────────────────────┴────────────────────────────────┴─────────────────┘
+
+  The old Eject/timing guesswork is gone. AUTOPLAY_ON = False still leaves
+  auto‑play out of the build, but the Play queue with its icon and cancelling
+  remains.
+
+  Firmware details that shaped it
+  - Where the setting is saved: a settings byte of the unused settings menu
+    (0x200004DA). The firmware already saves and loads it, and nothing else on
+    the PL100 uses it. 2 means on; a factory reset or erased settings means off.
+    Saving uses the same "save soon" call as brightness.
+  - Why Play at "Disc" is intercepted early: the firmware's key dispatcher drops
+    every key except Open/Close and Power when the status is "Disc" or "Eject".
+    So Play at an empty slot is handled before the dispatcher.
+  - Why Stop only cancels: while stopped, the firmware turns Stop into Eject.
+    Without the cancel, Stop during loading would eject the disc.
+  - Line‑1 text: "AUTO"/"OFF" and the brightness percentage now share one line‑1
+    text mechanism.
+
+  Checks
+  - Emulator:
+    - Toggling on/off with the right text and icon.
+    - Insert with auto‑play on plays; Stop afterwards doesn't re‑trigger it for
+      the same disc.
+    - Play cancels a queued auto‑play; with auto‑play off, Play queues and Stop
+      cancels.
+    - Power‑on with a disc doesn't auto‑play, even with a brief "Disc". Power‑on
+      with an empty slot, then insert, does play.
+    - Brightness still works.
+    - No stray memory writes.
+  - Settings: the firmware's own save writes the value 2 into the record and its
+    load restores it, with brightness unaffected.
+  - Unchanged: time fill and gap display behave as before.
+  - Builds: AUTOPLAY_ON = False and the various patch subsets build and behave
+    correctly, and Python 3.9 gives the same output.
+
+  Things to check on the device
+  1. Empty slot, press Play: "AUTO" and the play icon appear. Switch off and on:
+     the icon is still there at "Disc".
+  2. Insert a disc: the icon stays through loading and it starts playing.
+  3. Switch on with a disc inside and auto‑play on: it stays stopped.
+  4. While loading: Play → icon on; Play again or Stop → icon off.
+
+  One cosmetic side effect: if "Disc" flashes briefly while a disc that's inside
+  loads at power‑on, the play icon flashes with it while auto‑play is on. It
+  doesn't start playing.
+
+  README: the auto‑play section describes the old behaviour, so you'll want to
+  update it with this table.
+
+  The change is only in build_patch.py and isn't committed.
