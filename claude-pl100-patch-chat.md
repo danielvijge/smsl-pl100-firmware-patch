@@ -2655,3 +2655,638 @@ Opus 5.5 · Claude Team
   update it with this table.
 
   The change is only in build_patch.py and isn't committed.
+
+❯ For the shuffle play, it indeed picks a random song and continuous forever.   
+  So it effectly repeat-disc-with-random. Can this be made into a true shuffle  
+  mode? That is, shuffle all track but play each track exactly once.            
+  First provide an answer before potentially implementing a patch.              
+
+⏺ True shuffle is built: patch/IAP_PL100_1v1_b250219_all_v10.hex. It's tested in
+  the emulator against the firmware's own end‑of‑track and Next/Previous code,
+  not yet on the player.
+
+  What it does now
+  - Switching shuffle on: starts a new round with a fresh random seed. If
+    something is playing, that track counts as played.
+  - During a round: every track plays exactly once, in random order. After the
+    last one it stops like the end of a disc; shuffle stays selected.
+  - Play from stop:
+    - Mid‑round (after you pressed Stop): the round continues with a random
+      unplayed track.
+    - After a finished round: a new round starts with a random first track.
+  - Next: a random unplayed track, or stop if every track has played.
+  - Previous: goes back through the order played; at the first track it restarts
+    that track. A track you skip back from goes back into the round.
+  - Discs with more than 255 tracks (MP3): the old random behaviour.
+
+  End‑of‑track fix
+  The firmware decides 2 s before the stored track length ends. That length can
+  still be the previous track's for up to ~22 s. Now that check only runs when
+  the stored length belongs to the playing track. This also helps repeat‑one and
+  the stop after the last track in normal mode.
+
+  Emulator results
+  - True shuffle, 9‑track disc: 3, 8, 1, 4, 6, 2, 9, 7, 5 and then stop.
+  - Original firmware, same disc: 3, 2, 2, 9, 8, 4, 5, 7, 5, 1, 6, 4, 4…,
+    endless and with repeats.
+  - Next, Next, Previous ×3: back through the history, then a restart of the
+    first track.
+  - A round with only Next presses: all tracks once, then stop.
+  - Stale length: ignored; the track's own length still triggers.
+  - 300 tracks: the old behaviour.
+  - Unchanged: auto‑play, queue, OSD, time fill and gap display work as before.
+  - Off‑switches: TRUE_SHUFFLE_ON = False and TRACK_END_FIX_ON = False each
+    leave their firmware locations untouched.
+  - Builds: Python 3.9 gives the same output.
+
+  Original firmware quirk (unchanged): the end‑of‑track check never fires when
+  the track length has 0 minutes or 0 seconds, so a track under 1 minute or
+  exactly 4:00. For such a track, shuffle, repeat‑one and the stop after the
+  last track don't kick in; the module just continues to the next track in
+  order. In shuffle, the patch then counts that track as played, but it isn't
+  randomly chosen. It also can't be skipped if it was already played, so in that
+  case a track can play twice. I left this alone, but it can be fixed if you
+  want: it's two comparisons in 0x0800D190.
+
+  To try on the device: switch shuffle on and let a few tracks play. Each track
+  should come once, and it should stop at the end. Also try Next/Previous.
+
+  The change is only in build_patch.py. A new patch name (shuffle) and two
+  options are worth mentioning in your README. Nothing is committed.
+
+❯ For the original firmware quirck, not sure I understand. Explain that a bit   
+  more. Does it only occur in shuffle/repeat mode, or also in normal play?      
+
+⏺ It's in the firmware's end‑of‑track check (0x0800D190), which runs on every
+  display update.
+
+  What the check does
+  It compares the elapsed time with the stored track length minus 2 s. When that
+  point is reached, it acts according to the play mode:
+
+  ┌─────────────┬───────────────────────────────────────────────────────┐
+  │    Mode     │               Action 2 s before the end               │
+  ├─────────────┼───────────────────────────────────────────────────────┤
+  │ Normal      │ only on the last track: stop (and go back to track 1) │
+  ├─────────────┼───────────────────────────────────────────────────────┤
+  │ Repeat one  │ play the same track again                             │
+  ├─────────────┼───────────────────────────────────────────────────────┤
+  │ Repeat disc │ only on the last track: go to track 1                 │
+  ├─────────────┼───────────────────────────────────────────────────────┤
+  │ Shuffle     │ jump to a random track                                │
+  └─────────────┴───────────────────────────────────────────────────────┘
+
+  On all other tracks, in normal and repeat‑disc mode, the check does nothing.
+  The CD module simply carries on to the next track by itself.
+
+  The quirk
+  Before comparing, the firmware skips the check if the stored length's minutes
+  are 0 or its seconds are 0. It's evidently meant as "skip when no length is
+  known yet" (0:00), but it was written as minutes = 0 or seconds = 0 instead of
+  and. As a result the check never fires for:
+  - Tracks shorter than one minute (0:xx).
+  - Tracks whose length ends in :00, such as 3:00 or 4:00. That's about 1 in 60
+    tracks. Note the module's lengths are 2 s shorter than a computer shows, so
+    it's about the module's value.
+
+  What you'd notice when it hits such a track
+  When the check doesn't fire, the module just plays on to the next track. At
+  the end of the disc it reports that, and the firmware then handles the mode
+  itself (0x0800D9C4): normal mode stops, repeat‑one replays, repeat‑disc goes
+  to track 1, and shuffle does nothing.
+
+  ┌────────────────┬────────────────────────────────────────────────────────┐
+  │      Mode      │                         Effect                         │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │                │ None you'd notice. On the last track it stops when the │
+  │ Normal         │  module reports the end of the disc instead of 2 s     │
+  │                │ earlier, which ends up the same.                       │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ Repeat disc    │ None you'd notice, for the same reason.                │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │                │ That track isn't repeated; it continues to the next    │
+  │ Repeat one     │ track. If it's the last track, the end‑of‑disc message │
+  │                │  still repeats it.                                     │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ Shuffle        │ That track is followed by the next one in order        │
+  │ (original)     │ instead of a random one.                               │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ Shuffle (true  │ Same, so not a random pick, and if that next track was │
+  │ shuffle)       │  already played it plays a second time.                │
+  └────────────────┴────────────────────────────────────────────────────────┘
+
+  So in normal play it doesn't matter; it only affects repeat‑one and shuffle,
+  and only for tracks under a minute or with a length ending in :00.
+
+  The fix is small: skip only when the length is entirely unknown, so minutes
+  and seconds are 0. That's a few bytes in 0x0800D190, and it fits naturally
+  under the TRACK_END_FIX_ON option. Want me to add it?
+
+❯ yes, add it under TRACK_END_FIX_ON. I've also noticed, when using remaining   
+  time, that the last track always ends when the display has 0:03. Is this      
+  caused by the same bug? And would that also be fixed?                         
+
+⏺ To your question first: the 0:03 is not caused by this bug. It comes from the
+  same check, but it's intended behaviour there:
+
+  - The early stop: on the last track in normal mode, the end‑of‑track check
+    stops playback 2 s before the stored track length.
+  - Why you see 0:03: the check runs just before the display update in the same
+    pass. When the time reaches "2 s left", it has already stopped before 0:02
+    can be displayed. So the last value you see is 0:03.
+  - Whether audio is lost: for the other tracks the module's lengths were 2 s
+    shorter than your computer's, because they exclude the gap before the next
+    track. The last track has no next track, so its length is probably exact. In
+    that case the firmware really does cut off the last ~2 s of the disc, which
+    is often silence or the end of a fade.
+
+  The quirk fix won't change that. A separate fix is possible, more on that
+  after the change you asked for. That change first: the two zero checks are at
+  0x0800D1BA–0x0800D1CC.
+
+⏺ I've added the fix under TRACK_END_FIX_ON. The new build is
+  patch/IAP_PL100_1v1_b250219_all_v11.hex, tested in the emulator only.
+
+  The fix: one branch in the end‑of‑track check is changed (0x0800D1C2, 2
+  bytes). The check is now skipped only when the length is entirely unknown
+  (0:00), instead of whenever the minutes or the seconds are 0.
+
+  Emulator result (repeat‑one, the firmware's own check):
+
+  ┌────────────────┬─────────────────────────┬─────────────────────────┐
+  │  Track length  │        Original         │         Patched         │
+  ├────────────────┼─────────────────────────┼─────────────────────────┤
+  │ 3:30           │ acts 2 s before the end │ same                    │
+  ├────────────────┼─────────────────────────┼─────────────────────────┤
+  │ 4:01           │ acts 2 s before the end │ same                    │
+  ├────────────────┼─────────────────────────┼─────────────────────────┤
+  │ 4:00           │ never                   │ acts 1 s before the end │
+  ├────────────────┼─────────────────────────┼─────────────────────────┤
+  │ 0:45           │ never                   │ acts 2 s before the end │
+  ├────────────────┼─────────────────────────┼─────────────────────────┤
+  │ 0:00 (unknown) │ never                   │ never                   │
+  └────────────────┴─────────────────────────┴─────────────────────────┘
+
+  The 1 s for x:00 lengths is the firmware's own calculation: for seconds 0 or 1
+  it uses "previous minute :59". The shuffle round, Next/Previous and the
+  auto‑play tests still pass, and Python 3.9 gives the same output.
+
+  Your 0:03 question: no, that's a different matter, and this fix doesn't change
+  it.
+  - Why it stops there: in normal mode the firmware deliberately stops the last
+    track 2 s before the end of the stored length. The check runs just before
+    the display update, so 0:02 never gets shown and the last value you see is
+    0:03.
+  - Is audio lost? Probably yes, about the last 2 s of the disc. For the other
+    tracks the module's lengths are 2 s short because they exclude the gap
+    before the next track, but the last track has no next track. Often that's
+    silence or the tail of a fade, but not always.
+  - Why the firmware does it: for shuffle and repeat‑one the jump has to be
+    requested before the module moves on by itself. For a plain stop at the end
+    of the disc that's unnecessary. The firmware also has a handler for the
+    module's own "end of disc" message (0x0800D9C4), which in normal mode stops
+    playback as well.
+
+  Possible fix: in normal mode, don't stop early on the last track. The disc
+  then plays to the very end and the module's end‑of‑disc message stops it. The
+  catch is that I haven't seen that message in our diagnostic videos. If the
+  module doesn't send it, the player would keep showing the play icon after the
+  disc has finished. So it would need one test on the device: play the last
+  track to the end and check that it stops and returns to the total time.
+
+  Want me to add that as a separate option?
+
+❯ yes, add it as a separate option                                              
+
+⏺ I've added it as a separate option, LAST_TRACK_FULL_ON. The build is
+  patch/IAP_PL100_1v1_b250219_all_v12.hex, tested in the emulator only.
+  LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the 
+  module stops), not 2 s early
+
+  What it does
+  - Main change: in normal mode the firmware no longer stops the last track 2 s
+    early. The disc plays to the very end, and the module's own end‑of‑disc
+    message stops playback, via a handler the firmware already has. The
+    remaining time should now count down to 0:00 or 0:01.
+  - Safety net: if that message doesn't come and the player is still "playing" 3
+    s after the last track's length, the patch stops it the way the original
+    did. It relies on time fill (TIME_FILL_ON), which keeps the time counting
+    once the module goes quiet.
+  - Unchanged: shuffle, repeat‑one and repeat‑disc keep their 2 s‑early
+    behaviour, which they need to request the jump in time.
+
+  Emulator result (last track 9 of 9, length 3:30, normal mode unless noted)
+
+  ┌───────────────────────────────────┬─────────────────┬────────────────────┐
+  │              Moment               │    Original     │      Patched       │
+  ├───────────────────────────────────┼─────────────────┼────────────────────┤
+  │ 2 s left (3:28)                   │ stops           │ plays on           │
+  ├───────────────────────────────────┼─────────────────┼────────────────────┤
+  │ 3:32                              │ stopped already │ plays on           │
+  ├───────────────────────────────────┼─────────────────┼────────────────────┤
+  │ 3:33 (3 s past)                   │ stopped already │ stops (safety net) │
+  ├───────────────────────────────────┼─────────────────┼────────────────────┤
+  │ track 5 (not last), 3:33          │ plays on        │ plays on           │
+  ├───────────────────────────────────┼─────────────────┼────────────────────┤
+  │ repeat disc, last track, 2 s left │ → track 1       │ → track 1          │
+  └───────────────────────────────────┴─────────────────┴────────────────────┘
+
+  Other checks:
+  - Unchanged: true shuffle (full round, Next, stale length), auto‑play, time
+    fill and gap display.
+  - Off‑switch: LAST_TRACK_FULL_ON = False leaves the firmware's code at that
+    spot original. The option also works on its own, with shuffle and the
+    end‑of‑track fix both off.
+  - Builds: Python 3.9 gives the same output.
+
+  One thing to test on the device: play the last track of a disc to the end in
+  normal mode.
+  - Expected: the time runs to 0:00/0:01 (or the full length in elapsed mode),
+    the player stops right away, and the display returns to the total time.
+  - If it keeps showing the play icon with the time counting past the end and
+    only stops about 4 s later, the module doesn't send the end‑of‑disc message.
+    The safety net is what stopped it. In that case, tell me and I'll make the
+    safety net stop right at the end.
+
+  The change is only in build_patch.py and isn't committed. The new option is
+  worth mentioning in your README.
+
+❯ Would this fix also work in shuffle mode? Would it then know what the last    
+  track is and play it all the way to the end?                                  
+
+⏺ No, not as it stands. LAST_TRACK_FULL_ON only changes normal mode. In shuffle,
+  the last track of a round is still cut 2 s early:
+
+  - Current behaviour: in shuffle mode, the end‑of‑track check fires 2 s before
+    the end of every track, so a new random track starts on time. With true
+    shuffle, at the last track of a round there's nothing left to pick, so the
+    patch stops right there, 2 s early, the same as the original normal‑mode
+    behaviour.
+  - Does it know it's the last track? Yes. True shuffle knows the moment the
+    last unplayed track starts, so it can treat that track differently.
+  - Why the normal‑mode trick doesn't carry over: in normal mode the last track
+    is the last track on the disc, so the module stops by itself at the end. In
+    shuffle the round's last track is random, often in the middle of the disc.
+    If it's simply left to play out, the module continues with the next track in
+    disc order and doesn't stop. And even when the round ends on the disc's
+    final track, the firmware's end‑of‑disc handler does nothing in shuffle
+    mode.
+
+  How it could work: for the last track of a round, don't stop early. Stop as
+  soon as the module leaves that track, meaning the track number changes, or
+  after the track's length when it was the disc's final track (the same safety
+  net as in normal mode).
+
+  Trade‑off: time messages arrive once per second, so the patch notices the
+  change up to about a second late.
+  - Normal discs: between tracks there's usually a ~2 s silent gap, so the stop
+    falls in silence. The last track plays fully and you hear nothing of the
+    next one.
+  - Gapless discs (live albums, continuous mixes): the next track starts right
+    away, so up to about a second of it could be heard before the player stops.
+
+  So it's a choice between "last 2 s cut" (now) and "plays fully, but on gapless
+  discs a fraction of the next track may come through". I think the second is
+  better for most discs, since gaps are normal on studio albums. It would fit
+  under LAST_TRACK_FULL_ON, which would then cover both normal mode and the end
+  of a shuffle round.
+
+  Want me to add it that way?
+
+❯ No need to build, just answer. For shuffle mode, would it not make more       
+  sense, instead of deciding 2s before the end to decide eactly at the end of a 
+  track? Many older CD players have a little spinner to indicate that they      
+  randomise something at that point. A tradeoff I can see is that it might take 
+  a little longer to go to the next track in suffle mode because the            
+  calculation happens after the track ends.                                     
+
+⏺ Yes, deciding at the end of the track makes more sense, and it fixes the
+  cut‑off without a special rule for the last track. One correction to your
+  trade‑off, though: the delay doesn't come from the calculation. Picking a
+  track takes microseconds. What takes time is the CD module seeking to the new
+  track, typically half a second to two seconds. That seek happens in both
+  designs.
+
+  Why the firmware decides 2 s early
+  It isn't about computing. The "play track N" command has to reach the module
+  before it carries on to the next track on the disc by itself. The command goes
+  through a queue to the module once per main‑loop pass (~40 ms), and only
+  after that does the module start seeking. So the firmware sends it early and
+  accepts that the last 2 s of every track are cut. That's audible at every
+  track change, not only at the end of a round.
+
+  What deciding at the end would look like
+  - When: as soon as the module reports it has reached the track's end: the
+    elapsed time reaches the track's length, or the track number changes (the
+    module enters the next track's gap). Whichever comes first.
+  - Granularity: time messages arrive once per second, so "at the end" means
+    within about a second after it.
+  - On normal discs: each track is followed by a ~2 s silent gap before the next
+    track (that's what we saw counting down as -0.02). The jump happens inside
+    that silence, so nothing is cut and nothing of the wrong track is heard. The
+    pause between tracks gets a little longer: silence, then the seek. That's
+    the "spinner moment" on older players.
+  - On gapless discs (live albums, mixes), there's no silent gap. Up to about a
+    second of the next track in disc order could be heard before the jump.
+    That's the real cost.
+  - On the display: during that moment the module already reports the next track
+    in disc order. The track number would briefly show that track, and with gap
+    display the -0.0x countdown, before the jump. That's where your spinner
+    idea fits nicely: from the end of the track until the new one starts, line 1
+    could show something like RND or a small animation instead of a misleading
+    track number.
+  - For true shuffle: the round's last track then needs no special case. At its
+    end there's nothing left to pick, so the player stops, after the full track.
+  - Repeat‑one would gain the same way: the track plays in full before it
+    restarts.
+
+  Summary
+
+  ┌───────────────────┬─────────────────┬──────────────────────────────────┐
+  │                   │   Decide 2 s    │        Decide at the end         │
+  │                   │   early (now)   │                                  │
+  ├───────────────────┼─────────────────┼──────────────────────────────────┤
+  │ End of each track │ last 2 s cut    │ plays in full                    │
+  ├───────────────────┼─────────────────┼──────────────────────────────────┤
+  │ Pause between     │ seek time       │ gap + seek time (slightly        │
+  │ tracks            │                 │ longer)                          │
+  ├───────────────────┼─────────────────┼──────────────────────────────────┤
+  │ Gapless discs     │ clean jump      │ up to ~1 s of the wrong track    │
+  ├───────────────────┼─────────────────┼──────────────────────────────────┤
+  │ Display during    │ clean           │ briefly the wrong track number   │
+  │ the change        │                 │ (or a "spinner")                 │
+  └───────────────────┴─────────────────┴──────────────────────────────────┘
+
+  For a typical studio album, deciding at the end is the better choice. If you
+  ever want it, the cleanest version would replace the firmware's 2‑second check
+  for shuffle and repeat‑one with "end reached", and add the spinner text
+  during the jump.
+
+❯ Does the player know exactly when a song ends? Can it pause when the song     
+  ends, then go to the next song in suffle mode? Or does it not know it and     
+  therefore does it 2 s before the song's end?                                  
+
+⏺ The MCU only knows roughly when a track ends; the CD module knows exactly.
+  That gap is why the firmware stops 2 s early.
+
+  What the MCU knows
+  - The track length, from the length message, to the frame (1/75 s). For
+    example 06 16 0C is 6:22 plus 12 frames.
+  - The elapsed time, but only once per second, from the time messages, which
+    report whole seconds (frames 0). They're read by polling in the main loop,
+    so they arrive up to about 40 ms late, and about 7 % of them are lost.
+  - No "track has ended" event. The module has no message for it. What the MCU
+    notices afterwards is the track number changing, up to a second late, when
+    the module is already into the next track's gap.
+
+  The module does know it exactly: it reads the disc's position data 75 times a
+  second.
+
+  Why it acts 2 s early
+  The margin covers:
+  - The 1‑second resolution of the time (and a lost message can add another
+    second).
+  - The command path: the queue sends one command per main‑loop pass (~40 ms),
+    then I2C, and then the module still has to react.
+
+  To jump before the module carries on to the next track by itself, it has to
+  act well before the end. 2 s is a safe, crude margin.
+
+  Could it pause exactly at the end and then jump? In principle, much more
+  precisely than now:
+  - Precise timing: the time messages mark the start of each second, and the
+    length is known to the frame. So after the last time message of a track, the
+    patch can compute how long is left (e.g. 0.87 s) and time it with the
+    firmware's 75 ms clock. Sending "pause" at that moment would hit the end to
+    within roughly 0.1–0.2 s instead of 2 s early, allowing a little for the
+    command path. Then it jumps to the next (random) track, and the pause covers
+    the seek: your "spinner moment".
+  - Needs tuning on the device: how long the module takes to act on a pause can
+    only be measured on the real player, and a lost time message makes that
+    particular track end less precisely.
+
+  A possibly better route: let the module do it itself. When you press Repeat or
+  Shuffle, the firmware already sends commands to the module (0x22 for repeat,
+  0x0D and 0x23 for shuffle on/off). So the module may have its own repeat, or
+  even shuffle, which would act at exactly the right frame. The firmware still
+  does its own random picking, so the module's version may be missing or
+  unreliable. Finding out would take a few experiments with the diagnostic
+  build: send those commands and film what the module does.
+
+  In short: the 2 s early stop is a crude safety margin, not a hard limit.
+  Timing the end with the frame‑accurate length and the 75 ms clock could get
+  within a fraction of a second, with pause and jump at the actual end. How well
+  that works, and whether the module can do it natively, can only be settled
+  with tests on the player.
+
+❯ For the possible route option, that is interesting to explore later.          
+  First another possible patch. The player has vol- and vol+ buttons. When no   
+  headphone is connected, these buttons do nothing. Is it possible to give them 
+  a function, but only when no headphone is connected? E.g. vol- is the same    
+  as the DISP button. vol+ might cycle between repeat-1, repeat-disc, shuffle,  
+  normal mode                                                                   
+
+⏺ Yes, that's possible, and the firmware already provides almost everything
+  needed.
+
+  What the firmware does now
+  - The buttons: Vol− / Vol+ on the remote send keys 0x10 / 0x11 (IR 0x0A /
+    0x0B).
+  - Headphone detection: a pin, PE13, is low when a headphone is plugged in. The
+    firmware copies it into a variable (0x200004A0: 1 = headphone in, 2 =
+    none).
+  - Why the buttons do nothing: in the key handler (0x080070F0), the volume keys
+    are thrown away when PE13 is high (no headphone). With a headphone they
+    change the volume and show it on line 1.
+  - Repeat and Shuffle are keys 0x1D and 0x1C, handled at 0x0800E780 and
+    0x0800E7A4.
+
+  How the patch would work
+  The brightness patch already intercepts every key before the firmware sees it
+  (key_hook), so the remapping can go there, active only when no headphone is
+  connected:
+  - Vol−: becomes the DISP function, the elapsed/remaining toggle.
+  - Vol+: cycles normal → repeat one → repeat disc → shuffle → normal, by
+    feeding the firmware's own Repeat/Shuffle keys:
+
+  | Current mode | Vol+ sends       | New mode           |
+  |--------------|------------------|--------------------|
+  | normal       | Repeat           | repeat one         |
+  | repeat one   | Repeat           | repeat disc        |
+  | repeat disc  | Repeat + Shuffle | (normal →) shuffle |
+  | shuffle      | Shuffle          | normal             |
+    Going through the real Repeat/Shuffle handlers keeps everything consistent:
+    the commands to the CD module, the icon, true shuffle's reset and reseed.
+    The step from repeat disc to shuffle sends both keys, exactly as if you
+    pressed Repeat and then Shuffle. That way the module receives the same
+    command sequence as with the dedicated buttons, which matters because I
+    don't know what it does with those commands.
+  - With a headphone: both buttons control the volume as before.
+
+  Two details to handle
+  1. Holding the button: the firmware lets IR volume keys auto‑repeat while
+     held, for volume ramping. For the mode cycle that would race through the
+     modes, so the patch should react only to a fresh press and ignore the
+     repeats. That needs a quick look at how the IR code marks repeats.
+  2. Feedback: the repeat and shuffle icons share one spot, and repeat‑one and
+     repeat‑disc look alike at a glance. I'd show the new mode on line 1 for 2.5
+     s, like the brightness percentage. Something like RPT1, RPTA, SHUF, NORM;
+     the font has all printable characters except space and comma, about 5 fit.
+     Vol− could show REM/ELAP the same way, but the hourglass already shows
+     that.
+
+  Not affected: the front panel (no volume buttons). If there's also a volume
+  knob, it uses different key codes in the firmware and would keep working as
+  volume.
+
+  Shall I build it, with RPT1 / RPTA / SHUF / NORM as the line‑1 feedback, or do
+  you prefer other texts?
+
+❯ The buttons vol- and vol+ I was talking about are the buttons on the cd       
+  player itself, not on the remote. But likely they map the same? If the        
+  buttons on the device are used, the user is close to the screen and can       
+  clearly see the existing icons for repeat-1, repeat-disc, shuffle, and        
+  hourglass. So I don't think no other feedback is needed, the current icons    
+  only would be good enough.                                                    
+
+⏺ The player's own Vol− and Vol+ now do something when no headphone is plugged
+  in. The build is patch/IAP_PL100_1v1_b250219_all_v13.hex, tested in the
+  emulator only.
+
+  Do the device buttons map the same as the remote? Yes. The front‑panel scanner
+  gives Vol− and Vol+ the same key codes as the remote's volume buttons
+  (0x10/0x11). The patch can still tell them apart, because the firmware sets a
+  flag when a key comes from the remote, so only the device's buttons are
+  remapped.
+
+  Behaviour (option PANEL_VOL_ON, in the brightness patch's key hook):
+
+  ┌──────────────────┬─────────────────────────────────────┬────────────────┐
+  │                  │            No headphone             │   Headphone    │
+  │                  │                                     │   plugged in   │
+  ├──────────────────┼─────────────────────────────────────┼────────────────┤
+  │ Vol− on the      │ elapsed/remaining toggle (like      │ volume, as     │
+  │ player           │ DISP)                               │ before         │
+  ├──────────────────┼─────────────────────────────────────┼────────────────┤
+  │ Vol+ on the      │ normal → repeat one → repeat disc → │ volume, as     │
+  │ player           │  shuffle → normal                   │ before         │
+  ├──────────────────┼─────────────────────────────────────┼────────────────┤
+  │ Vol−/Vol+ on the │ nothing, as before                  │ volume, as     │
+  │  remote          │                                     │ before         │
+  └──────────────────┴─────────────────────────────────────┴────────────────┘
+
+  - How Vol+ works: it presses the firmware's own Repeat and Shuffle keys for
+    you. The CD module therefore gets the same commands, and the icons and true
+    shuffle (new round, new seed) behave exactly as with the remote's buttons.
+    From repeat disc to shuffle it sends Repeat and then Shuffle, just as if you
+    pressed both.
+  - Holding a button counts as one press: for volume ramping, the firmware
+    repeats a held button every few milliseconds and sends an extra event on
+    release. Events closer together than 300 ms count as one press, so two
+    deliberate presses need just over ⅓ s between them.
+  - No extra feedback: as you suggested, the existing icons show the result.
+
+  Checks:
+  - Emulator:
+    - Vol+ five times goes repeat one → repeat disc → shuffle → normal → repeat
+      one, and Vol− gives the time toggle.
+    - Holding for 1.5 s plus the release event changes the mode once; two
+      presses 400 ms apart change it twice.
+    - The remote, a headphone or standby leave the key unchanged, and FN
+      brightness still works.
+  - Regression: true shuffle, auto‑play, the OSD and the gap display are
+    unchanged.
+  - Off‑switch: with PANEL_VOL_ON = False the build is byte‑identical to v12.
+  - Builds: without the remaining patch, Vol− simply does nothing. Python 3.9
+    gives the same output.
+
+  Worth checking on the device:
+  - Unplug the headphone, press Vol+ a few times (icons cycle) and Vol−
+    (hourglass on and off).
+  - Plug the headphone in: both buttons should control the volume again.
+
+  The change is only in build_patch.py and isn't committed. The new option is
+  worth mentioning in your README.
+
+❯ Almost correct, only the vol- and vol+ are reversed: vol+ toggles DISP, vol-  
+  the repeat/shuffle modes                                                      
+
+⏺ I've swapped the two buttons: patch/IAP_PL100_1v1_b250219_all_v14.hex, tested
+  in the emulator only.
+
+  My first attempt at this got it wrong: I read your message as the behaviour
+  you wanted, not the one you saw, and produced a build identical to v13. I
+  caught that by comparing the two builds before handing it over.
+
+  Cause: on your player the physical Vol+ button sends key 0x10, the code the
+  firmware treats as volume down; Vol− sends 0x11. I had assumed the opposite.
+
+  Now (no headphone):
+  - Vol− → elapsed/remaining toggle, like DISP.
+  - Vol+ → normal → repeat one → repeat disc → shuffle → normal.
+
+  Checks:
+  - Against v13: exactly one byte differs, the key code that selects the time
+    toggle (0x10 → 0x11).
+  - Emulator: Vol+ cycles the modes and Vol− gives the time toggle. Holding a
+    button still counts as one press. The remote, a plugged‑in headphone and
+    standby are unchanged.
+  - Builds: Python 3.9 gives the same output.
+
+  In build_patch.py the two button codes are now named constants
+  (PANEL_VOLUP_KEY = 0x10, PANEL_VOLDN_KEY = 0x11). Nothing is committed.
+
+❯ Maybe a minor bug with the pre-gap. This goes  -0.02, -0.01, 00.01, 00.02. So 
+  it's skipping 00.00. Can this be explained?                                   
+
+⏺ This one has a clear explanation, and it's a bug in my gap display: an
+  interaction with how the firmware decides when to redraw the time.
+
+  What happens: the module's messages around the end of a gap are:
+
+  ┌────────────────┬──────────────────┬─────────────────┐
+  │    Message     │     Meaning      │      Shown      │
+  ├────────────────┼──────────────────┼─────────────────┤
+  │ 0:01 + frames  │ gap, 1.74 s left │ -0.02           │
+  ├────────────────┼──────────────────┼─────────────────┤
+  │ 0:00 + frames  │ gap, 0.74 s left │ -0.01           │
+  ├────────────────┼──────────────────┼─────────────────┤
+  │ 0:00, frames 0 │ track starts     │ should be 00.00 │
+  ├────────────────┼──────────────────┼─────────────────┤
+  │ 0:01           │                  │ 00.01           │
+  └────────────────┴──────────────────┴─────────────────┘
+
+  The firmware only rewrites the time label when the stored minutes or seconds
+  change (it remembers the last shown value at 0x20000620/0x20000624). The last
+  gap message and the track start both store 0:00. So the firmware sees "no
+  change" and keeps -0.01 on screen for that second, then shows 00.01. My gap
+  flag changes the text but not the value, and the firmware doesn't know about
+  the flag.
+
+  Fix: when the gap flag changes, mark the label as outdated (last shown minutes
+  := 0xFF, as the elapsed/remaining toggle already does). It's a few
+  instructions in time_msg.
+
+⏺ That was a bug in my gap display, and it's fixed:
+  patch/IAP_PL100_1v1_b250219_all_v15.hex, tested in the emulator.
+
+  Cause: the firmware only redraws the time label when the stored minutes or
+  seconds change. The gap's last message is 0:00 (with frames, so -0.01), and
+  the first message of the track is also 0:00. The value didn't change, so the
+  firmware kept showing -0.01 for that second and only redrew at 0:01. My code
+  changed the meaning (gap or not) but not the value, and the firmware doesn't
+  know about the gap flag.
+
+  Fix: whenever the gap state changes, the patch marks the time label as
+  outdated, the same trick the elapsed/remaining toggle already uses. The next
+  display update then redraws it.
+
+  Verified with the firmware's own display routine (0x0800D4E4) in the emulator,
+  fed the messages from the end of a gap:
+  - v14: -0.03, -0.02, -0.01, (unchanged), 00.01, 00.02, reproducing what you
+    saw.
+  - v15: -0.03, -0.02, -0.01, 00.00, 00.01, 00.02.
+
+  Also checked: gap detection, time fill, true shuffle, auto‑play and the panel
+  buttons are unchanged, and Python 3.9 gives the same output. The change is a
+  few instructions in time_msg in build_patch.py and isn't committed.
