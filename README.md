@@ -8,7 +8,8 @@ It adds the following fixes and enhancements:
 2. Option to change the brightness of the display using six settings using the remote's FN button. The brightness
 percentage is shown on the screen, briefly replacing the track number, similar to the volume indicator.
 3. Show `-0.02` (and counting down) for gaps between tracks. 
-4. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining time it displays an hourglass icon. (If you don't like the icon, it can be toggled off in the python script.)
+4. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining time it displays an hourglass icon. If not headphone is connected, remaining time can also be toggled by the vol- button on the
+player, but not vol- on the remote.
    * There are a couple of bugs/weird things with the time remaining display:
       * It can take anywhere between 0 and 60+ seconds for the remaining time to show. Until that time the elapsed time is displayed.
       * On track change it might first count down from the time of the previous track. Again, after a while it becomes correct.
@@ -25,6 +26,9 @@ it is updated. The result is that now it could show a specific time for less the
    * When no disc is loaded (screen showing `Disc`) press the play button to enable auto play. The play icon is shown on
    the screen, and in the top right is briefly shows `AUTO`. Inserting a disc will automatically start playing it. This
    mode is remember, also when putting the player in standby mode or removing power altogether.
+6. The vol- and vol+ buttons on the player now have a function when no headphone is plugged in.
+   * Vol- toggles time remaining/time elapsed
+   * Vol+ toggles between repeat-one, repeat-all, shuffle, and normal mode.
 
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest brightness.
@@ -32,6 +36,9 @@ it is updated. The result is that now it could show a specific time for less the
 3. Pressing play while the disc is still loading (power on or inserting a new disc) queues the play action. Previously it would just hang and do nothing. This is part of the patch for automatically playing described above. As soon as the play
 button is pressed, the icon is shown on the screen to indicate that the disc will start playing after the reading and loading
 is completed.
+4. The player would stop 2 seconds before the end of the last track, leading to missed audio. Usually this is already silence/
+fade-out, so it might not have always been noticeable.
+5. Proper shuffle mode, playing each track exactly once, then stopping. In the original firmware this was a random mode, repeating indefinitely. It could also play the same track multiple times in a row.
 
 ## Original firmware
 
