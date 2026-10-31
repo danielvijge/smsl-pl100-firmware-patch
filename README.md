@@ -1,5 +1,9 @@
 # Patched firmware for the SMSL PL100 CD player
 
+:warning: AI disclosure: AI slop & vibe coded. All patches are written by AI (Claude Opus 5.5).
+The patches firmware has been tested on hardware, but the code itself is not reviewed.
+However, this readme is fully human-authored, still some standards.
+
 This repository contains patched firmware for the SMSL PL100 CD player.
 It adds the following fixes and enhancements:
 
@@ -48,8 +52,6 @@ from the default 1.0 to 1.1. It's not known what things 1.1 fixes compared to 1.
 The original firmware is added to this repository as [IAP_PL100_1v1_b250219.hex](IAP_PL100_1v1_b250219.hex).
 
 ## Patching the original firmware
-
-:warning: All patches are written by AI (Claude Opus 5.5). It has been tested but the code is not reviewed.
 
 With the help of AI the original firmware was analysed. AI then patched the firmware based on the instructions.
 Instead of directly patching the firmware it produced a python script to patch the firmware. This allows anyone
