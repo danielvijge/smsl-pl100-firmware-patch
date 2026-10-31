@@ -82,6 +82,11 @@ Patch shuffle - true shuffle and a safer end-of-track check.
     check now only runs with the playing track's own length. It also skipped
     every length with 0 minutes or 0 seconds (tracks under 1 min, or x:00);
     now only an unknown length (0:00).
+  * LAST_TRACK_FULL_ON: in normal mode the firmware stopped the last track 2 s
+    before its length (the remaining time never got below 0:03, and the end
+    of the disc was cut). Now it plays to the end and the module's own
+    end-of-disc message stops it (0x0800D9C4); as a safety net, still playing
+    3 s past the last track's length (time fill keeps counting) stops it.
 
 Patch cdtime - time messages of the CD module.
   * About 7 % of the module's messages fail the checksum and are dropped, so
@@ -107,6 +112,12 @@ Patch 6 - FN cycles the backlight brightness.
     update has written it. The duration is measured
     on the firmware's 75 ms clock (0x20000560, counted in the TIM1 interrupt),
     not in display updates: those run once per main-loop pass (~40 ms).
+  * PANEL_VOL_ON: without a headphone the player's own Vol- and Vol+ (keys
+    0x11 / 0x10, the same as the remote's; told apart by the IR flag) did
+    nothing. Vol- now toggles elapsed / remaining (needs the remaining patch)
+    and Vol+ cycles normal, repeat one, repeat disc, shuffle via the
+    firmware's Repeat / Shuffle keys; the icons show the result. Holding a
+    button is one press. With a headphone, and on the remote, unchanged.
   * IR_DIAG_ON (off by default): show the last received IR command as
     "IRxx" on line 1, e.g. to identify remote buttons.
 
@@ -199,6 +210,17 @@ SH_HIST = 0x200003B0       # 128 x u8 spare (dead menu table): tracks in the ord
 SH_HIST_MAX = 128
 SH_WAIT_STEPS = 100        # 7.5 s: the end check keeps firing until the asked-for track plays
 CD_LEN_KIND = CD_STATE + 0x93  # length message: 0 the disc, 1 a track; +0x95 its track number
+LAST_TRACK_GRACE = 3       # LAST_TRACK_FULL_ON: still playing 3 s after the last track's length: stop
+IR_PENDING = 0x200004BC    # set when an IR command is waiting: get_key's key comes from the remote
+HEADPHONE = 0x200004A0     # 1 headphone plugged in (PE13 low), 2 none; copied in the TIM1 interrupt
+REPEAT_KEY, SHUFFLE_KEY = 0x1D, 0x1C
+PANEL_VOLUP_KEY = 0x10     # key of the player's Vol+ button (PC5; tested on the device)
+PANEL_VOLDN_KEY = 0x11     # key of the player's Vol- button (PC6)
+PANEL_VOL_PEND = 0x2000028C  # u8 spare (0 after boot, unused): key to hand out on the next pass
+PANEL_VOL_LAST = 0x2000028D  # u8 spare (0 after boot, unused): last panel volume key
+PANEL_VOL_T = 0x200002AC     # u16 spare (dead menu table): CLOCK_75MS of that key
+PANEL_VOL_HOLD_STEPS = 4     # volume key events < 300 ms apart are one press (hold / release)
+BUILD_NAMES = set()          # patches in this build (set by main)
 TIME_PREV = 0x2000029C     # 3 x u8 spare (dead menu table): track, sec, min of the previous time message
 CD_MSG_TRACK = CD_STATE + 0x99  # time message: track number
 CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the gap before a track
@@ -225,6 +247,8 @@ PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the r
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
+LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
+PANEL_VOL_ON = True        # without headphone the player's own Vol- = time toggle, Vol+ = play mode cycle
 
 EXPORTS = {}               # cave addresses one patch provides for another
 CAVE = 0x08074350          # first free flash after the original image (ends 0x08074347)
@@ -957,7 +981,23 @@ FMT_TIME = [
 KEY_HOOK = [
     'key_hook:',
     ('push', reglist('r4', lr=True)),
+] + ([
+    ('ldr_lit', 'r1', 'lit_vol_pend'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'kh_get'),
+    ('movs', 'r2', 0),               # second key of a panel Vol+ press
+    ('strb', 'r2', 'r1', 0),
+    ('mov', 'r4', 'r0'),
+    ('b', 'key_ret'),
+    'kh_get:',
+    ('ldr_lit', 'r1', 'lit_ir_pending'),
+    ('ldrb', 'r4', 'r1', 0),         # key will come from the remote?
+] if PANEL_VOL_ON else []) + [
     ('bl', GET_KEY),
+] + ([
+    ('mov', 'r1', 'r4'),
+    ('bl', 'panel_vol'),
+] if PANEL_VOL_ON else []) + [
     ('mov', 'r4', 'r0'),
 ] + ([
     ('cmp', 'r4', 0xFF),
@@ -1006,6 +1046,69 @@ KEY_HOOK = [
     ('bl', 'OSD_SHOW'),
     ('pop', reglist('r4', pc=True)),
 
+    # panel_vol(r0 = key, r1 = from remote) -> key. The player's own Vol- / Vol+
+    # do nothing without a headphone; then Vol- toggles elapsed / remaining
+    # (like DISP) and Vol+ cycles normal -> repeat one -> repeat disc ->
+    # shuffle -> normal through the firmware's Repeat / Shuffle keys (from
+    # repeat disc: Repeat, then Shuffle on the next pass). Key events closer
+    # than 300 ms are one press (holding repeats, release after a hold).
+    *(['panel_vol:',
+       ('push', reglist('r4', lr=True)),
+       ('mov', 'r4', 'r0'),
+       ('cmp', 'r0', 0x10),
+       ('beq', 'pv_vol'),
+       ('cmp', 'r0', 0x11),
+       ('bne', 'pv_out'),
+       'pv_vol:',
+       ('cmp', 'r1', 0),
+       ('bne', 'pv_out'),            # remote: unchanged
+       ('ldr_lit', 'r1', 'lit_headphone'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('cmp', 'r1', 1),
+       ('beq', 'pv_out'),            # headphone: volume
+       ('ldr_lit', 'r1', 'lit_power'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('cmp', 'r1', 0),
+       ('beq', 'pv_out'),            # standby
+       ('ldr_lit', 'r3', 'lit_vol_t'),
+       ('ldrh', 'r1', 'r3', 0),
+       ('ldr_lit', 'r2', 'lit_clock_kh'),
+       ('ldrh', 'r2', 'r2', 0),
+       ('strh', 'r2', 'r3', 0),
+       ('subs', 'r1', 'r2', 'r1'),
+       ('uxth', 'r1', 'r1'),         # 75 ms steps since the previous event
+       ('ldr_lit', 'r3', 'lit_vol_last'),
+       ('ldrb', 'r2', 'r3', 0),
+       ('strb', 'r0', 'r3', 0),
+       ('cmp', 'r2', 'r0'),
+       ('bne', 'pv_new'),
+       ('cmp', 'r1', PANEL_VOL_HOLD_STEPS),
+       ('bhs', 'pv_new'),
+       ('movs', 'r4', 0xFF),         # same press
+       ('b', 'pv_out'),
+       'pv_new:',
+       ('cmp', 'r0', PANEL_VOLDN_KEY),
+       ('bne', 'pv_mode'),
+       ('movs', 'r4', 'VOLDN_FN'),   # the time toggle key if the remaining patch is built
+       ('b', 'pv_out'),
+       'pv_mode:',
+       ('ldr_lit', 'r1', 'lit_play_mode'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('movs', 'r4', REPEAT_KEY),   # normal / repeat one: Repeat
+       ('cmp', 'r1', 2),
+       ('bne', 'pv_m3'),
+       ('ldr_lit', 'r2', 'lit_vol_pend'),
+       ('movs', 'r3', SHUFFLE_KEY),  # repeat disc: Repeat (-> normal), then Shuffle
+       ('strb', 'r3', 'r2', 0),
+       ('b', 'pv_out'),
+       'pv_m3:',
+       ('cmp', 'r1', 3),
+       ('bne', 'pv_out'),
+       ('movs', 'r4', SHUFFLE_KEY),  # shuffle: Shuffle (-> normal)
+       'pv_out:',
+       ('mov', 'r0', 'r4'),
+       ('pop', reglist('r4', pc=True))] if PANEL_VOL_ON else []),
+
     # bright_load(): replaces the generic 1..6 clamp when the saved brightness
     # is loaded, so level 0 (100 %) survives a power cycle. Anything else -> 3.
     'bright_load:',
@@ -1023,6 +1126,13 @@ KEY_HOOK = [
     ('word', POWER_ON),
     'lit_bright:',
     ('word', BRIGHTNESS),
+    *(['lit_vol_pend:', ('word', PANEL_VOL_PEND),
+       'lit_vol_last:', ('word', PANEL_VOL_LAST),
+       'lit_vol_t:', ('word', PANEL_VOL_T),
+       'lit_ir_pending:', ('word', IR_PENDING),
+       'lit_headphone:', ('word', HEADPHONE),
+       'lit_clock_kh:', ('word', CLOCK_75MS),
+       'lit_play_mode:', ('word', PLAY_MODE)] if PANEL_VOL_ON else []),
     'lit_level_text:',
     ('word', 'osd_text'),
     'osd_text:',                     # text pointer per level
@@ -1033,7 +1143,9 @@ KEY_HOOK = [
 
 def patch_brightness(img):
     ensure_osd(img)
-    cave, lab = assemble(resolve(KEY_HOOK), cave_addr(img))
+    voldn = TIME_KEY if 'remaining' in BUILD_NAMES else 0xFF
+    prog = [('movs', 'r4', voldn) if ins == ('movs', 'r4', 'VOLDN_FN') else ins for ins in resolve(KEY_HOOK)]
+    cave, lab = assemble(prog, cave_addr(img))
     # main loop: bl get_key -> bl key_hook
     code, _ = assemble([('bl', lab['key_hook'])], 0x08004300)
     patch(img, 0x08004300, bytes.fromhex('04f094fa'), code)
@@ -1042,6 +1154,7 @@ def patch_brightness(img):
     patch(img, 0x08006EBC, bytes.fromhex('fff778fe'), code)
     put(img, lab['key_hook'], cave)
     print(f"brightness: key_hook at {lab['key_hook']:#x}, {len(cave)} bytes"
+          + (' (panel Vol-/Vol+ without headphone)' if PANEL_VOL_ON else '')
           + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
 
 
@@ -1195,6 +1308,13 @@ def cd_time():
         ('movs', 'r4', 1),
         'gap_set:',
         ('ldr_lit', 'r2', 'lit_pregap'),
+        ('ldrb', 'r3', 'r2', 0),
+        ('cmp', 'r3', 'r4'),
+        ('beq', 'gap_same'),
+        ('ldr_lit', 'r3', 'lit_last_min'),  # gap ended / began: the firmware only rewrites the
+        ('movs', 'r5', 0xFF),               # time label when min/sec change (the gap's last
+        ('str', 'r5', 'r3', 0),             # 0:00 and the track's first 0:00 are equal)
+        'gap_same:',
         ('strb', 'r4', 'r2', 0),
         ('ldr_lit', 'r5', 'lit_prev'),   # remember track, sec, min
         ('ldr_lit', 'r3', 'lit_msg_track'),
@@ -1273,6 +1393,8 @@ def cd_time():
         ('word', CD_STATE),
         'lit_prev:',
         ('word', TIME_PREV),
+        'lit_last_min:',
+        ('word', LAST_SHOWN_MIN),
         'lit_msg_track:',
         ('word', CD_MSG_TRACK),
     ]
@@ -1308,7 +1430,7 @@ def patch_cdtime(img):
 # now only runs when that is the playing track.
 def shuffle_code():
     prog = []
-    if TRACK_END_FIX_ON:
+    if TRACK_END_FIX_ON or LAST_TRACK_FULL_ON:
         prog += [
             'len_msg:',                  # replaces strb.w r0, [r1, #0x10c] (track length sec)
             ('mov', 'r2', 'r1'),
@@ -1329,15 +1451,82 @@ def shuffle_code():
             ('bx_lr',),
 
             'end_check:',                # replaces bl END_CHECK in the main task
-            ('ldr_lit', 'r2', 'lit_sh'),
-            ('ldrb', 'r0', 'r2', 0),
-            ('ldr_lit', 'r1', 'lit_cur'),
+            ('push', reglist('r4', lr=True)),
+            *([('bl', 'last_full'),
+               ('cmp', 'r0', 0),
+               ('bne', 'ec_done')] if LAST_TRACK_FULL_ON else []),
+            *([('ldr_lit', 'r2', 'lit_sh'),
+               ('ldrb', 'r0', 'r2', 0),
+               ('ldr_lit', 'r1', 'lit_cur'),
+               ('ldr', 'r1', 'r1', 0),
+               ('cmp', 'r0', 'r1'),
+               ('bne', 'ec_done')] if TRACK_END_FIX_ON else []),
+            ('bl', END_CHECK),
+            'ec_done:',
+            ('pop', reglist('r4', pc=True)),
+        ]
+    if LAST_TRACK_FULL_ON:
+        prog += [
+            # last_full() -> r0 = 1 if it stopped: normal mode no longer stops
+            # the last track 2 s early, the module's end-of-disc message does.
+            # Safety net if that message does not come: still playing the last
+            # track LAST_TRACK_GRACE s after its own length (the time fill keeps
+            # counting when the module is silent): stop as the firmware would.
+            'last_full:',
+            ('push', reglist('r4', lr=True)),
+            ('movs', 'r4', 0),
+            ('ldr_lit', 'r0', 'lit_mode'),
+            ('ldrb', 'r0', 'r0', 0),
+            ('cmp', 'r0', 0),
+            ('bne', 'lf_out'),
+            ('ldr_lit', 'r3', 'lit_state'),
+            ('ldrb', 'r0', 'r3', 4),
+            ('cmp', 'r0', 6),
+            ('bne', 'lf_out'),
+            ('ldr_lit', 'r3', 'lit_cur'),
+            ('ldr', 'r0', 'r3', 0),      # track
+            ('ldr_lit', 'r1', 'lit_tracks'),
             ('ldr', 'r1', 'r1', 0),
             ('cmp', 'r0', 'r1'),
-            ('bne', 'ec_skip'),
-            ('b.w', END_CHECK),
-            'ec_skip:',
-            ('bx_lr',),
+            ('blo', 'lf_out'),           # not the last track
+            ('ldr_lit', 'r2', 'lit_sh'),
+            ('ldrb', 'r2', 'r2', 0),
+            ('cmp', 'r2', 'r0'),
+            ('bne', 'lf_out'),           # length not known for this track
+            ('ldr', 'r1', 'r3', 0x0C),   # +0x108 length min
+            ('movs', 'r2', 60),
+            ('muls', 'r1', 'r2'),
+            ('ldrb', 'r2', 'r3', 0x10),  # +0x10C length sec
+            ('adds', 'r1', 'r1', 'r2'),
+            ('cmp', 'r1', 0),
+            ('beq', 'lf_out'),
+            ('ldr', 'r0', 'r3', 4),      # +0x100 elapsed min
+            ('movs', 'r2', 60),
+            ('muls', 'r0', 'r2'),
+            ('ldrb', 'r2', 'r3', 8),     # +0x104 elapsed sec
+            ('adds', 'r0', 'r0', 'r2'),
+            ('adds_i8', 'r1', LAST_TRACK_GRACE),
+            ('cmp', 'r0', 'r1'),
+            ('blo', 'lf_out'),
+            ('bl', 'sh_stop'),
+            ('movs', 'r4', 1),
+            'lf_out:',
+            ('mov', 'r0', 'r4'),
+            ('pop', reglist('r4', pc=True)),
+        ]
+    if TRUE_SHUFFLE_ON or LAST_TRACK_FULL_ON:
+        prog += [
+            'sh_stop:',                  # stop as at the end of the disc (like END_STOP)
+            ('ldr_lit', 'r1', 'lit_state'),
+            ('movs', 'r0', 1),
+            ('strb', 'r0', 'r1', 4),
+            ('ldr_lit', 'r1', 'lit_cur'),
+            ('str', 'r0', 'r1', 0),      # track 1
+            ('movs', 'r0', 0),
+            ('str', 'r0', 'r1', 4),      # 0:00
+            ('strb', 'r0', 'r1', 8),
+            ('movs', 'r0', 3),
+            ('b.w', CD_QUEUE),
         ]
     if TRUE_SHUFFLE_ON:
         prog += [
@@ -1450,18 +1639,6 @@ def shuffle_code():
             ('strb', 'r1', 'r3', 1),
             'ss_done:',
             ('bx_lr',),
-
-            'sh_stop:',                  # stop as at the end of the disc (like END_STOP)
-            ('ldr_lit', 'r1', 'lit_state'),
-            ('movs', 'r0', 1),
-            ('strb', 'r0', 'r1', 4),
-            ('ldr_lit', 'r1', 'lit_cur'),
-            ('str', 'r0', 'r1', 0),      # track 1
-            ('movs', 'r0', 0),
-            ('str', 'r0', 'r1', 4),      # 0:00
-            ('strb', 'r0', 'r1', 8),
-            ('movs', 'r0', 3),
-            ('b.w', CD_QUEUE),
 
             'sh_tick:',                  # tick hook: note the track that is playing
             ('push', reglist('r4', lr=True)),
@@ -1656,18 +1833,25 @@ def shuffle_code():
 
 
 def patch_shuffle(img):
-    if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON):
-        print('shuffle: off (TRUE_SHUFFLE_ON and TRACK_END_FIX_ON are False)')
+    if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON or LAST_TRACK_FULL_ON):
+        print('shuffle: off (TRUE_SHUFFLE_ON, TRACK_END_FIX_ON and LAST_TRACK_FULL_ON are False)')
         return
     cave, lab = assemble(shuffle_code(), cave_addr(img))
     def hook(site, old_target, new):
         old, _ = assemble([('bl', old_target)], site)
         code, _ = assemble([('bl', lab[new])], site)
         patch(img, site, old, code)
-    if TRACK_END_FIX_ON:
+    if TRACK_END_FIX_ON or LAST_TRACK_FULL_ON:
         code, _ = assemble([('bl', lab['len_msg'])], 0x0800DE34)
         patch(img, 0x0800DE34, bytes.fromhex('81f80c01'), code)
         hook(0x0800E0B2, END_CHECK, 'end_check')
+    if LAST_TRACK_FULL_ON:
+        # END_CHECK, normal mode (and any mode but 1..3): "bne stop-at-last-track"
+        # -> "bne exit": the module's end-of-disc message stops (0x0800D9C4)
+        old, _ = assemble([('bne', 0x0800D290)], 0x0800D1F0)
+        code, _ = assemble([('bne', 0x0800D2BE)], 0x0800D1F0)
+        patch(img, 0x0800D1F0, old, code)
+    if TRACK_END_FIX_ON:
         # END_CHECK skipped when the length's minutes OR seconds were 0 (meant
         # as "no length known"): tracks under 1 min or of x:00 never ended
         # early. Skip only when both are 0: "minutes 0 -> skip" becomes
@@ -1684,7 +1868,8 @@ def patch_shuffle(img):
     first = min(lab[n] for n in ('len_msg', 'sh_n') if n in lab)
     put(img, first, cave)
     print(f'shuffle: at {first:#x}, {len(cave)} bytes'
-          + (' (true shuffle)' if TRUE_SHUFFLE_ON else '') + (' (track end fix)' if TRACK_END_FIX_ON else ''))
+          + (' (true shuffle)' if TRUE_SHUFFLE_ON else '') + (' (track end fix)' if TRACK_END_FIX_ON else '')
+          + (' (last track in full)' if LAST_TRACK_FULL_ON else ''))
 
 
 def install_tick_hooks(img):
@@ -1800,6 +1985,7 @@ def main():
                 names.insert(names.index(name), dep)
 
     img = read_hex(args.src)
+    BUILD_NAMES.update(names)
     for name in names:
         PATCHES[name](img)
     install_tick_hooks(img)
