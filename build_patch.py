@@ -69,6 +69,8 @@ CD module diagnostic (--cd-diag) - for investigation only, not for normal use.
   * Instead of the normal display, shows the raw bytes of the last CD module
     messages (time 0x21, length 0x20, other) in hex, plus counters of good
     messages and checksum failures. See cd_diag() for the layout.
+  * Module play modes experiment: in repeat/shuffle mode the firmware's own
+    end-of-track handling is skipped, so the module decides what follows.
 
 Usage: build_patch.py [--version VERSION] [--cd-diag] <original.hex> <patched.hex> [patch,...]
   patches: track, backlight, disctime, play, remaining, brightness (default: all)
@@ -798,11 +800,17 @@ def patch_splash(img, version):
 # messages, in hex, 9 bytes per line, alternating white/yellow per byte:
 #   lines 0-1  last time message      (class 4, type 0x21)
 #   lines 2-3  last length message    (class 4, type 0x20)
-#   lines 4-5  last other class-4 message
+#   lines 4-5  last other message (any class; the first byte is the class)
 #   line  6    20=/21=/E: count of length and time messages, checksum
-#              failures (hex, low byte); R: length requests sent (low digit)
-#   line  7    TR/DI: track length (+0x108/+0x10C) and disc total
-#              (+0x110/+0x114) as stored by the firmware, decimal mm:ss
+#              failures (hex, low byte); C: last command queued for the
+#              module (CD_QUEUE number, hex)
+#   line  7    M: play mode (0 normal, 1 repeat one, 2 repeat disc, 3 shuffle),
+#              T: track, elapsed mm:ss as stored by the firmware (decimal)
+# Module play modes experiment: the firmware's own end-of-track handling
+# (END_CHECK) is skipped in modes 1-3, so whatever track follows is the
+# module's own choice. The firmware sends no repeat command; Shuffle sends
+# [02 01 09 01 01] (on, also sent before fast forward/rewind) or
+# [02 01 09 01 02] (off, also sent before every Play).
 # A message is [len][class][type][data...][checksum] at CD_STATE+0x8E; the
 # bytes shown start at class. LVGL keeps running but its flush is a no-op.
 CD_MSG = CD_STATE + 0x8E
@@ -811,13 +819,16 @@ CD_READ = 0x0800DE8C       # read one message from the module (I2C)
 CD_PARSE = 0x0800D890      # parse the received message
 CD_QUEUE = 0x0800D03A      # queue a command for the module (cmd number)
 CMD_REQ_LENGTH = 0x21      # sends [04 20 01]; the firmware sends it once after loading
+DIAG_REQ_LENGTH = False    # remaining-time experiment: request the length on every track change
+END_CHECK = 0x0800D190     # end-of-track handling (repeat, shuffle, stop at the disc end)
+PLAY_MODE = 0x20000189     # 0 normal, 1 repeat one, 2 repeat disc, 3 shuffle
 DIAG_LAST_TRACK = 0x13     # spare byte of slot 0: track number seen last
 LCD_CLEAR = 0x08008E90     # whole panel black (direct, not LVGL)
 SPLASH = 0x08004AFA        # boot screen, drawn on every wake
 LV_FLUSH_PTR = 0x08028114  # literal: LVGL display driver flush_cb
 LV_FLUSH_READY = 0x080283EE  # lv_disp_flush_ready(drv)
 DIAG = 0x20000298          # 0x60 bytes of the dead settings menu's item tables
-DIAG_REQS, DIAG_ERR, DIAG_DIRTY, DIAG_MAGIC = DIAG + 0x50, DIAG + 0x54, DIAG + 0x58, DIAG + 0x5C
+DIAG_CMD, DIAG_ERR, DIAG_DIRTY, DIAG_MAGIC = DIAG + 0x50, DIAG + 0x54, DIAG + 0x58, DIAG + 0x5C
 DIAG_SLOT = 20             # [n][18 bytes]
 DIAG_ROW0 = 6
 WHITE, YELLOW, CYAN, GREEN = 0xFFFF, 0xFFE0, 0x07FF, 0x07E0
@@ -884,6 +895,30 @@ def cd_diag():
         'init_done:',
         ('bx_lr',),
 
+        # CD_QUEUE entry (push {lr}; mov r3, r0 moved here): note the command
+        'queue_hook:',
+        ('ldr_lit', 'r1', 'lit_cmd'),
+        ('strb', 'r0', 'r1', 0),
+        ('ldr_lit', 'r1', 'lit_dirty'),
+        ('ldrb', 'r2', 'r1', 0),
+        ('movs', 'r3', 0x10),
+        ('orrs', 'r2', 'r3'),
+        ('strb', 'r2', 'r1', 0),
+        ('push', reglist(lr=True)),
+        ('mov', 'r3', 'r0'),
+        ('b.w', CD_QUEUE + 4),
+
+        # replaces bl END_CHECK: only in normal mode, so in the other modes the
+        # module decides what plays after a track
+        'end_gate:',
+        ('ldr_lit', 'r0', 'lit_mode'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('cmp', 'r0', 0),
+        ('bne', 'end_skip'),
+        ('b.w', END_CHECK),
+        'end_skip:',
+        ('bx_lr',),
+
         # replaces bl CD_READ: count checksum failures
         'read_hook:',
         ('push', reglist('r4', lr=True)),
@@ -926,8 +961,8 @@ def cd_diag():
         ('bls', 'n_ok'),
         ('movs', 'r5', 18),
         'n_ok:',
-        ('movs', 'r7', 8),               # slot 3: other class
-        ('movs', 'r1', 3 * DIAG_SLOT),
+        ('movs', 'r7', 4),               # slot 2: other message
+        ('movs', 'r1', 2 * DIAG_SLOT),
         ('ldrb', 'r0', 'r4', 1),
         ('cmp', 'r0', 4),
         ('bne', 'got_slot'),
@@ -1002,27 +1037,20 @@ def cd_diag():
         ('strb', 'r1', 'r0', 0),
         'parse:',
         ('bl', CD_PARSE),
-        # experiment: request the length whenever the track number changes
-        ('ldr_lit', 'r0', 'lit_track'),
-        ('ldr', 'r0', 'r0', 0),
-        ('ldr_lit', 'r1', 'lit_diag'),
-        ('ldrb', 'r2', 'r1', DIAG_LAST_TRACK),
-        ('cmp', 'r0', 'r2'),
-        ('beq', 'no_request'),
-        ('strb', 'r0', 'r1', DIAG_LAST_TRACK),
-        ('cmp', 'r0', 0),
-        ('beq', 'no_request'),
-        ('ldr_lit', 'r1', 'lit_reqs'),
-        ('ldr', 'r2', 'r1', 0),
-        ('adds_i8', 'r2', 1),
-        ('str', 'r2', 'r1', 0),
-        ('ldr_lit', 'r0', 'lit_dirty'),
-        ('ldrb', 'r1', 'r0', 0),
-        ('movs', 'r2', 0x10),
-        ('orrs', 'r1', 'r2'),
-        ('strb', 'r1', 'r0', 0),
-        ('movs', 'r0', CMD_REQ_LENGTH),
-        ('bl', CD_QUEUE),
+    ] + ([
+            # experiment: request the length whenever the track number changes
+            ('ldr_lit', 'r0', 'lit_track'),
+            ('ldr', 'r0', 'r0', 0),
+            ('ldr_lit', 'r1', 'lit_diag'),
+            ('ldrb', 'r2', 'r1', DIAG_LAST_TRACK),
+            ('cmp', 'r0', 'r2'),
+            ('beq', 'no_request'),
+            ('strb', 'r0', 'r1', DIAG_LAST_TRACK),
+            ('cmp', 'r0', 0),
+            ('beq', 'no_request'),
+            ('movs', 'r0', CMD_REQ_LENGTH),
+            ('bl', CD_QUEUE),
+        ] if DIAG_REQ_LENGTH else []) + [
         'no_request:',
         ('bl', 'diag_draw'),
         ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
@@ -1136,27 +1164,27 @@ def cd_diag():
     ] + hex8() + ch(' ') + ch('E') + [
         ('ldr_lit', 'r4', 'lit_err'),
         ('ldr', 'r4', 'r4', 0),
-    ] + hex8() + ch(' ') + ch('R') + [
-        ('ldr_lit', 'r4', 'lit_reqs'),
-        ('ldr', 'r4', 'r4', 0),
-        ('movs', 'r2', 15),
-        ('ands', 'r2', 'r4'),
-    ] + hexchar() + dch() + [
+    ] + hex8() + ch(' ') + ch('C') + [
+        ('ldr_lit', 'r4', 'lit_cmd'),
+        ('ldrb', 'r4', 'r4', 0),
+    ] + hex8() + [
         ('movs', 'r6', 3 + 16 * 7),
         ('movs', 'r7', DIAG_ROW0),
         ('ldr_lit', 'r5', 'lit_green'),
-    ] + ch('T') + ch('R') + ch(' ') + [
-        ('ldr_lit', 'r4', 'lit_len'),
+    ] + ch('M') + [
+        ('ldr_lit', 'r4', 'lit_mode'),
+        ('ldrb', 'r2', 'r4', 0),
+        ('movs', 'r3', 15),
+        ('ands', 'r2', 'r3'),
+    ] + hexchar() + dch() + ch(' ') + ch('T') + [
+        ('ldr_lit', 'r4', 'lit_cd'),
         ('ldr', 'r4', 'r4', 0),
+    ] + dec2() + ch(' ') + [
+        ('ldr_lit', 'r4', 'lit_cd'),
+        ('ldr', 'r4', 'r4', 4),
     ] + dec2() + ch(':') + [
-        ('ldr_lit', 'r4', 'lit_len'),
-        ('ldrb', 'r4', 'r4', 4),
-    ] + dec2() + ch(' ') + ch('D') + ch('I') + ch(' ') + [
-        ('ldr_lit', 'r4', 'lit_len'),
-        ('ldr', 'r4', 'r4', 8),
-    ] + dec2() + ch(':') + [
-        ('ldr_lit', 'r4', 'lit_len'),
-        ('ldrb', 'r4', 'r4', 12),
+        ('ldr_lit', 'r4', 'lit_cd'),
+        ('ldrb', 'r4', 'r4', 8),
     ] + dec2() + [
         'draw_done:',
         ('add_sp', 8),
@@ -1165,8 +1193,8 @@ def cd_diag():
     ]
     lits = {'lit_dirty': DIAG_DIRTY, 'lit_magic_addr': DIAG_MAGIC, 'lit_magic': 0x47414944,
             'lit_diag': DIAG, 'lit_flags': CD_FLAGS, 'lit_bit16': 1 << 16, 'lit_msg': CD_MSG,
-            'lit_reqs': DIAG_REQS, 'lit_err': DIAG_ERR, 'lit_white': WHITE, 'lit_yellow': YELLOW,
-            'lit_cyan': CYAN, 'lit_green': GREEN, 'lit_len': CD_STATE + 0x108,
+            'lit_cmd': DIAG_CMD, 'lit_err': DIAG_ERR, 'lit_white': WHITE, 'lit_yellow': YELLOW,
+            'lit_cyan': CYAN, 'lit_green': GREEN, 'lit_mode': PLAY_MODE, 'lit_cd': CD_STATE + 0xFC,
             'lit_track': CD_STATE + 0xFC}
     for name, val in lits.items():
         prog += [name + ':', ('word', val)]
@@ -1185,10 +1213,12 @@ def cd_diag():
 def patch_cd_diag(img):
     cave, lab = assemble(cd_diag(), cave_addr(img))
     for site, orig, new in ((0x0800E08C, CD_READ, 'read_hook'), (0x0800E0A2, CD_PARSE, 'msg_hook'),
-                            (0x0800A868, SPLASH, 'diag_wake')):
+                            (0x0800A868, SPLASH, 'diag_wake'), (0x0800E0B2, END_CHECK, 'end_gate')):
         old, _ = assemble([('bl', orig)], site)
         code, _ = assemble([('bl', lab[new])], site)
         patch(img, site, old, code)
+    code, _ = assemble([('b.w', lab['queue_hook'])], CD_QUEUE)
+    patch(img, CD_QUEUE, bytes.fromhex('00b50346'), code)
     patch(img, LV_FLUSH_PTR, struct.pack('<I', 0x08028065), struct.pack('<I', lab['flush_stub'] | 1))
     put(img, lab['flush_stub'], cave)
     print(f"cd-diag: at {lab['flush_stub']:#x}, {len(cave)} bytes (DIAGNOSTIC BUILD: normal display replaced)")
