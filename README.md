@@ -1,8 +1,8 @@
 # Patched firmware for the SMSL PL100 CD player
 
-:warning: AI disclosure: AI slop & vibe coded. All patches are written by AI (Claude Opus 5.5).
-The patches firmware has been tested on hardware, but the code itself is not reviewed.
-However, this readme is fully human-authored, still some standards.
+:warning: AI disclosure: vibe coded AI stuff. All patches are written by AI (Claude Opus 5.5).
+The patched firmware has been tested on hardware, but the code itself is not reviewed.
+However, this readme is fully human-written. The complete prompt log is added here.
 
 This repository contains patched firmware for the SMSL PL100 CD player.
 It adds the following fixes and enhancements:
@@ -43,6 +43,8 @@ is completed.
 4. The player would stop 2 seconds before the end of the last track, leading to missed audio. Usually this is already silence/
 fade-out, so it might not have always been noticeable.
 5. Proper shuffle mode, playing each track exactly once, then stopping. In the original firmware this was a random mode, repeating indefinitely. It could also play the same track multiple times in a row.
+6. Gapless playback even after using fast forward or rewind. In the original firmware it would add a small delay after
+seeking in a track.
 
 ## Original firmware
 
@@ -70,11 +72,12 @@ Clone this repository and run:
 build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
 ```
 
-Options for patches are: track, backlight, disctime, play, remaining, brightness, cdtime. When nothing is
+Options for patches are: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless. When nothing is
 specified, all patches are applied.
 
 Optionally a version can be supplied. When supplied this version is shown on the splash screen during
 boot, below the SMSL logo and "Ver 1.1". When omitted the splash screen remains unchanged.
+The version that can be downloaded here has all patches applied and displays the patch version number.
 
 ## Preparation before flashing
 
