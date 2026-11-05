@@ -121,6 +121,18 @@ Patch 6 - FN cycles the backlight brightness.
   * IR_DIAG_ON (off by default): show the last received IR command as
     "IRxx" on line 1, e.g. to identify remote buttons.
 
+Patch 7 - gaps between tracks after fast forward / rewind.
+  * [02 01 09 01 01] (command 0x24) puts the CD module in a mode where it
+    stops at the end of each track and reports it; the firmware then starts
+    the next track itself (0x0800DA84): a seek, so an audible gap.
+    [02 01 09 01 02] (0x25) is continuous play. Fast forward / rewind
+    (0x0800E87E / 0x0800E8A0) and Shuffle on send 0x24; the Play key
+    (0x0800E10E) sends 0x25 before every play.
+  * The release of fast forward / rewind (0x0800D134) only sends "play from
+    here" (command 8), so the module stays in stop-at-end mode and every
+    later track change has a gap, until Play is pressed again.
+  * Send 0x25 before that play command, as the Play key does.
+
 Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * The boot screen (0x08004AFA) is drawn straight to the LCD, not through
     LVGL. "Ver 1.1" moves up a little and the patch line is drawn below it in
@@ -128,7 +140,8 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * Without --version the boot screen stays original.
 
 Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
-  patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness (default: all)
+  patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless
+           (default: all)
 """
 import argparse
 import struct
@@ -1925,6 +1938,31 @@ def splash_hook(text, row):
     ]
 
 
+# seek_end(): replaces bl CD_QUEUE (command 8, play from here) at the end of
+# fast forward / rewind; queues continuous play first, like the Play key.
+CMD_CONTINUOUS = 0x25      # [02 01 09 01 02]: the module plays on at a track end
+CMD_PLAY_FROM = 8          # play track +0x115 from +0x116:+0x117
+SEEK_END_SITE = 0x0800D188
+SEEK_END = [
+    'seek_end:',
+    ('push', reglist(lr=True)),
+    ('movs', 'r0', CMD_CONTINUOUS),
+    ('bl', CD_QUEUE),
+    ('movs', 'r0', CMD_PLAY_FROM),
+    ('bl', CD_QUEUE),
+    ('pop', reglist(pc=True)),
+]
+
+
+def patch_gapless(img):
+    cave, lab = assemble(SEEK_END, cave_addr(img))
+    old, _ = assemble([('bl', CD_QUEUE)], SEEK_END_SITE)
+    site, _ = assemble([('bl', lab['seek_end'])], SEEK_END_SITE)
+    patch(img, SEEK_END_SITE, old, site)
+    put(img, lab['seek_end'], cave)
+    print(f"gapless: seek_end at {lab['seek_end']:#x}, {len(cave)} bytes")
+
+
 def patch_splash(img, version):
     text = 'patch ' + version
     bad = sorted(set(c for c in text if c not in SPLASH_CHARS))
@@ -1963,7 +2001,7 @@ def remap_buttons(img, names):
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
-           'brightness': patch_brightness}
+           'brightness': patch_brightness, 'gapless': patch_gapless}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens;
 # the gap display in 'remaining' needs cdtime's gap detection
 REQUIRES = {'play': ['disctime'], 'remaining': ['cdtime'] if PREGAP_MINUS_ON else []}
