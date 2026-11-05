@@ -3290,3 +3290,134 @@ Opus 5.5 · Claude Team
   Also checked: gap detection, time fill, true shuffle, auto‑play and the panel
   buttons are unchanged, and Python 3.9 gives the same output. The change is a
   few instructions in time_msg in build_patch.py and isn't committed.
+
+❯ Many reviewers of the PL100 argue if this CD player is gapless. All agree     
+  that if fast forward/rewind are used, there will be a gap when going to the   
+  next track. And some reviewers always hear a gap between tracks, even when    
+  letting the disc just play. Is there anything in the firmware that could      
+  explain this?
+
+⏺ Yes. The firmware has a plausible explanation for the gap after
+  fast-forward/rewind, and it can make every later track change gappy too. It's
+  an inference from the code; nothing has been tested on the player yet.
+
+  How a track change normally works
+
+  In normal mode the firmware does nothing at the end of a track. The module
+  simply plays on into the next track, so there's nothing in the firmware that
+  would add a gap. Whether that transition is truly seamless in the audio is up
+  to the CD module, which the firmware can't show.
+
+  The second way: module stops, firmware restarts
+
+  The firmware also has a handler for a module status message (class 3, type 3,
+  code 40 30 40). When that message arrives during playback, the firmware sends
+  "play track N+1 from 0:00" (0x0800DA84). That's a fresh seek: the module has
+  stopped, then has to find the next track and start again. That's an audible
+  gap.
+
+  The firmware needs this path for a module that stops at the end of each track.
+  That's where the 09 command from the earlier test comes in:
+  - 02 01 09 01 01 is sent when fast-forward/rewind starts and when Shuffle is
+    switched on.
+  - 02 01 09 01 02 is sent by the Play button and when Shuffle is switched off.
+
+  Everything fits if 09 01 01 means "stop at the end of each track" and 09 01 02
+  means "play continuously":
+  - Fast-forward/rewind switches to stop-at-end, so scanning halts at the track
+    boundary. The firmware then starts the next track itself (0x0800DA30).
+  - Shuffle switches to stop-at-end, so the firmware can choose the next track.
+  - Your diagnostic build showed exactly this: with the firmware's own track-end
+    handling disabled in shuffle mode, the module stopped at the end. The
+    firmware's 40 30 40 handler then started the next track in order.
+
+  The bug
+
+  When you release fast-forward/rewind (0x0800D134), the firmware only sends
+  "play from here". It never sends 09 01 02 to switch back to continuous play.
+  The Play button does send it (0x0800E10E sends it first, every time).
+
+  So after one use of fast-forward or rewind, the module stays in stop-at-end
+  mode. From then on every track change goes:
+  1. the module stops,
+  2. it reports 40 30 40,
+  3. the firmware seeks to the next track,
+  4. there's a gap.
+
+  This continues until Play is pressed again. Next and Previous don't reset it,
+  because they send a play command directly, without 09 01 02.
+
+  That would explain both groups of reviewers:
+  - "A gap after fast-forward/rewind": always, from the next track change on.
+  - "Always a gap": anyone who tried fast-forward/rewind once, and then only
+    used Next/Previous or just let the disc play, keeps hearing gaps.
+
+  Other places with a real gap or cut
+
+  These are separate from the bug, and our patches already address some of them:
+  - Repeat one and shuffle: the firmware jumps 2 s before the end of the track,
+    so you lose the last 2 s and get a seek.
+  - Normal mode: the last track was cut 2 s early. LAST_TRACK_FULL_ON fixes
+    that.
+
+  Test it on your player with v15, no new build needed
+
+  1. Play a disc and listen to a track change. If the module itself is gapless,
+     there's no gap here.
+  2. In the next track, briefly fast-forward and release. At the following track
+     change you should hear a gap.
+  3. Press Pause and then Play. This sends 09 01 02 again, so the next track
+     change should be gapless again.
+
+  If that's what happens, the theory is confirmed.
+
+  Possible fix: a small patch, under its own config option, that sends 09 01 02
+  when fast-forward/rewind is released, just as the Play button already does. I
+  can build that if the test confirms it.
+
+❯ Already build the patch, then it's easier to test and compare the differences 
+
+⏺ I built the fix as a separate gapless patch. Your v16 build is
+  patch/IAP_PL100_1v1_b250219_all_v16.hex, and its boot screen shows "patch
+  v2026-11-05". It's tested in the emulator only, not yet on the player.
+
+  What it changes: releasing fast-forward/rewind now also sends "continuous
+  play" (02 01 09 01 02) to the module, just before "play from here". The Play
+  button already does exactly this.
+
+  Emulator check, running the firmware's own release routine and command queue:
+
+  ┌─────┬───────────────────────────────────┐
+  │     │     Commands sent on release      │
+  ├─────┼───────────────────────────────────┤
+  │ v15 │ 0x08 (play from here only)        │
+  ├─────┼───────────────────────────────────┤
+  │ v16 │ 0x25 (continuous play), then 0x08 │
+  └─────┴───────────────────────────────────┘
+
+  In both builds the resume position (min:sec) is the same. Nothing is sent
+  while the button is still held or outside fast-forward/rewind, and no other
+  memory is written.
+
+  For comparing: v16 without gapless is byte-identical to v15. v15 is the
+  "before" build and v16 the "after", and this is the only difference. The
+  second number in the steps is the track change you should hear on v16:
+
+  1. Let a track change happen without touching anything: it should sound the
+     same on both. This tells you whether the module itself is gapless.
+  2. Fast-forward briefly in a track, release, and listen to the next track 
+     change: with v15 a gap, with v16 none.
+  3. Then let a few more tracks change: with v15 they keep the gap until you
+     press Play (or Pause, then Play); with v16 there's no gap.
+
+  If step 2 is still gappy on v16, the guess about what 09 means is wrong, and
+  we'd need to look further.
+
+  Notes:
+  - Shuffle still turns stop-at-end on, deliberately: it lets the firmware
+    choose the next track. True shuffle jumps before the end anyway, so that's
+    unchanged.
+  - Nothing is committed. The change is the new patch in build_patch.py (+40
+    lines), plus its docstring and usage line.
+  - README: the patch list and a short description of the fast-forward/rewind
+    gap fix could be added.
