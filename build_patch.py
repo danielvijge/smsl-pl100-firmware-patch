@@ -90,13 +90,29 @@ Patch shuffle - true shuffle and a safer end-of-track check.
 
 Patch cdtime - time messages of the CD module.
   * About 7 % of the module's messages fail the checksum and are dropped, so
-    the time sometimes jumps by 2 s. TIME_FILL_ON: when playing and no time
-    message came for 1.275 s, advance the elapsed time by 1 s (count down in
-    the gap); the next message sets the module's own time again.
+    the time sometimes jumps by 2 s. TIME_FILL_ON: when playing and the
+    shown second has not changed for 1.125 s, advance the elapsed time by 1 s
+    (count down in the gap); the next message sets the module's own time
+    again. The 1.125 s count from the first message with that second (a
+    repeat of the same second does not restart it): that message arrives at
+    or after the second began, so the next second has always begun by then
+    and the filled time is never ahead of the disc. Counted from the last
+    message instead, a late or repeated message delayed the fill until just
+    before the next real one, which then showed it only briefly.
   * Notes for each time message whether it is from the gap before a track,
     for PREGAP_MINUS_ON: the module counts the gap down, and those messages
     have a non-zero frames byte (normal play does too, occasionally, so a
     count down or a new track is required as well).
+  * LENGTH_REQUEST_ON: the module only sends a track length when asked. The
+    firmware asks with command 0x22 ([04 20 01 01 80], current track) every
+    2000 main-loop passes (~22 s, timer 0x20000562, 0x0800E0D0), and on the
+    Repeat key, so after a track change the remaining time and the end check
+    used the previous track's length for up to 22 s. The length message says
+    which track it is for (noted by the shuffle patch, see TRACK_END_FIX_ON).
+    Each time message (~1 s) now compares that with the track it reports,
+    and while playing and they differ it asks: on the first message, then
+    every other one until the answer arrives (in the gap before a track, or
+    after a checksum failure, the answer may not match yet).
 
 Patch 6 - FN cycles the backlight brightness.
   * FN (BRIGHT_IR) has no function on the PL100. It is mapped to key 0x14,
@@ -231,14 +247,16 @@ PANEL_VOLUP_KEY = 0x10     # key of the player's Vol+ button (PC5; tested on the
 PANEL_VOLDN_KEY = 0x11     # key of the player's Vol- button (PC6)
 PANEL_VOL_PEND = 0x2000028C  # u8 spare (0 after boot, unused): key to hand out on the next pass
 PANEL_VOL_LAST = 0x2000028D  # u8 spare (0 after boot, unused): last panel volume key
+LEN_REQ_SKIP = 0x200002AB  # u8 spare (dead menu table): time messages to skip before asking again
 PANEL_VOL_T = 0x200002AC     # u16 spare (dead menu table): CLOCK_75MS of that key
 PANEL_VOL_HOLD_STEPS = 4     # volume key events < 300 ms apart are one press (hold / release)
 BUILD_NAMES = set()          # patches in this build (set by main)
 TIME_PREV = 0x2000029C     # 3 x u8 spare (dead menu table): track, sec, min of the previous time message
 CD_MSG_TRACK = CD_STATE + 0x99  # time message: track number
 CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the gap before a track
-TIME_FILL_STEPS = 17       # no time message for 17 x 75 ms = 1.275 s: one was lost
-TIME_FILL_STEP = 13        # then again every ~1 s (13 x 75 ms) while they stay missing
+TIME_FILL_STEPS = 15       # shown second unchanged for 15 x 75 ms = 1.125 s: its successor was lost
+TIME_FILL_STEP = 14        # a fill counts as that second's start + 1.05 s (14 x 75 ms), so further
+                           # fills follow every 1.05 s; both include a step for the 75 ms rounding
 TICK_HOOKS = []            # cave functions to run after every display update (see install_tick_hooks)
 BRIGHT_OSD_TEXT = ['100%', '65%', '55%', '35%', '20%', '10%']   # levels 0..5
 DRAW_STR = 0x08009A42      # boot screen: (col, row, str, fg, [sp] bg), 13 px per char
@@ -261,6 +279,7 @@ AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play o
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
+LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
 PANEL_VOL_ON = True        # without headphone the player's own Vol- = time toggle, Vol+ = play mode cycle
 
 EXPORTS = {}               # cave addresses one patch provides for another
@@ -1277,20 +1296,35 @@ def resolve(prog):
 
 # time_msg(): replaces "strb.w r0, [r1, #0x104]" (elapsed seconds) in both
 # branches of the CD module's time message (0x21) handler. Does that store,
-# then notes the time of arrival and whether the message is from the gap
+# then notes when the shown time changed (a different second or track, or
+# the first message since playing started) and whether the message is from the gap
 # before a track, which the module counts down: while playing, minutes 0, a
 # non-zero frames byte (normal play mostly reports whole seconds, but not
 # always), and either a new track or fewer seconds than the previous message
 # (the same second again keeps the state). r1 (CD state) must survive.
-# time_fill(): tick hook. While playing, if no time message came for 1.275 s
-# one was lost (~7 % fail the checksum): advance the elapsed time by 1 s
-# (count down in the gap), then every ~1 s while they stay missing. The next
-# message overwrites it with the module's own time.
+# time_fill(): tick hook. While playing, if the shown second has not changed
+# for 1.125 s a message was lost (~7 % fail the checksum): advance the
+# elapsed time by 1 s (count down in the gap), then every 1.05 s while they
+# stay missing. The next message overwrites it with the module's own time;
+# one with the second the fill already shows does not restart the count.
 def cd_time():
     return [
         'time_msg:',
-        ('push', reglist('r4', 'r5', lr=True)),
+        ('push', reglist('r4', 'r5', 'r6', lr=True)),
         ('ldr_lit', 'r2', 'lit_elapsed'),
+        ('ldrb', 'r6', 'r2', 4),         # second shown so far (by a message or a fill)
+        ('subs', 'r6', 'r6', 'r0'),      # r6 != 0: the shown time changes
+        ('cbnz', 'r6', 'changed'),
+        ('ldr_lit', 'r3', 'lit_msg_track'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('ldr_lit', 'r6', 'lit_cur_track'),
+        ('ldrb', 'r6', 'r6', 0),         # +0xFC is only written after this hook
+        ('subs', 'r6', 'r6', 'r3'),
+        ('cbnz', 'r6', 'changed'),
+        ('ldr_lit', 'r3', 'lit_armed'),
+        ('ldrb', 'r6', 'r3', 0),
+        ('subs_i3', 'r6', 'r6', 1),      # not armed yet: first message since playing
+        'changed:',
         ('strb', 'r0', 'r2', 4),         # +0x104 elapsed sec (the replaced store)
         ('movs', 'r4', 0),               # in the gap?
         ('ldr', 'r3', 'r2', 0),          # +0x100 elapsed min
@@ -1337,14 +1371,50 @@ def cd_time():
         ('ldr_lit', 'r3', 'lit_elapsed'),
         ('ldr', 'r3', 'r3', 0),
         ('strb', 'r3', 'r5', 2),
+        ('cbz', 'r6', 'same_time'),
         ('ldr_lit', 'r0', 'lit_clock'),
         ('ldrh', 'r3', 'r0', 0),
         ('ldr_lit', 'r0', 'lit_stamp'),
         ('strh', 'r3', 'r0', 0),
+        'same_time:',
         ('ldr_lit', 'r0', 'lit_armed'),
         ('movs', 'r3', 1),
         ('strb', 'r3', 'r0', 0),
-        ('pop', reglist('r4', 'r5', pc=True)),
+    ] + ([
+        # LENGTH_REQUEST_ON: while playing, ask for the length until the
+        # stored one is for this message's track
+        ('ldr_lit', 'r3', 'lit_state'),
+        ('ldrb', 'r3', 'r3', 4),
+        ('cmp', 'r3', 6),
+        ('bne', 'lr_done'),
+        ('ldr_lit', 'r2', 'lit_skip'),
+        ('movs', 'r0', 0),
+        ('ldr_lit', 'r3', 'lit_msg_track'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('ldr_lit', 'r5', 'lit_len_track'),
+        ('ldrb', 'r5', 'r5', 0),
+        ('cmp', 'r3', 'r5'),
+        ('beq', 'lr_store'),             # the right length: ask at once on the next change
+        ('ldrb', 'r0', 'r2', 0),
+        ('cbz', 'r0', 'lr_ask'),
+        ('movs', 'r0', 0),               # skipped this one
+        ('b', 'lr_store'),
+        'lr_ask:',
+        ('movs', 'r0', 1),               # skip the next message: the answer takes ~1 s
+        ('strb', 'r0', 'r2', 0),
+        ('ldr_lit', 'r2', 'lit_period'),
+        ('ldr_lit', 'r0', 'lit_period_n'),
+        ('strh', 'r0', 'r2', 0),         # restart the firmware's own 22 s timer
+        ('mov', 'r4', 'r1'),
+        ('movs', 'r0', CMD_REQ_TRACK_LENGTH),
+        ('bl', CD_QUEUE),
+        ('mov', 'r1', 'r4'),
+        ('b', 'lr_done'),
+        'lr_store:',
+        ('strb', 'r0', 'r2', 0),
+        'lr_done:',
+    ] if LENGTH_REQUEST_ON else []) + [
+        ('pop', reglist('r4', 'r5', 'r6', pc=True)),
 
         'time_fill:',
         ('ldr_lit', 'r3', 'lit_state'),
@@ -1363,7 +1433,7 @@ def cd_time():
         ('ldr_lit', 'r1', 'lit_clock'),
         ('ldrh', 'r1', 'r1', 0),
         ('subs', 'r1', 'r1', 'r0'),
-        ('uxth', 'r1', 'r1'),            # 75 ms steps since the last message
+        ('uxth', 'r1', 'r1'),            # 75 ms steps since the shown second began
         ('cmp', 'r1', TIME_FILL_STEPS),
         ('blo', 'tf_ret'),
         ('adds_i8', 'r0', TIME_FILL_STEP),
@@ -1410,13 +1480,28 @@ def cd_time():
         ('word', LAST_SHOWN_MIN),
         'lit_msg_track:',
         ('word', CD_MSG_TRACK),
+        'lit_cur_track:',
+        ('word', CD_STATE + 0xFC),
+        *(['lit_skip:', ('word', LEN_REQ_SKIP),
+           'lit_len_track:', ('word', SH),        # +0: track of the stored length (shuffle patch)
+           'lit_period:', ('word', LEN_PERIOD_TIMER),
+           'lit_period_n:', ('word', LEN_PERIOD)] if LENGTH_REQUEST_ON else []),
     ]
 
 
+# LENGTH_REQUEST_ON: the firmware's own request for the current track's length
+CMD_REQ_TRACK_LENGTH = 0x22  # [04 20 01 01 80]
+LEN_PERIOD_TIMER = 0x20000562  # u16: main-loop passes until the firmware's next 0x22
+LEN_PERIOD = 2000
+
+
 def patch_cdtime(img):
-    if not (TIME_FILL_ON or PREGAP_MINUS_ON):
-        print('cdtime: off (TIME_FILL_ON and PREGAP_MINUS_ON are False)')
+    if not (TIME_FILL_ON or PREGAP_MINUS_ON or LENGTH_REQUEST_ON):
+        print('cdtime: off (TIME_FILL_ON, PREGAP_MINUS_ON and LENGTH_REQUEST_ON are False)')
         return
+    # the length request compares with the track of the stored length, which the shuffle patch notes
+    assert not LENGTH_REQUEST_ON or TRACK_END_FIX_ON or LAST_TRACK_FULL_ON, \
+        'LENGTH_REQUEST_ON needs TRACK_END_FIX_ON or LAST_TRACK_FULL_ON'
     cave, lab = assemble(cd_time(), cave_addr(img))
     for site in (0x0800DDA6, 0x0800DDDC):      # seek / play branch of the time message
         code, _ = assemble([('bl', lab['time_msg'])], site)
@@ -1425,7 +1510,8 @@ def patch_cdtime(img):
         TICK_HOOKS.insert(0, lab['time_fill'])  # before the display text hooks
     put(img, lab['time_msg'], cave)
     print(f"cdtime: time_msg at {lab['time_msg']:#x}, {len(cave)} bytes"
-          + (' (time fill)' if TIME_FILL_ON else '') + (' (gap detection)' if PREGAP_MINUS_ON else ''))
+          + (' (time fill)' if TIME_FILL_ON else '') + (' (gap detection)' if PREGAP_MINUS_ON else '')
+          + (' (length request)' if LENGTH_REQUEST_ON else ''))
 
 
 # Shuffle (play mode 3) picks a random track with rand() % tracks + 1 at the
@@ -2003,8 +2089,10 @@ PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch
            'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
            'brightness': patch_brightness, 'gapless': patch_gapless}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens;
-# the gap display in 'remaining' needs cdtime's gap detection
-REQUIRES = {'play': ['disctime'], 'remaining': ['cdtime'] if PREGAP_MINUS_ON else []}
+# the gap display in 'remaining' needs cdtime's gap detection; cdtime's length request
+# needs the track of the stored length, which 'shuffle' notes
+REQUIRES = {'play': ['disctime'], 'remaining': ['cdtime'] if PREGAP_MINUS_ON else [],
+            'cdtime': ['shuffle'] if LENGTH_REQUEST_ON else []}
 
 
 def main():
