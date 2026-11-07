@@ -110,7 +110,9 @@ Patch cdtime - time messages of the CD module.
     used the previous track's length for up to 22 s. The length message says
     which track it is for (noted by the shuffle patch, see TRACK_END_FIX_ON).
     Each time message (~1 s) now compares that with the track it reports,
-    and while playing and they differ it asks: on the first message, then
+    and while playing and they differ, or the stored length is 0:00 (eject
+    and standby clear it, but not the track noted with it, so track 1 of a
+    new disc could match track 1 of the old one), it asks: on the first message, then
     every other one until the answer arrives (in the gap before a track, or
     after a checksum failure, the answer may not match yet).
 
@@ -1488,7 +1490,13 @@ def cd_time():
         ('ldr_lit', 'r5', 'lit_len_track'),
         ('ldrb', 'r5', 'r5', 0),
         ('cmp', 'r3', 'r5'),
-        ('beq', 'lr_store'),             # the right length: ask at once on the next change
+        ('bne', 'lr_differ'),
+        ('ldr_lit', 'r5', 'lit_elapsed'),
+        ('ldr', 'r3', 'r5', 8),          # +0x108 length min
+        ('ldrb', 'r5', 'r5', 0x0C),      # +0x10C length sec
+        ('orrs', 'r3', 'r5'),
+        ('bne', 'lr_store'),             # the right length: ask at once on the next change
+        'lr_differ:',                    # (0:00: cleared at eject / standby, the track noted is stale)
         ('ldrb', 'r0', 'r2', 0),
         ('cbz', 'r0', 'lr_ask'),
         ('movs', 'r0', 0),               # skipped this one
