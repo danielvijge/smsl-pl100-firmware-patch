@@ -615,7 +615,8 @@ PLAY_KEY = [
 
     # play_poll(): replaces the main loop's call to 0x08007F30. Starts a
     # pending Play once the disc is ready; drops it if the tray opens, there
-    # is no disc / the tray is blocked, or the play state changed meanwhile.
+    # is no disc ("Disc", status 3 or 6) / the tray is blocked, or the play
+    # state changed meanwhile.
     'play_poll:',
     ('push', reglist('r4', lr=True)),
     ('bl', MAIN_TASK),
@@ -703,6 +704,8 @@ PLAY_KEY = [
     ('cbz', 'r0', 'poll_done'),
     ('ldr_lit', 'r3', 'lit_state'),
     ('ldrb', 'r0', 'r3', 7),         # tray status 2 Eject / 3 Disc / 4 Block
+    ('cmp', 'r0', 6),                # / 6 Disc (load failed: no disc, e.g. Stop
+    ('beq', 'poll_cancel'),          # at an empty slot retries the load)
     ('subs_i3', 'r0', 'r0', 2),
     ('cmp', 'r0', 2),
     ('bls', 'poll_cancel'),
