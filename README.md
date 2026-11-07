@@ -12,20 +12,10 @@ It adds the following fixes and enhancements:
 2. Option to change the brightness of the display using six settings using the remote's FN button. The brightness
 percentage is shown on the screen, briefly replacing the track number, similar to the volume indicator.
 3. Show `-0.02` (and counting down) for gaps between tracks. 
-4. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining time it displays an hourglass icon. If not headphone is connected, remaining time can also be toggled by the vol- button on the
-player, but not vol- on the remote.
-   * There are a couple of bugs/weird things with the time remaining display:
-      * It can take anywhere between 0 and 60+ seconds for the remaining time to show. Until that time the elapsed time is displayed.
-      * On track change it might first count down from the time of the previous track. Again, after a while it becomes correct.
-      * Powering on the player with a disc inserted and playing it will first count down from the total disc time, not the track time.
-   * All this is not a bug in this firmware, but is inherent to how the hardware is implemented. This only sends a track
-update around every 22 seconds. And a message can be corrupted, missing an update.
-Corrupted messages are also the reason that sometimes a time change is not shown, and it could jump from 00:31 to 00:33.
-I did quite some diagnostics to try to find out if this could be changed. The full
-results can be read in [claude-pl100-patch-chat.md](claude-pl100-patch-chat.md) (line 1500 and onwards). The diagnostic
-build script is available in the `diagnostic-remaining-time` git branch. While it cannot be really fix, it is somewhat
-mitigated. When no new time messages come the time is still increased by 1 second. The next time a real message is received
-it is updated. The result is that now it could show a specific time for less then a second, quickly advancing to the next.
+4. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining
+time it displays an hourglass icon. The time remaining of a new track should be correct within 0-2 seconds of starting
+the track. If not headphone is connected, remaining time can also be toggled by the vol- button on the player, but not
+vol- on the remote.
 5. Option to automatically play when inserting a disc.
    * When no disc is loaded (screen showing `Disc`) press the play button to enable auto play. The play icon is shown on
    the screen, and in the top right is briefly shows `AUTO`. Inserting a disc will automatically start playing it. This
@@ -33,6 +23,12 @@ it is updated. The result is that now it could show a specific time for less the
 6. The vol- and vol+ buttons on the player now have a function when no headphone is plugged in.
    * Vol- toggles time remaining/time elapsed
    * Vol+ toggles between repeat-one, repeat-all, shuffle, and normal mode.
+7. Screen saver after 3 minutes of idle time, meaning stopped or no disc, never when playing/paused. The setting can be enabled and controlled with the MENU key of the remote. Available options are:
+   * `NONE`: screen saver is not enabled.
+   * `DIM`: screen dims to the lowest brightness. If the screen is already at 10% this has no noticeable effect.
+   * `DARK`: screen goes completely off.
+   * `CD/w`: A CD icon is shown at a random position on the screen, changing every 10 seconds. (`/w` for white)
+   * `CD/c`: Similar to `CD/w`, but now the CD icon also changes to a random colour. (`/c` for colour)
 
 **Bug fixes:**
 1. When the device is in standby the display is fully off instead of the lowest brightness.
@@ -45,6 +41,10 @@ fade-out, so it might not have always been noticeable.
 5. Proper shuffle mode, playing each track exactly once, then stopping. In the original firmware this was a random mode, repeating indefinitely. It could also play the same track multiple times in a row.
 6. Gapless playback even after using fast forward or rewind. In the original firmware it would add a small delay after
 seeking in a track.
+7. Skipping seconds is no longer there. The CD module sends the current time every second. As a result the time on the
+screen is updated. About 7% of these message are corrupted. When that happens the time remains the same. The next good
+message would then change again the time. The display could show `00:22` -> `0:22` -> `0:24`. This is resolved by always
+changing the time, even if there is a corrupt time message.
 
 ## Original firmware
 
@@ -72,8 +72,8 @@ Clone this repository and run:
 build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
 ```
 
-Options for patches are: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless. When nothing is
-specified, all patches are applied.
+Options for patches are: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless, screen.
+When nothing is specified, all patches are applied.
 
 Optionally a version can be supplied. When supplied this version is shown on the splash screen during
 boot, below the SMSL logo and "Ver 1.1". When omitted the splash screen remains unchanged.
