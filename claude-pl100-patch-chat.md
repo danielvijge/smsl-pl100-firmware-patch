@@ -3421,3 +3421,762 @@ Opus 5.5 · Claude Team
     lines), plus its docstring and usage line.
   - README: the patch list and a short description of the fast-forward/rewind
     gap fix could be added.
+
+❯ The last issue is the 22 seconds that the time is sent. It was mentioned   
+  earlier that it might be possible to send a message to the CD unit requesting 
+  the time most often. It seems the CD unit is an CDM-M10 4.11/5 868C. Is    
+  there information available about this that could tell what message can be    
+  sent to request the time more often?                  
+
+⏺ There's no public documentation for this protocol, but the firmware itself
+  answers the question.
+
+  First, a correction about the 22 seconds: the module sends the time about once
+  a second. It's the track length that only arrives every ~22 s, and that's
+  what makes the remaining-time display jump. Now that the module's commands are
+  decoded, this turns out not to be the module's own rhythm. The firmware asks
+  for it:
+  - Every ~22 s, the main task sends command 0x22, [04 20 01 01 80]
+    (0x0800E0D0). A counter (0x20000562) is reloaded with 2000 each time, and at
+    roughly 11 ms per main-loop pass that's ~22 s. This matches the ~22 s you
+    filmed.
+  - The module answers with the length message, which in your film was the
+    current track's length.
+  - Our diagnostic v3 sent the wrong request. It used 0x21, [04 20 01], which
+    the firmware sends once after loading, and the module answered with the disc
+    total. The 01 80 in 0x22 probably means "current track".
+  - The Repeat button also sends 0x22, which is why you saw the 01 05 00 04 20
+    confirmation after pressing it.
+
+  So the likely fix is to send 0x22 right after each track change, instead of
+  waiting up to 22 s for the next periodic request. That only uses a command the
+  firmware already sends regularly, so it's low risk.
+
+  Quick test, no build needed: play a disc in remaining-time mode. Right after a
+  track change, while the countdown is still wrong, press Repeat three times on
+  the remote, which brings you back to normal mode. Each press sends 0x22. If
+  the remaining time corrects itself within about a second, the theory holds.
+
+  About the CDM-M10 itself:
+  - It's a Philips CD loader mechanism, also used in car radios. A variant
+    listed for Vauxhall/GM/Chevrolet/Hyundai radios is the CDM-M10 4.11/52 850C,
+    and another listing says it fits the Continental MM2012 head unit in the
+    Renault Scenic and Laguna.
+  - I found no datasheet or command reference, only shop listings.
+  - Philips' CD Pro modules use a protocol called DSA. The
+    [len][class][type][data][checksum] messages over I2C here don't look like
+    DSA, so I can't confirm the CDM-M10 uses it.
+  - These messages probably come from the module's own controller board, not
+    from the Philips mechanism itself. Car-radio service manuals for the head
+    units that use the CDM-M10 would be the most likely place to find more.
+
+  If the Repeat test works, I'll build the patch: send 0x22 about a second after
+  each track change, under its own config option.
+
+  Sources:
+  - CDM-M10 4.7/105 CD Loader mechanism (opuradio)
+    (https://www.opuradio.com/products/cdm-m10-47-105-single-cd-deck-loader-driv
+    e-mechanism-for-renault-scenic-laguna-3-p)
+  - Philips CDM-M10 4.11/52 850C loader (opuradio) (https://www.opuradio.com/phi
+    lips-single-cd-drive-loader-deck-mechanism-cdm-m10-411-52-850c-for-vauxhall-
+    gm-chevrolet-hyundai-car-stereo-radio-cd-player-mp3-p0866.html)
+  - Philips CDM mechanisms, CDM-12 and CD Pro (hifi-advice)
+    (https://www.hifi-advice.com/blog/classics/digital-classics/marantz-philips-
+    classics-2/philips-cdm-mechanisms-page-3-cdm-12-and-cd-pro/)
+
+❯ Yes, 3x repeat gives the remaining time immediately            
+
+⏺ The fix is built: patch/IAP_PL100_1v1_b250219_all_v17.hex, with "patch
+  v2026-11-06" on the boot screen. It's tested in the emulator only, not yet on
+  the player.
+
+  What it does: after the track number changes, the patch asks the module for
+  the current track's length (0x22, the same request Repeat sends) twice:
+  - 1 s after the change, so a normal track change corrects almost at once.
+  - 3 s later, in case the first request fell in the gap before a track: there
+    the track number already changes before the old track is really over.
+
+  It only sends while playing. When paused or stopped it waits, and sends as
+  soon as playback resumes. Each request also restarts the firmware's own ~22 s
+  timer, so the two don't send at nearly the same time.
+
+  Emulator check, using the real tick hook, stepped in 75 ms steps:
+
+  ┌────────────────────────────────────────────┬────────────────────────────┐
+  │        Situation         │    Requests sent     │
+  ├────────────────────────────────────────────┼────────────────────────────┤
+  │ Track change during playback      │ 1.0 s and 4.0 s after the  │
+  │                    │ change         │
+  ├────────────────────────────────────────────┼────────────────────────────┤
+  │ Track change while stopped, Play 1.5 s  │ at Play and 3 s later   │
+  │ later                 │             │
+  ├────────────────────────────────────────────┼────────────────────────────┤
+  │ Track numbers above 255, and the clock  │ same as normal       │
+  │ wrapping round              │             │
+  ├────────────────────────────────────────────┼────────────────────────────┤
+  │ Random leftover values in memory after  │ nothing is sent      │
+  │ power-on              │             │
+  └────────────────────────────────────────────┴────────────────────────────┘
+
+  It writes only its own three bytes, the firmware's timer and the command
+  queue.
+
+  On the player, check:
+  - Remaining time: right after each track change it should be correct within
+    about a second, without pressing Repeat.
+  - Shuffle and repeat one: the end-of-track check now has the right length much
+    sooner. Before this, a short previous track could end the next one early.
+
+  Details:
+  - The option is LENGTH_REQUEST_ON = True, in the cdtime patch. With it set to
+    False the build is byte-identical to v16, so v16 versus v17 compares only
+    this change.
+  - Nothing is committed.
+  - For the README: the remaining time is now correct right after a track
+    change, instead of after up to 22 s.
+
+❯ Instead of relying on timings, is there no even like "track started playing"? 
+  the track number also changes, so the firmware must know that        
+
+⏺ Yes, and that's better than fixed timings. I've rebuilt v17 to work this way:
+  patch/IAP_PL100_1v1_b250219_all_v17.hex. It's tested in the emulator only.
+
+  There's no separate "track started" message. In normal play the module just
+  carries on, and the firmware takes the track number from the time message
+  (about one per second). So the event is "the track number in a time message
+  changes".
+
+  A second event makes delays unnecessary. The length message says which track
+  it's for, and the shuffle patch already records that (TRACK_END_FIX_ON). So
+  the rule needs no timing: if the track in the time message differs from the
+  track of the stored length while playing, ask with 0x22. It stops by itself
+  once the right length has arrived. This also handles the cases that needed
+  delays before:
+  - In the gap before a track, the number changes early. If the module then
+    answers for the old track, the mismatch remains and it simply asks again.
+  - If the answer fails the checksum (~7 %), it asks again.
+  - After power-on, when the disc total has been stored as the track length,
+    that doesn't match the track either, so it asks.
+
+  It asks on the first mismatching message and then every other message, because
+  the answer takes about a second. This also restarts the firmware's own ~22 s
+  timer.
+
+  Emulator check, with the real time_msg and a simulated module that answers one
+  message later:
+
+  ┌────────────────────────┬──────────────────────┬────────────────────────┐
+  │    Situation     │    Requests    │  Correct length from   │
+  ├────────────────────────┼──────────────────────┼────────────────────────┤
+  │ Track change (Next)    │ 1        │ the next message    │
+  ├────────────────────────┼──────────────────────┼────────────────────────┤
+  │ Gap, module answering  │ at the start of the  │ 0:01          │
+  │ for the old track   │ gap, and at 0:00  │            │
+  ├────────────────────────┼──────────────────────┼────────────────────────┤
+  │ First answer lost   │ 2, two messages   │ the 4th message     │
+  │            │ apart       │            │
+  ├────────────────────────┼──────────────────────┼────────────────────────┤
+  │ Paused        │ none        │ at Play: 1 request,    │
+  │            │          │ then the next message  │
+  └────────────────────────┴──────────────────────┴────────────────────────┘
+
+  Nothing outside the expected memory is written.
+
+  Other details:
+  - Dependency: LENGTH_REQUEST_ON needs the shuffle patch with TRACK_END_FIX_ON
+    or LAST_TRACK_FULL_ON. Building cdtime alone adds shuffle automatically, and
+    a configuration without either option stops with a clear error.
+  - v16 comparison: with LENGTH_REQUEST_ON = False the build is byte-identical
+    to v16, so v16 versus v17 is still only this change.
+  - Nothing is committed. The README note from before still applies.
+
+❯ Maybe it doesn't matter for the resulting firmware, but shouldn't this be  
+  part of patch remaining instead of cdtime? Or is there a use to have this if  
+  time remaining isn't included in the firmware?              
+
+⏺ It's useful without the remaining-time display too, so I'd keep it where it
+  is.
+
+  Why it matters without remaining time: the stored track length isn't only for
+  the display. The firmware's end-of-track check uses it as well. That check
+  handles:
+  - repeat one and shuffle: jumping to the same or a random track 2 s before the
+    end,
+  - the last track in normal mode: with LAST_TRACK_FULL_ON, its safety net stops
+    3 s past the track's length.
+
+  With TRACK_END_FIX_ON, the check only runs once the length belongs to the
+  playing track. Without the request that can take up to 22 s. So on a track
+  shorter than about 24 s, the check never gets the right length in time. Repeat
+  one or shuffle then miss the end, and the module just plays the next track in
+  order. Without TRACK_END_FIX_ON it's worse: the check uses the previous
+  track's length, which can end a track early.
+
+  So the request mainly fixes the end-of-track check, and the remaining-time
+  display benefits as well.
+
+  Why it's in cdtime: it runs on every time message, and cdtime owns the hooks
+  on the time-message handler (0x0800DDA6/0x0800DDDC). Only one patch can
+  replace those instructions. Putting it in remaining would need a second hook
+  on the same spot, or would move the time-message handling into remaining.
+
+  Its real dependency is the shuffle patch, which records which track the stored
+  length belongs to. The build adds that automatically. The cdtime docstring
+  already mentions both uses ("the remaining time and the end check"), so I'd
+  leave the code as it is.
+
+❯ And with this patch, should 2 songs after each other have the exact same   
+  track length, it would keep resending the 0x22 message, correct? As it cannot 
+  know the track length is the same as the previous track.          
+
+⏺ No, it stops after the first answer. The check compares track numbers, not
+  lengths.
+
+  The length message carries the track number it belongs to (+0x95). The shuffle
+  patch records that number when the length arrives, even if the length is
+  identical to the previous one.
+
+  Take two tracks of 3:45:
+  1. Track 5 starts. The stored length is still noted as track 4's, so the patch
+  asks.
+  2. The answer arrives: "track 5, 3:45". The length value doesn't change, but
+  the noted track becomes 5.
+  3. The next time message says track 5, which now matches the noted track, so
+  it stops asking.
+
+  It only keeps asking while answers don't arrive, or arrive for another track
+  (e.g. in the gap). Even then it asks at most once every two time messages.
+
+❯ With the cdtime patch, in case a corrupted time message arrives, the seconds  
+  are still advanced. But then the next message arrives. So a time is only   
+  displayed very briefly. Before it would show (for example) 00:25 for two   
+  seconds before going to 00:27. Now it displays 00:26 very briefly.      
+  Now that the timings are more reliable, can this patch be improved to avoid   
+  any delays or very quickly shown times?                  
+
+⏺ Built v18. Now emulating both versions on the same message streams, with the
+  true disc time alongside:
+
+❯ How realistic is it to build a small screensaver that is shown after a few    
+  minutes of activity?                         
+
+⏺ The firmware's dormant auto-dim feature is almost all there: a timeout
+  setting, an idle timer that key presses reset, and an action that writes
+  backlight PWM, though that action was written for another model and would
+  likely brighten the PL100's screen. I'll replace that action with our own and
+  set the timeout, and I'll finish or roll back the half-applied fill-timing fix
+  separately.
+
+⏺ What would you like to clarify about the screensaver: what it shows, when it
+  starts, how it wakes, or how the idle time is set? Or is there something else
+  you have in mind for it?
+
+❯ It should be dim + moving element. But only when the player is stopped. When  
+  it's player, there is no need to show the screensaver          
+
+⏺ The plan is to dim the screen and move the play-mode and auto-play icons only
+  while stopped, with a key press waking the screen and still doing its normal
+  job. I'm checking which screen objects exist and where they sit before writing
+  it.
+
+  Context
+
+  The display stays fully lit while the player sits stopped. The user wants a
+  screensaver:
+  - When: after a fixed idle time, only while stopped with a disc or at the
+    empty slot ("Disc"). Never while playing, paused, loading or seeking.
+  - What: dim the backlight, hide the text, and show only the play-mode icon
+    (repeat one / repeat disc / shuffle) and the auto-play play icon, at a
+    position that changes now and then.
+  - Wake: any key, remote or panel, restores the screen and still does its 
+    normal function. Disc insert/eject or a state change also wakes it.
+  - Idle time: fixed in the build (config option).
+
+  The firmware has a dormant auto-dim feature:
+  - timeout setting 0x200004D5,
+  - idle timer 0x2000054C, restarted per key at 0x080070A0,
+  - an expiry action that writes TIM3 CCR4 0x40000440 = 1. With the
+    active-low backlight that is full brightness, so it isn't usable as is.
+
+  We use our own idle tracking instead; it's simpler and doesn't depend on
+  that menu setting.
+
+  Design (patch/build_patch.py; new patch saver, after brightness)
+
+  Config:
+  - SCREENSAVER_ON = True
+  - SAVER_IDLE_S = 180
+  - SAVER_DIM_LEVEL = 5 (10 %)
+  - SAVER_MOVE_S = 10
+
+  RAM: spare dead-menu bytes, chosen after checking for free ones:
+  - last activity: u16 CLOCK_75MS stamp
+  - active flag
+  - current offset dx/dy
+  - next move stamp
+
+  1. Activity tracking
+  - Every key: hook the existing key_hook path (get_key hook 0x08004300,
+    brightness patch). It records CLOCK_75MS on any key ≠ 0, and if active
+    calls saver_exit first. The key is passed on unchanged (wake and act).
+  - A change of play state (CD_STATE+4) or tray status (+7) also counts as
+    activity. A tick hook keeps the last values.
+  - Dependency: saver requires brightness (key hook). Add it to REQUIRES.
+
+  2. saver_tick (tick hook, registered last in TICK_HOOKS, so it runs after
+  play_icon/osd). It runs after every display update.
+  - Allowed state: play state 1 (stopped) with a disc and not loading (tray
+    5/0), or tray 3/6 ("Disc"). Otherwise, if active → saver_exit; reset the
+    idle stamp.
+  - Not active and idle ≥ SAVER_IDLE_S: saver_enter.
+    - set_brightness(SAVER_DIM_LEVEL) (SET_BRIGHTNESS 0x08005F70), without
+      saving.
+    - Pick the first offset.
+  - Active, every pass: the display update re-shows its objects each pass, so
+    re-apply:
+    - Hide all text/other objects with OBJ_SET_HIDDEN 0x08015F4A: line 1
+      ui+0x08, line 2 ui+0x0C, the track label, plus anything else visible
+      when stopped (inventory in step 0).
+    - Hide the stop icon ui+0x18.
+    - Leave the mode icon ui+0x28 and the play icon ui+0x10 as the firmware
+      and the play_icon hook set them. Move them with OBJ_SET_POS 0x08013F2E
+      to original position + offset.
+  - Every SAVER_MOVE_S: a new offset from a small LFSR, or rand() 0x08029C14.
+    It's clamped so the icons stay inside the visible area (x ≤ ~200 so the
+    icons end before ~230, y ≤ ~100).
+
+  3. saver_exit
+  - set_brightness(BRIGHTNESS setting 0x200004A5).
+  - Move the icons back to their original positions.
+  - Unhide the hidden objects.
+  - Force a full redraw: DISPLAY_REDRAW 0x2000018C = 1 and LAST_SHOWN_MIN = 
+    0xFF.
+  - Clear the flag.
+
+  The display update's own hide/show logic then restores the normal stopped
+  screen.
+
+  Step 0 (first, read-only): emulate setup_ui (0x08028FD8 → 0x08029184) with
+  unicorn and log every lv_obj_set_pos/set_size and the ui+N slot each object
+  is stored in. That gives:
+  - the full object list to hide,
+  - the icons' original coordinates for restoring.
+
+  Docstring: add a "Patch saver" section. The README is the user's; I'll
+  mention it.
+
+  Verification
+
+  - Emulator (scratchpad venv; reuse TICK_HOOKS chain/key-hook test patterns
+    from the earlier *_emu.py):
+    - idle reached while stopped → dim level set, objects hidden, icons moved
+      within bounds; moves every SAVER_MOVE_S
+    - key while active → brightness restored, positions restored, key still
+      returned
+    - playing/paused/loading never activates; state change while active exits
+    - CLOCK_75MS wrap handled
+    - RAM writes limited to the new bytes + LVGL calls (stubbed)
+  - Builds:
+    - SCREENSAVER_ON = False → byte-identical to the current v18
+    - Python 3.9 not available; skip
+    - write IAP_PL100_1v1_b250219_all_v19.hex; no commit
+  - On the device (user):
+    - stopped + idle 3 min → dims, icons move
+    - any key wakes and acts
+    - empty slot with auto-play on shows the moving play icon
+    - insert disc wakes
+    - playing never triggers
+
+⏺ The screensaver is built: patch/IAP_PL100_1v1_b250219_all_v19.hex, with "patch
+  v2026-11-07" on the boot screen. It's tested in the emulator only.
+
+  What it does:
+  - When: after 3 minutes without activity, only while stopped with a disc or at
+    the empty slot. Never while playing, paused, seeking or loading. Activity
+    means any key (remote, panel buttons or knob) or a change of play state or
+    tray status.
+  - What you see: the backlight dims to 10 % (your brightness setting isn't
+    changed) and all text and other icons are hidden. Only the play-mode icon
+    and the auto-play play icon stay, and they move together to a random
+    position every 10 s.
+  - Waking: any key restores brightness, icon positions and text, and still does
+    its normal function. Inserting a disc or pressing Play also wakes it.
+
+  Emulator check, with the screen and brightness calls stubbed:
+
+  ┌──────────────────────────┬──────────────────────────────────────────────┐
+  │     Situation      │        Result        │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Idle while stopped (with │                   │
+  │  the 75 ms clock      │ starts after 180 s, not at 179.5 s     │
+  │ wrapping)       │                   │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ While it runs      │ brightness level 5, only the mode icon    │
+  │           │ visible, a move every 10 s, always on screen │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │           │ brightness back to your level, icons back at │
+  │ A key        │  (5,8) and (90,8), text visible again, time  │
+  │           │ label redrawn              │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Playing, paused or    │ never starts               │
+  │ loading for 400 s     │                   │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Empty slot      │ starts after 180 s            │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Disc inserted      │ wakes                │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ Key hook        │ every real key is noted and still passed on; │
+  │           │  "no key" is ignored          │
+  └──────────────────────────┴──────────────────────────────────────────────┘
+
+  It writes only its own 12 bytes of RAM.
+
+  Points to check on the player:
+  - In normal mode with auto-play off, there's no icon to show. The screen is
+    then just dimmed and empty. Say if you'd rather see something there, e.g.
+    the stop icon.
+  - If your brightness is already 10 %, dimming changes nothing visible.
+  - The tick hooks only run while the player is on, so the screensaver can't
+    switch the backlight on in standby.
+
+  Details:
+  - The settings are in build_patch.py: SCREENSAVER_ON, SAVER_IDLE_S (180),
+    SAVER_DIM_LEVEL (5 = 10 %) and SAVER_MOVE_S (10). It's a new patch, saver,
+    which adds brightness automatically because it uses that patch's key hook.
+  - Without it, the build is byte-identical to v18: with SCREENSAVER_ON = False
+    and without saver, so v18 versus v19 compares only the screensaver.
+  - thumbasm.py has one new instruction (orrs).
+  - Nothing is committed. For the README: the new screensaver and its four
+    settings.
+
+  About the time-fill change in v18: v18 contains the first improvement. The
+  fill is now timed from the first message of each second, at 1.125 s instead of
+  1.275 s, and a repeated message no longer delays it. In the emulator that
+  removed the short flashes when messages repeat. They can still happen when the
+  module's messages don't come exactly once a second. A more precise variant
+  that tracks when each second starts was designed but isn't built in. I'd first
+  see how v18 or v19 looks on the player.
+
+❯ when the screensaver is activated, the screen goes completely off, regardless 
+  of the value in SAVER_DIM_LEVEL                    
+
+⏺ I think the screen isn't actually off. It's dimmed with nothing left to show.
+
+  What I checked:
+  - SAVER_DIM_LEVEL does reach the backlight. set_brightness (0x08005F70) maps
+    level 5 to PWM 900 (10 % lit) and level 6 to 1000 (off), and the saver calls
+    it with your level.
+  - Nothing in the firmware writes the backlight PWM afterwards while stopped:
+    the only other writer is the dormant dimmer, which is switched off.
+
+  The likely cause:
+  - The screensaver hides all text, the stop icon and the other icons. It keeps
+    only the play-mode icon and the auto-play play icon.
+  - In normal mode (no repeat or shuffle), with auto-play off or with a disc in,
+    neither icon is shown. The screen is then black at whatever brightness you
+    set.
+  - On this display, black at a low backlight looks just like "off". My emulator
+    test hid this because I simulated a player in repeat mode.
+
+  Can you confirm: when you tested, was the player in normal mode, and was
+  auto-play off (or a disc inserted)? If you set repeat or shuffle and wait 3
+  minutes, you should see that icon moving around, dimmed.
+
+  If that's it, the fix is to always keep something visible. My suggestion: when
+  neither the mode icon nor the auto-play icon is shown, keep the stop icon
+  visible and move it instead. Or do you have something else in mind for that
+  case?
+
+❯ The screensaver works when no disc is inserted. On the regular stop screen,   
+  showing the total time, no screensaver is shown             
+
+⏺ The likely cause is that the module's status messages also write the play
+  state directly, so my code's exact-match check and activity counting kept the
+  3-minute timer from expiring. I'm changing it so only key presses count as
+  activity and idle is allowed when the disc is stopped, paused or seeking.
+
+❯ I wrote earlier it only shows when no disc is loaded. That's not completely   
+  true. When no disc is loaded and auto play is off, it also doesn't work. So   
+  maybe it only works if the icon (play) is already loaded? As the no disc with 
+  autoplay already has the play icon on the screen            
+
+⏺ That fits what I suspected first. The screensaver does start, but it shows
+  only the play-mode icon and the auto-play play icon:
+  - Empty slot, auto-play on: the play icon is visible, so you see it moving.
+  - Empty slot with auto-play off, or a disc in normal mode: neither icon is
+    visible, so the screen is dimmed and black. That's the "completely off" from
+    your earlier message.
+
+  So the fix is to always keep something visible: when neither icon is shown,
+  show the stop icon and move it instead. The v20 change, which treats any state
+  other than paused/playing/seeking as "stopped", is probably not needed, but
+  it is harmless and slightly more robust, so I'm keeping it. Implementing the
+  fallback:
+
+⏺ You're right: the screensaver only showed something when an icon was already
+  on screen. It did start in the other cases too, but with nothing visible the
+  dimmed screen was just black. Fixed in
+  patch/IAP_PL100_1v1_b250219_all_v20.hex, tested in the emulator only.
+
+  The fix: when neither the play-mode icon nor the auto-play play icon is shown,
+  the stop icon stays visible and moves around instead. When you wake it, the
+  stop icon goes back to its normal place.
+
+  I also made the "stopped" check more robust, in case the CD module's status
+  messages put their own state codes into the play-state byte. "Stopped" now
+  means anything other than paused, playing or seeking. Only key presses count
+  as activity. Inserting or ejecting a disc and playing still wake it, because
+  the screensaver isn't allowed in those states.
+
+  Emulator check:
+
+  ┌───────────────────────────────────────┬────────────────────────────────┐
+  │       Screen        │ Visible during the screensaver │
+  ├───────────────────────────────────────┼────────────────────────────────┤
+  │ Disc, normal mode         │ stop icon          │
+  ├───────────────────────────────────────┼────────────────────────────────┤
+  │ Disc, repeat           │ mode icon          │
+  ├───────────────────────────────────────┼────────────────────────────────┤
+  │ Empty slot, auto-play on        │ play icon          │
+  ├───────────────────────────────────────┼────────────────────────────────┤
+  │ Empty slot, auto-play off       │ stop icon          │
+  ├───────────────────────────────────────┼────────────────────────────────┤
+  │ Disc, other module state codes (0, 2) │ starts as normal      │
+  └───────────────────────────────────────┴────────────────────────────────┘
+
+  - A key restores brightness, all positions and the text.
+  - Paused, playing, seeking or loading for 400 s: it never starts.
+  - Memory: it writes only its own RAM.
+
+  Your test values: v20 is built with the values now in build_patch.py:
+  SAVER_IDLE_S = 15, SAVER_DIM_LEVEL = 1, SAVER_MOVE_S = 1. The levels run
+  backwards: level 1 is 65 % brightness and level 5 is 10 %. If you meant "very
+  dim", use 5. Remember to set the idle time and move interval back (e.g. 180 /
+  10) before a release build.
+
+  Nothing is committed.
+
+❯ would it be possible to always show a custom icon? e.g. an icon of a CD?   
+
+⏺ The screensaver now shows a moving CD, and nothing else:
+  patch/IAP_PL100_1v1_b250219_all_v21.hex. It's tested in the emulator only.
+
+  What changed:
+  - The CD is the design you picked, solid with shine, at 64×64 px in the same
+    white as the other icons. It's drawn by a new cd() function in icons.py.
+  - Everything else is hidden while the screensaver runs, including the play,
+    stop and play-mode icons. So it looks the same in every stopped situation.
+  - The CD borrows the hourglass's screen object, which is always hidden when
+    not playing. On wake the hourglass gets its own image, place and size back.
+    Builds without the hourglass get the firmware's original (unused) icon back
+    instead.
+  - The CD moves within x 0–162 and y 0–71, so it stays fully visible, left of
+    the panel edge at about x 230.
+
+  Emulator check, for every stopped situation (disc in normal or repeat mode,
+  empty slot with auto-play on or off, other module state codes):
+  - While it runs: only the CD is visible, at 64×64, and every move stays within
+    bounds.
+  - On a key: the brightness, the hourglass image (verified by its header), its
+    position (52,8) and size 30×30, and the normal screen all come back.
+  - Never starts: when paused, playing, seeking or loading.
+  - Rendered from the built hex, the CD image looks right.
+
+  Details:
+  - The flash image grows by about 12 KB, for the 64 px image; there's plenty of
+    room.
+  - Your test values are still in the build: idle 15 s, level 1 (65 %), moving
+    every 1 s. For normal use, something like 180 / 5 / 10 is better. Level 5 is
+    10 %.
+  - Without the screensaver, the build is still byte-identical to v18.
+  - Nothing is committed. I left cd_icon_options.png with the four designs in
+    the project folder; you can delete it.
+  - For the README: the screensaver now shows a moving CD.
+
+❯ This looks already really nice. Would it be possible to make it user    
+  configurable? The MENU button still has no function. Pressing this could   
+  cycle between some different modes (indicated same as brightness):      
+  - no screensaver at all, nothing happens                 
+  - dim the screen to SAVER_DIM_LEVEL (but could be the screen is already at    
+  that level, then nothing special happens)                
+  - screen off                           
+  - moving disc                          
+    And what would be good labels for these 4 modes? "Off" could be interpreted 
+  as either "no screensaver" or "screen is off"               
+
+⏺ The MENU button now picks the screensaver mode:
+  patch/IAP_PL100_1v1_b250219_all_v22.hex, tested in the emulator only.
+
+  How it works:
+  - MENU steps through NONE → DIM → DARK → CD → NONE. Line 1 shows the new mode
+    for 2.5 s, like the brightness does, and the choice is saved.
+  - After flashing, the mode is NONE.
+  - While the screensaver runs, MENU only wakes it. Every other key wakes it and
+    does its normal job.
+
+  ┌──────┬───────────────────────────────────────────────────┐
+  │ Mode │     After the idle time, while stopped      │
+  ├──────┼───────────────────────────────────────────────────┤
+  │ NONE │ nothing                   │
+  ├──────┼───────────────────────────────────────────────────┤
+  │ DIM  │ dims to SAVER_DIM_LEVEL, screen content unchanged │
+  ├──────┼───────────────────────────────────────────────────┤
+  │ DARK │ backlight off                │
+  ├──────┼───────────────────────────────────────────────────┤
+  │ CD   │ dims, and only the moving CD is shown       │
+  └──────┴───────────────────────────────────────────────────┘
+
+  DIM and CD never make the screen brighter: if your own brightness is already
+  lower, it stays at your level.
+
+  Labels: the line-1 font contains all letters, digits and symbols, but no space
+  or comma, and about 4–5 characters fit. NONE / DIM / DARK / CD fit and avoid
+  confusion with "OFF" and the empty-slot "Disc".
+
+  Storage: the mode is saved in another unused byte of the firmware's settings
+  record (0x200004DB), next to the auto-play byte. The firmware loads it without
+  checking, so the patch treats any unknown value (0, an empty page, junk) as
+  NONE.
+
+  A bug I found and fixed in the assembler: align in thumbasm.py handled odd
+  addresses (after text strings) differently in its two passes. That shifted
+  every label after the MENU texts, and the emulator caught it right away. Code
+  is always at even addresses, so it didn't affect anything before: the build
+  without the screensaver is still byte-identical to v18.
+
+  Emulator check:
+  - MENU cycle: works from the factory value and from an erased value. Each
+    press saves, shows the right text, and the key itself is swallowed.
+  - Per mode:
+    - NONE never starts.
+    - DIM sets level 5 and leaves the screen untouched.
+    - DARK sets level 6, which is off.
+    - CD shows only the moving CD.
+  - MENU while active: it wakes the screen without changing the mode.
+  - Other keys: they wake it and are passed on.
+  - Memory: only the expected RAM and the setting byte are written.
+
+  Details:
+  - Your values 180 s / level 5 / 10 s are kept. SAVER_DIM_LEVEL now applies to
+    both DIM and CD.
+  - Nothing is committed.
+  - For the README:
+    - MENU now cycles the screensaver modes.
+    - The four labels and what each does.
+    - The default is NONE.
+
+❯ is the colour of an icon encoded in the image itself, or can this be    
+  dynamically assigned?                        
+
+⏺ Both, actually.
+
+  In the image itself: the icons, the firmware's own as well as our hourglass
+  and CD, use LVGL's "true colour + alpha" format. Each pixel stores a colour
+  (RGB565) and a transparency byte, and they're all drawn in the same light
+  grey-white (#E8E8E8). The colour is part of the image data.
+
+  Dynamically: LVGL v7 can tint an image while drawing it ("image recolor"), via
+  two style properties: a colour and a strength (0–255). At full strength each
+  pixel takes that colour and keeps its own transparency. So a white icon
+  becomes, say, a cleanly anti-aliased red or blue icon. This firmware has it
+  compiled in and uses it:
+  - The image drawing code reads the recolor properties (0x08026576).
+  - There's a helper to set the colour on a single object (around 0x080252BA,
+    which calls LVGL's local-style setter 0x08016BFA).
+  - setup_ui itself sets image recolor on a style (0x200007C0, via
+    0x08029B5A/0x08029B72/0x08029B8C).
+
+  So a patch could give the CD, or any icon, a colour at runtime without
+  changing the image. For example a different colour per screensaver mode, or a
+  slowly changing colour while the CD moves. The colour is just an RGB565 value,
+  so it could even be a config option. I'd still need to confirm the exact
+  arguments of that helper before using it.
+
+  One more option: LVGL also has an "alpha only" image format, which stores just
+  the transparency (1 byte per pixel) and draws in the recolor colour. The 64
+  px CD would then take 4 KB instead of 12 KB. Whether this firmware's LVGL
+  build supports that format would need checking. With the current format and
+  recolor, it works either way.
+
+  Is there a colour or effect you have in mind?
+
+❯ For the CD icon screensaver, everytime the disc moves to a different    
+  position, pick a random colour for the disc. Not sure if it's easier to have  
+  a list of some distinct colours, or have it be complete random based on the   
+  available colour space. What would be a better option?            
+
+⏺ I went with a fixed list of distinct colours: the CD now gets a random colour
+  from it every time it moves, never the same one twice in a row. The build is
+  patch/IAP_PL100_1v1_b250219_all_v23.hex, tested in the emulator only.
+
+  Why a list instead of fully random colours: random RGB values are often dark
+  or muddy, and those are hard to see at 10 % backlight. Two random picks in a
+  row can also look almost the same. A short list of bright, clearly different
+  colours always looks deliberate.
+
+  The colours: red, orange, yellow, green, cyan, blue, violet and pink. They're
+  in a new setting, SAVER_CD_COLOURS in build_patch.py, as normal hex RGB values
+  you can change, add to or remove. With () the CD stays white.
+
+  How it works: the CD image stays white, and LVGL tints it while drawing
+  ("image recolor"). The edges stay smooth.
+  - The CD's screen object has its own style in the firmware, so the patch sets
+    the tint colour there, at full strength.
+  - It then calls lv_obj_refresh_style (0x08013C14) so LVGL picks up the change.
+    LVGL caches whether an image is tinted at all, so this call is needed.
+  - On wake the tint strength goes back to 0, so the hourglass is white again.
+
+  Emulator check: over 31 moves every colour came from the list, never the same
+  twice in a row, and all eight colours appeared. Each colour change is followed
+  by a style refresh. The tint is switched on when the CD appears and off again
+  on wake. The four modes and the MENU cycle still behave as before. Without
+  the screensaver the build is still byte-identical to v18.
+
+  Things to look at on the player:
+  - Colours at the dim level: whether they're bright enough at 10 % backlight.
+    Blue and violet are the darkest of the eight.
+  - The hourglass: that it's white again after waking, when playing in
+    remaining-time mode.
+
+  Nothing is committed. For the README: the CD changes colour on every move, and
+  the colours can be set in SAVER_CD_COLOURS.
+
+❯ Can this be an option to cycle through with the MENU key? e.g "CD/w" for an   
+  always white CD, and "CD/c" for a colour-changing cd.          
+
+⏺ MENU now cycles through five modes: patch/IAP_PL100_1v1_b250219_all_v24.hex,
+  tested in the emulator only.
+
+  The cycle: NONE → DIM → DARK → CD/w → CD/c → NONE.
+  - CD/w: the dimmed, moving CD, always white.
+  - CD/c: the same, with a new colour from the list on every move, never the
+    same twice in a row.
+  - Line 1 shows "CD/w" and "CD/c" on the press. The font has / and lowercase
+    letters, and they're about as wide as "AUTO".
+
+  Stored values: the mode that was called "CD" before keeps its stored value and
+  is now CD/w. CD/c gets a new value. From an empty or unknown setting (NONE),
+  the first press goes to DIM.
+
+  One bug I caught in the emulator: in CD/c the tint strength wasn't switched
+  on, because the bookkeeping that runs just before reused the register holding
+  the mode. The colours would never have shown on the player. It now reads the
+  saved mode instead.
+
+  Emulator check:
+  - MENU: the cycle is correct from the factory value and from an erased value,
+    and every press saves and shows the right label.
+  - CD/w: a dimmed, moving CD, with no tint calls at all.
+  - CD/c: the tint is switched on at the start. Over 31 moves:
+    - all colours came from the list,
+    - never the same twice in a row,
+    - all eight were used,
+    - each colour change was followed by a style refresh.
+
+    On wake the tint is switched off.
+  - NONE, DIM and DARK behave as before, and other keys still wake the screen
+    and do their job.
+  - Without the screensaver the build is still byte-identical to v18.
+
+  Nothing is committed. For the README, the mode list is now NONE / DIM / DARK /
+  CD/w / CD/c.
