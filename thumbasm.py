@@ -61,9 +61,9 @@ def assemble(prog, base):
             continue
         op, *a = ins
         if op == 'align':
-            if pc % 4:
-                out += b'\x00\xbf'  # nop
-                pc += 2
+            pad = -pc % 4
+            out += b'\x00\xbf' if pad == 2 else bytes(pad)  # nop after code, zeros after odd-length data
+            pc += pad
             continue
         if op == 'bl':
             out += enc_bl(pc, tgt(a[0]))
@@ -108,6 +108,8 @@ def assemble(prog, base):
                 h = 0x0800 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'ands':  # ands rdn, rm
                 h = 0x4000 | reg(a[1]) << 3 | reg(a[0])
+            elif op == 'orrs':  # orrs rdn, rm
+                h = 0x4300 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'muls':  # muls rdn, rm
                 h = 0x4340 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'subs':  # subs rd, rn, rm

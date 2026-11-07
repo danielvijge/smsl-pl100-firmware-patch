@@ -4,6 +4,7 @@ The firmware's own icons are LV_IMG_CF_TRUE_COLOR_ALPHA with 16-bit colour:
 3 bytes per pixel, RGB565 little-endian followed by an 8-bit alpha. White
 line art like the repeat icons (~#E8E8E8); drawn by supersampling simple shapes.
 """
+import math
 import struct
 
 SS = 4  # supersampling per axis
@@ -56,6 +57,35 @@ def hourglass(size=30):
     sand = [[p(11, 25), p(15, 19), p(19, 25)],      # bottom heap
             [p(12, 8), p(18, 8), p(15, 12)]]        # what is left on top
     return render(size, size, lines=bars + glass, polys=sand, width=1.6 * s)
+
+
+def render_polar(size, inside):
+    """Alpha map for a shape given as inside(r, angle) around the centre."""
+    c = size / 2
+    alpha = []
+    for y in range(size):
+        for x in range(size):
+            hits = 0
+            for sy in range(SS):
+                for sx in range(SS):
+                    px, py = x + (sx + 0.5) / SS - c, y + (sy + 0.5) / SS - c
+                    if inside(math.hypot(px, py), math.atan2(py, px)):
+                        hits += 1
+            alpha.append(round(255 * hits / (SS * SS)))
+    return alpha
+
+
+def cd(size=64):
+    """Solid compact disc with a centre hole and two reflection arcs cut out."""
+    s = size / 40
+
+    def ring(r, radius, width):
+        return abs(r - radius * s) <= width * s / 2
+
+    def shine(r, a):
+        return (ring(r, 13, 1.6) and -2.6 < a < -1.7) or (ring(r, 10.2, 1.6) and -2.5 < a < -1.9)
+
+    return render_polar(size, lambda r, a: (7.5 * s < r <= 19.3 * s and not shine(r, a)) or ring(r, 4, 1.4))
 
 
 def lv_img_true_color_alpha(alpha, w, h, rgb=(232, 232, 232)):

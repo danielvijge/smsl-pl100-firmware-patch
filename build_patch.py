@@ -149,6 +149,32 @@ Patch 7 - gaps between tracks after fast forward / rewind.
     later track change has a gap, until Play is pressed again.
   * Send 0x25 before that play command, as the Play key does.
 
+Patch saver - screensaver while stopped.
+  * After SAVER_IDLE_S without a key (remote, panel or knob), while stopped
+    with a disc (TOC read) or at the empty slot ("Disc"), the backlight dims to SAVER_DIM_LEVEL (not saved)
+    and everything is hidden except a 64 px CD (icons.py) that moves to a
+    random position every SAVER_MOVE_S; for CD/c each time in a random colour
+    from SAVER_CD_COLOURS (LVGL image recolor on the object's own style). The CD borrows the hourglass object
+    (ui+0x24, always hidden when not playing); on waking it gets its own
+    image, place and size back (the firmware's unused shuffle icon when the
+    remaining patch or its icon is not built). Never while playing,
+    paused, seeking or loading.
+  * Any key restores the screen and still does its normal function; so does
+    leaving those states (disc inserted or ejected, playing). The play state
+    byte also gets the CD module's own status codes, so "stopped" is any
+    state other than paused (3), playing (6) or seeking (7/8). key_hook (brightness patch) notes
+    the key, a tick hook after the display update does the rest, so the
+    display update's own hide/show logic is overridden every pass.
+  * MENU (SAVER_IR, no function so far) cycles the mode, saved in a settings
+    byte of the dead settings menu (0x200004DB, record +0x2D) and shown on
+    line 1 like the brightness: NONE (no screensaver), DIM (dim to
+    SAVER_DIM_LEVEL only), DARK (backlight off), CD/w (dim + moving white
+    CD), CD/c (the same, a new colour on every move). After flashing it is
+    NONE. While the screensaver runs, MENU only wakes it.
+  * The firmware's own idle dimmer (setting 0x200004D5, timer 0x2000054C)
+    stays unused: it is only reachable from the dead settings menu and sets
+    the backlight PWM to 1, which on the PL100 (active-low) is full brightness.
+
 Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * The boot screen (0x08004AFA) is drawn straight to the LCD, not through
     LVGL. "Ver 1.1" moves up a little and the patch line is drawn below it in
@@ -156,13 +182,13 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
   * Without --version the boot screen stays original.
 
 Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
-  patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless
-           (default: all)
+  patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless,
+           saver (default: all)
 """
 import argparse
 import struct
 
-from icons import hourglass, lv_img_true_color_alpha
+from icons import cd, hourglass, lv_img_true_color_alpha
 from thumbasm import assemble, reglist
 
 BASE = 0x08004000
@@ -189,6 +215,7 @@ IR_TABLE_LEN = 0x58
 TIME_KEY = 0x26            # key case patched to time_toggle (natively MENU, no-op)
 BRIGHT_KEY = 0x14          # key caught by key_hook (natively DISP, no function)
 NOOP_KEY = 0x5C            # key with no function (natively FN)
+SAVER_KEY = 0x5D           # key caught by key_hook for the screensaver mode (no IR command gives it natively)
 SETUP_UI = 0x08028FD8      # GUI-Guider setup_ui(&ui), called once from main
 IMG_SET_SRC = 0x0802600E   # lv_img_set_src(obj, src)
 OBJ_SET_POS = 0x08013F2E   # lv_obj_set_pos(obj, x, y)
@@ -247,6 +274,16 @@ PANEL_VOLUP_KEY = 0x10     # key of the player's Vol+ button (PC5; tested on the
 PANEL_VOLDN_KEY = 0x11     # key of the player's Vol- button (PC6)
 PANEL_VOL_PEND = 0x2000028C  # u8 spare (0 after boot, unused): key to hand out on the next pass
 PANEL_VOL_LAST = 0x2000028D  # u8 spare (0 after boot, unused): last panel volume key
+SAVER_SETTING = 0x200004DB  # saved setting byte of the dead settings menu (record +0x2D, loaded
+                           # unchecked): 2 DIM, 3 DARK, 4 white CD, 5 colour-changing CD,
+                           # anything else (1, 0, erased) NONE
+SAVER_TEXT = ('NONE', 'DIM', 'DARK', 'CD/w', 'CD/c')  # line 1 per mode; the font has no space or comma
+SAVER_DARK_LEVEL = 6       # backlight off
+SAVER = 0x20000430         # 12 bytes spare (dead menu table): +0 u16 last activity (CLOCK_75MS),
+                           # +2 u16 last move, +4 active, +5 key seen (key_hook), +6 mode running
+                           # (1 DIM, 2 DARK, 3 CD/w, 4 CD/c), +7 CD colour index,
+                           # +8 x, +9 y of the icons, +10 objects that were
+                           # visible (bits, SAVER_HIDE order), +11 0xA5 once initialised
 LEN_REQ_SKIP = 0x200002AB  # u8 spare (dead menu table): time messages to skip before asking again
 PANEL_VOL_T = 0x200002AC     # u16 spare (dead menu table): CLOCK_75MS of that key
 PANEL_VOL_HOLD_STEPS = 4     # volume key events < 300 ms apart are one press (hold / release)
@@ -270,6 +307,7 @@ SPLASH_CHARS = set(' .:-+=<>/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno
 
 # Remote buttons (IR commands, tested): MENU 0x04, FN 0x08, DISP 0x0C
 TIME_IR = 0x0C             # elapsed / remaining time toggle: DISP
+SAVER_IR = 0x04            # screensaver mode cycle: MENU
 BRIGHT_IR = 0x08           # brightness cycle: FN
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
@@ -280,6 +318,12 @@ TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, the
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
 LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
+SCREENSAVER_ON = True      # key_hook notes keys for the saver patch (screensaver while stopped)
+SAVER_IDLE_S = 180         # idle time before the screensaver starts
+SAVER_DIM_LEVEL = 5        # backlight level for DIM and CD (5 = 10 %; the brightness levels run backwards)
+SAVER_CD_COLOURS = (0xFF4040, 0xFF9020, 0xFFE030, 0x40E040,   # CD: a random one of these on every move,
+                    0x30E0E0, 0x4080FF, 0xA060FF, 0xFF50C0)   # never the same twice; () keeps it white
+SAVER_MOVE_S = 10          # the icons move to a new position this often
 PANEL_VOL_ON = True        # without headphone the player's own Vol- = time toggle, Vol+ = play mode cycle
 
 EXPORTS = {}               # cave addresses one patch provides for another
@@ -1033,6 +1077,23 @@ KEY_HOOK = [
     ('mov', 'r4', 'r0'),
 ] + ([
     ('cmp', 'r4', 0xFF),
+    ('beq', 'kh_no_key'),
+    ('ldr_lit', 'r1', 'lit_saver'),      # a key: tell the screensaver
+    ('movs', 'r0', 1),
+    ('strb', 'r0', 'r1', 5),
+    ('cmp', 'r4', SAVER_KEY),
+    ('bne', 'kh_no_key'),
+    ('movs', 'r4', 0xFF),                # MENU: consumed
+    ('ldrb', 'r0', 'r1', 4),
+    ('cmp', 'r0', 1),
+    ('beq', 'kh_no_key'),                # the screensaver runs: only wake it
+    ('ldr_lit', 'r1', 'lit_power'),
+    ('ldrb', 'r0', 'r1', 0),
+    ('cbz', 'r0', 'kh_no_key'),          # standby
+    ('bl', 'saver_cycle'),
+    'kh_no_key:',
+] if SCREENSAVER_ON else []) + ([
+    ('cmp', 'r4', 0xFF),
     ('beq', 'no_diag'),
     ('ldr_lit', 'r1', 'lit_ir_raw'),
     ('ldrb', 'r0', 'r1', 0),         # raw IR command, 0 if the key was not IR
@@ -1077,6 +1138,31 @@ KEY_HOOK = [
     ('ldr', 'r0', 'r1', 0),
     ('bl', 'OSD_SHOW'),
     ('pop', reglist('r4', pc=True)),
+
+    # saver_cycle(): MENU - next screensaver mode, saved, shown on line 1
+    *(['saver_cycle:',
+       ('push', reglist('r4', lr=True)),
+       ('ldr_lit', 'r4', 'lit_saver_setting'),
+       ('ldrb', 'r0', 'r4', 0),
+       ('subs_i3', 'r0', 'r0', 1),       # mode 0..4 = NONE, DIM, DARK, CD/w, CD/c
+       ('cmp', 'r0', len(SAVER_TEXT) - 1),
+       ('bls', 'sc_mode'),
+       ('movs', 'r0', 0),                # 0, erased, junk: NONE
+       'sc_mode:',
+       ('adds_i8', 'r0', 1),
+       ('cmp', 'r0', len(SAVER_TEXT)),
+       ('blo', 'sc_store'),              # next mode
+       ('movs', 'r0', 0),                # after CD/c: NONE
+       'sc_store:',
+       ('adds_i3', 'r1', 'r0', 1),
+       ('strb', 'r1', 'r4', 0),
+       ('lsls', 'r0', 'r0', 2),
+       ('ldr_lit', 'r1', 'lit_saver_text'),
+       ('adds', 'r1', 'r1', 'r0'),
+       ('ldr', 'r0', 'r1', 0),
+       ('bl', 'OSD_SHOW'),
+       ('bl', SCHEDULE_SAVE),
+       ('pop', reglist('r4', pc=True))] if SCREENSAVER_ON else []),
 
     # panel_vol(r0 = key, r1 = from remote) -> key. The player's own Vol- / Vol+
     # do nothing without a headphone; then Vol- toggles elapsed / remaining
@@ -1158,6 +1244,9 @@ KEY_HOOK = [
     ('word', POWER_ON),
     'lit_bright:',
     ('word', BRIGHTNESS),
+    *(['lit_saver:', ('word', SAVER),
+       'lit_saver_setting:', ('word', SAVER_SETTING),
+       'lit_saver_text:', ('word', 'saver_text')] if SCREENSAVER_ON else []),
     *(['lit_vol_pend:', ('word', PANEL_VOL_PEND),
        'lit_vol_last:', ('word', PANEL_VOL_LAST),
        'lit_vol_t:', ('word', PANEL_VOL_T),
@@ -1170,6 +1259,9 @@ KEY_HOOK = [
     'osd_text:',                     # text pointer per level
     *[('word', f'osd_text_{i}') for i in range(len(BRIGHT_OSD_TEXT))],
     *[x for i, t in enumerate(BRIGHT_OSD_TEXT) for x in (f'osd_text_{i}:', ('bytes', t.encode() + b'\0'))],
+    *([('align',), 'saver_text:', *[('word', f'saver_text_{i}') for i in range(len(SAVER_TEXT))],
+       *[x for i, t in enumerate(SAVER_TEXT) for x in (f'saver_text_{i}:', ('bytes', t.encode() + b'\0'))]]
+      if SCREENSAVER_ON else []),
 ]
 
 
@@ -1210,6 +1302,8 @@ def patch_remaining(img):
         code, _ = assemble([('bl', lab['ui_setup'])], 0x080042C6)
         patch(img, 0x080042C6, bytes.fromhex('24f087fe'), code)
     put(img, lab['fmt_time'], cave)
+    if REMAINING_ICON_ON:
+        EXPORTS['hourglass'] = lab['icon_dsc']   # the saver borrows the icon object
     print(f"remaining: fmt_time at {lab['fmt_time']:#x}, {len(cave)} bytes"
           + (' (with hourglass icon)' if REMAINING_ICON_ON else ' (no icon)'))
 
@@ -2049,6 +2143,281 @@ def patch_gapless(img):
     print(f"gapless: seek_end at {lab['seek_end']:#x}, {len(cave)} bytes")
 
 
+# saver_tick(): tick hook for the screensaver (see "Patch saver"). r4 = SAVER
+# throughout; r5 = now (CLOCK_75MS).
+SAVER_HIDE = (0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x2C, 0x30)  # ui slots hidden while it runs:
+                           # line 1, line 2, play, pause, stop, play mode, two status icons
+SAVER_CD = 0x24            # ui slot borrowed for the CD (hourglass / unused shuffle icon)
+SAVER_CD_SIZE = 64
+SAVER_CD_HEADER, SAVER_CD_DATA = lv_img_true_color_alpha(cd(SAVER_CD_SIZE), SAVER_CD_SIZE, SAVER_CD_SIZE)
+SHUFFLE_ICON = (0x08030338, 89, 4, 49, 27)  # ui+0x24 as setup_ui (0x08029184) leaves it: src, x, y, w, h
+SAVER_MAX_X = 230 - SAVER_CD_SIZE - 4       # the panel window hides the screen beyond x ~230
+SAVER_MAX_Y = 135 - SAVER_CD_SIZE
+SAVER_IDLE_STEPS = SAVER_IDLE_S * 40 // 3   # in 75 ms steps
+SAVER_MOVE_STEPS = SAVER_MOVE_S * 40 // 3
+RAND = 0x08029C14          # C library rand()
+CD_STYLE = 0x200007C0      # style setup_ui gives ui+0x24 alone: image recolor white, recolor opa 0, opa 255
+STYLE_SET_IMG_RECOLOR = 0x08029B5A      # setup_ui's helpers: (style, state, value)
+STYLE_SET_IMG_RECOLOR_OPA = 0x08029B8C
+REFRESH_STYLE = 0x08013C14  # lv_obj_refresh_style(obj, part, prop); LVGL caches "recolor transparent"
+STYLE_PROP_ALL = 0xFF
+
+
+def saver_code(restore):
+    """restore = (src, x, y, w, h) of the borrowed object after the screensaver."""
+    hide = []
+    for n, slot in enumerate(SAVER_HIDE):
+        skip = f'sh_skip{n}'
+        hide += [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', slot), ('cbz', 'r0', skip),
+                 ('ldr', 'r1', 'r0', OBJ_FLAGS), ('lsls', 'r1', 'r1', 27), ('bmi', skip),  # hidden already
+                 ('movs', 'r1', 1), ('bl', OBJ_SET_HIDDEN), skip + ':']
+    hide += [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', SAVER_CD), ('cbz', 'r0', 'sh_cd'),
+             ('ldr', 'r1', 'r0', OBJ_FLAGS), ('lsls', 'r1', 'r1', 27), ('bpl', 'sh_cd'),
+             ('movs', 'r1', 0), ('bl', OBJ_SET_HIDDEN), 'sh_cd:']
+    save = [('movs', 'r6', 0)]
+    for n, slot in enumerate(SAVER_HIDE):
+        skip = f'sv_skip{n}'
+        save += [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', slot), ('cbz', 'r0', skip),
+                 ('ldr', 'r1', 'r0', OBJ_FLAGS), ('lsls', 'r1', 'r1', 27), ('bmi', skip),
+                 ('movs', 'r1', 1 << n), ('orrs', 'r6', 'r1'), skip + ':']
+    save += [('strb', 'r6', 'r4', 10)]
+    show = [('ldrb', 'r6', 'r4', 10)]
+    for n, slot in enumerate(SAVER_HIDE):
+        skip = f'sw_skip{n}'
+        show += [('movs', 'r1', 1 << n), ('tst', 'r6', 'r1'), ('beq', skip),
+                 ('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', slot), ('cbz', 'r0', skip),
+                 ('movs', 'r1', 0), ('bl', OBJ_SET_HIDDEN), skip + ':']
+
+    def cd_obj(fn, *args):  # fn(ui[SAVER_CD], args...); args are numbers or literal labels
+        out = [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', SAVER_CD)]
+        for reg, v in zip(('r1', 'r2'), args):
+            out += [('ldr_lit', reg, v)] if isinstance(v, str) else [('movs', reg, v)]
+        return out + [('bl', fn)]
+    def recolor_opa(opa):  # tint strength on the CD's own style, then let LVGL notice
+        return [('ldr_lit', 'r0', 'lit_cd_style'), ('movs', 'r1', 0), ('movs', 'r2', opa),
+                ('bl', STYLE_SET_IMG_RECOLOR_OPA)] + cd_obj(REFRESH_STYLE, 0, STYLE_PROP_ALL)
+    n = len(SAVER_CD_COLOURS)
+    assert n != 1, 'SAVER_CD_COLOURS: at least two colours, or none'
+    src, x, y, w, h = restore
+    restore_code = (cd_obj(IMG_SET_SRC, 'lit_restore_src') + cd_obj(OBJ_SET_POS, x, y)
+                    + cd_obj(OBJ_SET_SIZE, w, h) + cd_obj(OBJ_SET_HIDDEN, 1)
+                    + (recolor_opa(0) if n else []))
+    cd_start = (cd_obj(IMG_SET_SRC, 'lit_cd_dsc') + cd_obj(OBJ_SET_SIZE, SAVER_CD_SIZE, SAVER_CD_SIZE)
+                + ([('ldrb', 'r0', 'r4', 6), ('cmp', 'r0', 4), ('bne', 'cd_white'),  # CD/c: tint at full strength
+                    ('ldr_lit', 'r0', 'lit_cd_style'), ('movs', 'r1', 0), ('movs', 'r2', 0xFF),
+                    ('bl', STYLE_SET_IMG_RECOLOR_OPA), 'cd_white:'] if n else []))
+    move = [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', SAVER_CD),
+            ('ldrb', 'r1', 'r4', 8), ('ldrb', 'r2', 'r4', 9), ('bl', OBJ_SET_POS)]
+    if n:
+        move += [
+            ('ldrb', 'r0', 'r4', 6),
+            ('cmp', 'r0', 4),
+            ('bne', 'col_done'),             # CD/w
+            ('bl', RAND),                    # next colour: previous + 1 + rand % (n - 1), mod n
+            ('movs', 'r1', n - 1),
+            ('udiv', 'r2', 'r0', 'r1'),
+            ('muls', 'r2', 'r1'),
+            ('subs', 'r0', 'r0', 'r2'),
+            ('ldrb', 'r1', 'r4', 7),
+            ('cmp', 'r1', n),
+            ('blo', 'col_prev_ok'),
+            ('movs', 'r1', 0),               # junk after reset
+            'col_prev_ok:',
+            ('adds', 'r0', 'r0', 'r1'),
+            ('adds_i8', 'r0', 1),
+            ('cmp', 'r0', n),
+            ('blo', 'col_ok'),
+            ('movs', 'r1', n),
+            ('subs', 'r0', 'r0', 'r1'),
+            'col_ok:',
+            ('strb', 'r0', 'r4', 7),
+            ('lsls', 'r0', 'r0', 1),
+            ('ldr_lit', 'r1', 'lit_palette'),
+            ('adds', 'r1', 'r1', 'r0'),
+            ('ldrh', 'r2', 'r1', 0),
+            ('ldr_lit', 'r0', 'lit_cd_style'),
+            ('movs', 'r1', 0),
+            ('bl', STYLE_SET_IMG_RECOLOR),
+        ] + cd_obj(REFRESH_STYLE, 0, STYLE_PROP_ALL) + ['col_done:']
+    return [
+        'saver_tick:',
+        ('push', reglist('r4', 'r5', 'r6', lr=True)),
+        ('ldr_lit', 'r4', 'lit_saver'),
+        ('ldr_lit', 'r0', 'lit_clock'),
+        ('ldrh', 'r5', 'r0', 0),
+        ('ldrb', 'r0', 'r4', 11),
+        ('cmp', 'r0', 0xA5),
+        ('beq', 'st_init_done'),
+        ('movs', 'r0', 0),               # first run after reset: the area held menu tables
+        ('str', 'r0', 'r4', 4),          # active, key seen
+        ('str', 'r0', 'r4', 8),          # position, visible objects
+        ('movs', 'r0', 0xA5),
+        ('strb', 'r0', 'r4', 11),
+        ('strh', 'r5', 'r4', 0),
+        'st_init_done:',
+        # activity: a key (a disc going in or out, or playing, is not allowed below)
+        ('ldr_lit', 'r3', 'lit_state'),
+        ('ldrb', 'r1', 'r3', 4),
+        ('ldrb', 'r2', 'r3', 7),
+        ('ldrb', 'r6', 'r4', 5),         # key seen
+        ('movs', 'r0', 0),
+        ('strb', 'r0', 'r4', 5),
+        # allowed: not paused (3), playing (6) or seeking (7/8) - the module's
+        # status messages also write their own codes here (0x0800D924) - and
+        # the empty slot (tray 3/6) or a read disc
+        ('cmp', 'r1', 3),
+        ('beq', 'to_wake'),
+        ('cmp', 'r1', 6),
+        ('blo', 'st_not_playing'),
+        ('cmp', 'r1', 8),
+        ('bls', 'to_wake'),
+        'st_not_playing:',
+        ('cmp', 'r2', 3),
+        ('beq', 'st_allowed'),
+        ('cmp', 'r2', 6),
+        ('beq', 'st_allowed'),
+        ('ldr_lit', 'r3', 'lit_state_f4'),
+        ('ldr', 'r0', 'r3', 0x28),       # +0x11C bit1: TOC read
+        ('movs', 'r1', 2),
+        ('tst', 'r0', 'r1'),
+        ('beq', 'to_wake'),
+        ('ldr', 'r0', 'r3', 0),          # +0xF4 tracks
+        ('cbz', 'r0', 'to_wake'),
+        'st_allowed:',
+        ('ldr_lit', 'r0', 'lit_setting'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('subs_i3', 'r0', 'r0', 2),      # DIM 0, DARK 1, CD/w 2, CD/c 3
+        ('cmp', 'r0', 3),
+        ('bhi', 'to_wake'),              # NONE (or junk): no screensaver
+        ('cbz', 'r6', 'st_idle'),
+        'to_wake:',                      # conditional branches only reach 256 bytes
+        ('b', 'st_wake'),
+        'to_ret:',
+        ('b', 'st_ret'),
+        'st_idle:',
+        ('mov', 'r6', 'r0'),             # mode
+        ('ldrb', 'r0', 'r4', 4),
+        ('cmp', 'r0', 0),
+        ('bne', 'st_active'),
+        ('ldrh', 'r0', 'r4', 0),
+        ('subs', 'r0', 'r5', 'r0'),
+        ('uxth', 'r0', 'r0'),
+        ('ldr_lit', 'r1', 'lit_idle'),
+        ('cmp', 'r0', 'r1'),
+        ('blo', 'to_ret'),
+        # start: r6 = mode (DIM 0, DARK 1, CD/w 2, CD/c 3)
+        ('adds_i3', 'r1', 'r6', 1),
+        ('strb', 'r1', 'r4', 6),         # mode running: 1 DIM, 2 DARK, 3 CD/w, 4 CD/c
+        ('movs', 'r1', 1),
+        ('strb', 'r1', 'r4', 4),
+        ('movs', 'r1', 0),
+        ('strb', 'r1', 'r4', 10),        # no objects to show again (DIM, DARK)
+        ('movs', 'r0', SAVER_DARK_LEVEL),
+        ('cmp', 'r6', 1),
+        ('beq', 'st_level'),
+        ('movs', 'r0', SAVER_DIM_LEVEL),
+        ('ldr_lit', 'r1', 'lit_bright'),
+        ('ldrb', 'r1', 'r1', 0),
+        ('cmp', 'r1', 5),
+        ('bhi', 'st_level'),             # (an invalid brightness: the dim level)
+        ('cmp', 'r1', 'r0'),
+        ('bls', 'st_level'),
+        ('mov', 'r0', 'r1'),             # already darker than the dim level: keep it
+        'st_level:',
+        ('bl', SET_BRIGHTNESS),
+        ('cmp', 'r6', 2),
+        ('blo', 'to_ret'),
+        # CD: note what is visible, the CD image, first position
+        *save,
+        *cd_start,
+        ('b', 'st_move'),
+        'st_active:',
+        ('ldrb', 'r0', 'r4', 6),
+        ('cmp', 'r0', 3),
+        ('blo', 'to_ret'),               # DIM / DARK: nothing to do while it runs
+        ('ldrh', 'r0', 'r4', 2),
+        ('subs', 'r0', 'r5', 'r0'),
+        ('uxth', 'r0', 'r0'),
+        ('cmp', 'r0', SAVER_MOVE_STEPS),
+        ('blo', 'st_hide'),
+        'st_move:',
+        ('strh', 'r5', 'r4', 2),
+        ('bl', RAND),
+        ('movs', 'r1', SAVER_MAX_X + 1),
+        ('udiv', 'r2', 'r0', 'r1'),
+        ('muls', 'r2', 'r1'),
+        ('subs', 'r0', 'r0', 'r2'),
+        ('strb', 'r0', 'r4', 8),
+        ('bl', RAND),
+        ('movs', 'r1', SAVER_MAX_Y + 1),
+        ('udiv', 'r2', 'r0', 'r1'),
+        ('muls', 'r2', 'r1'),
+        ('subs', 'r0', 'r0', 'r2'),
+        ('strb', 'r0', 'r4', 9),
+        *move,
+        'st_hide:',                      # the display update shows its objects again every pass
+        *hide,
+        ('b', 'st_ret'),
+        'st_wake:',
+        ('strh', 'r5', 'r4', 0),         # idle time starts again
+        ('ldrb', 'r0', 'r4', 4),
+        ('cmp', 'r0', 0),
+        ('beq', 'st_ret'),
+        ('movs', 'r0', 0),
+        ('strb', 'r0', 'r4', 4),
+        ('ldr_lit', 'r0', 'lit_bright'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('bl', SET_BRIGHTNESS),
+        ('ldrb', 'r0', 'r4', 6),
+        ('cmp', 'r0', 3),
+        ('blo', 'st_redraw'),
+        *restore_code,
+        *show,
+        'st_redraw:',
+        ('ldr_lit', 'r0', 'lit_last_min'),  # rewrite the time label
+        ('movs', 'r1', 0xFF),
+        ('str', 'r1', 'r0', 0),
+        ('ldr_lit', 'r0', 'lit_redraw'),
+        ('movs', 'r1', 1),
+        ('strb', 'r1', 'r0', 0),
+        'st_ret:',
+        ('pop', reglist('r4', 'r5', 'r6', pc=True)),
+        ('align',),
+        'lit_saver:', ('word', SAVER),
+        'lit_clock:', ('word', CLOCK_75MS),
+        'lit_state:', ('word', CD_STATE),
+        'lit_state_f4:', ('word', CD_STATE + 0xF4),
+        'lit_idle:', ('word', SAVER_IDLE_STEPS),
+        'lit_setting:', ('word', SAVER_SETTING),
+        'lit_ui:', ('word', UI),
+        'lit_bright:', ('word', BRIGHTNESS),
+        'lit_last_min:', ('word', LAST_SHOWN_MIN),
+        'lit_redraw:', ('word', DISPLAY_REDRAW),
+        'lit_cd_dsc:', ('word', 'cd_dsc'),
+        'lit_restore_src:', ('word', src),
+        'lit_cd_style:', ('word', CD_STYLE),
+        'lit_palette:', ('word', 'palette'),
+        'palette:', *[('bytes', struct.pack('<H', (c >> 19 & 31) << 11 | (c >> 10 & 63) << 5 | (c >> 3 & 31)))
+                      for c in SAVER_CD_COLOURS],
+        ('align',),
+        # lv_img_dsc_t: header, data_size, data
+        'cd_dsc:', ('word', SAVER_CD_HEADER), ('word', len(SAVER_CD_DATA)), ('word', 'cd_data'),
+        'cd_data:', ('bytes', SAVER_CD_DATA),
+    ]
+
+
+def patch_saver(img):
+    assert SCREENSAVER_ON, 'the saver patch needs SCREENSAVER_ON (key_hook notes the keys)'
+    if 'hourglass' in EXPORTS:
+        restore = (EXPORTS['hourglass'], ICON_X, ICON_Y, ICON_SIZE, ICON_SIZE)
+    else:
+        restore = SHUFFLE_ICON
+    cave, lab = assemble(saver_code(restore), cave_addr(img))
+    put(img, lab['saver_tick'], cave)
+    TICK_HOOKS.append(lab['saver_tick'])     # last: after play_icon / osd have set the icons
+    print(f"saver: saver_tick at {lab['saver_tick']:#x}, {len(cave)} bytes")
+
+
 def patch_splash(img, version):
     text = 'patch ' + version
     bad = sorted(set(c for c in text if c not in SPLASH_CHARS))
@@ -2077,6 +2446,8 @@ def remap_buttons(img, names):
         want[TIME_IR] = TIME_KEY
     if 'brightness' in names:
         want[BRIGHT_IR] = BRIGHT_KEY
+    if 'saver' in names:
+        want[SAVER_IR] = SAVER_KEY
     used = set(want.values())
     for ir in range(IR_TABLE_LEN):
         key = img[IR_TABLE + ir - BASE]
@@ -2087,12 +2458,12 @@ def remap_buttons(img, names):
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
-           'brightness': patch_brightness, 'gapless': patch_gapless}
+           'brightness': patch_brightness, 'gapless': patch_gapless, 'saver': patch_saver}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens;
 # the gap display in 'remaining' needs cdtime's gap detection; cdtime's length request
 # needs the track of the stored length, which 'shuffle' notes
 REQUIRES = {'play': ['disctime'], 'remaining': ['cdtime'] if PREGAP_MINUS_ON else [],
-            'cdtime': ['shuffle'] if LENGTH_REQUEST_ON else []}
+            'cdtime': ['shuffle'] if LENGTH_REQUEST_ON else [], 'saver': ['brightness']}
 
 
 def main():
