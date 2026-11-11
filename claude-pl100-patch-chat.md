@@ -4180,3 +4180,234 @@ Opus 5.5 · Claude Team
 
   Nothing is committed. For the README, the mode list is now NONE / DIM / DARK /
   CD/w / CD/c.
+
+❯ with the screen saver, when switching off the device, the screen briefly goes back
+  to the default state. E.g. when the screen saver is dark and the screen is off,
+  switching off the device will briefly turn on the screen, and then turn it off again.
+  Can this be fixed that from screen saver->device off, the screen doesn't first go to
+  the active state?
+
+⏺ Fixed: with the screensaver running, switching the player off no longer brings back the
+  normal screen first. The new build is patch/IAP_PL100_1v1_b250219_all_v27.hex. I've tested
+  it in the emulator only, not on the player.
+  
+  Cause: the player handles the power key in two steps of its main loop. In the first step it
+  marks the player as off, then updates the screen as usual. Only in the next step does it
+  switch the display off. The screensaver ran during that screen update, saw a key had been
+  pressed, and woke up. That restored the normal screen at your own brightness for that one step,
+  before the display went off.
+  
+  Fix: when the screensaver sees that the player has just been switched off, it doesn't wake.
+  The screen stays as it is until it goes off:
+  - DARK: stays dark.
+  - DIM: stays dimmed.
+  - CD/w and CD/c: still show only the CD. The screensaver also keeps hiding the normal screen
+    elements during that last step, so they don't flash next to the CD.
+  
+  The key press stays remembered, so at the next power-on the screensaver ends on its first check.
+  You get the normal screen at your own brightness, and the CD image goes back to the hourglass.
+  
+  Emulator check:
+  - All four modes: switching off while the screensaver runs doesn't change the brightness, and the
+    power key still reaches the player as before.
+  - After power-on: in every mode the screensaver ends on the first check, the brightness goes back
+    to your setting, and the normal screen elements are shown again.
+  - Earlier tests on v27: the MENU cycle, every mode, waking, the CD/c colours and the RAM checks give
+    the same results as before.
+  
+  I also added a short note to the "Patch saver" part of the description at the top of build_patch.py.
+  For the README, you could add one line: switching off while the screensaver runs keeps the screen dark
+  or dimmed until it goes off. Nothing is committed.
+
+❯ In the build script, what does SCREENSAVER_ON control? And if this different  
+  from specifying the patches on the command line?                              
+
+⏺ SCREENSAVER_ON controls only the screensaver code inside the brightness patch.
+  Putting saver on the command line adds the screensaver patch itself. So they
+  cover different parts of the screensaver, and you normally want them to match.
+
+  What SCREENSAVER_ON = True adds to the brightness patch's key hook:
+  - Every key press is noted for the screensaver (build_patch.py:1103).
+  - The MENU key is caught: if the screensaver is running, it only wakes it;
+    otherwise it cycles NONE → DIM → DARK → CD/w → CD/c and saves the choice.
+  - The mode cycle code and the "NONE"/"DIM"/… texts (build_patch.py:1173,
+    :1257, :1272).
+
+  This sits in the brightness patch because that patch already hooks every key
+  press.
+
+  What the saver patch name adds:
+  - The screensaver itself: the idle timer, dimming, hiding the screen, and the
+    moving CD with its image and colours.
+  - MENU on the remote is remapped to the screensaver key (remap_buttons,
+    build_patch.py:2481). Without that remap, the MENU code in the key hook
+    never receives anything.
+
+  When they don't match:
+
+  SCREENSAVER_ON: True
+  saver on command line: yes
+  Result: Full screensaver (the default)
+  ────────────────────────────────────────
+  SCREENSAVER_ON: False
+  saver on command line: no
+  Result: No screensaver code at all. Earlier I checked that this build is
+  byte-identical to v18, the build from before the screensaver.
+  ────────────────────────────────────────
+  SCREENSAVER_ON: False
+  saver on command line: yes
+  Result: The build stops with an error: "the saver patch needs SCREENSAVER_ON".
+  ────────────────────────────────────────
+  SCREENSAVER_ON: True
+  saver on command line: no (e.g. brightness without saver)
+  Result: Builds, but the key-hook code is dead weight. Key presses are still
+  noted in a spare RAM byte, which is harmless, and the MENU code is never
+  reached because MENU isn't remapped.
+
+  So yes, it's mostly redundant. The flag exists because the key-hook code is
+  built once when the script loads, before the script knows which patches are on
+  the command line.
+
+  It could follow the command line instead, like the Vol- mapping already does
+  with 'remaining' in BUILD_NAMES. That needs the key-hook code built at build
+  time. The flag would then disappear, and leaving out saver would also leave
+  out the key-hook part. It's a small refactor; I can do it if you want.
+
+❯ Would it make sense to change it in this way:                                 
+  - saver on command line control the full screen saver functionality           
+  - when SCREENSAVER_ON = False, the additional CD screen saver is not          
+  included, but the MENU key and NONE/DIM/DARK are still there                  
+    Goal of this would be to still have the functionality, but optionally avoid 
+  the increase in firmware size by including the CD image.                      
+    Do not yet build this, just answewr if it makes sense from the current code 
+  setup.                                                                        
+
+⏺ Yes, that split makes sense with the current code. Nearly all of the size is
+  the CD image, so the flag would remove almost all of the growth while keeping
+  MENU and NONE/DIM/DARK.
+
+  Where the size goes
+
+  The saver patch adds 13,268 bytes:
+
+  ┌───────────────────────────────────────────────────────┬─────────────────┐
+  │                         Part                          │      Size       │
+  ├───────────────────────────────────────────────────────┼─────────────────┤
+  │ CD image (64 × 64 pixels, 3 bytes each)               │ 12,288 bytes    │
+  ├───────────────────────────────────────────────────────┼─────────────────┤
+  │ Everything else: idle timer, dimming,                 │ about 1 KB      │
+  │ hide/move/colour code, palette                        │                 │
+  ├───────────────────────────────────────────────────────┼─────────────────┤
+  │ MENU cycle in the key hook                            │ a few hundred   │
+  │                                                       │ bytes           │
+  └───────────────────────────────────────────────────────┴─────────────────┘
+
+  Without the CD, the screensaver costs about 1 KB. The image now ends at about
+  0x08078BC7. If the chip has 512 KB of flash, that leaves about 29 KB free, so
+  the 12 KB image is a real share of what's left.
+
+  How it fits the code
+  - saver on the command line controls everything. That means building the
+    key-hook part at build time from 'saver' in BUILD_NAMES instead of the flag.
+    The Vol- mapping in patch_brightness already works this way, so it's a
+    known pattern.
+  - The flag only controls the CD part:
+    - Without it, the image, palette, CD start/move/colour code and the restore
+      of the borrowed hourglass object all drop out. These are already separate
+      code blocks in saver_code().
+    - The MENU texts become NONE/DIM/DARK, and the cycle wraps after DARK. The
+      cycle code uses len(SAVER_TEXT), so that mostly follows.
+    - The "allowed modes" check in the tick (cmp r0, 3) becomes 1 instead of 3.
+  - Saved settings carry over safely. A player flashed earlier with CD/w or CD/c
+    saved has a 4 or 5 stored. A build without the CD would read that as NONE,
+    the same way junk values are read now. The next MENU press gives DIM.
+
+  Two suggestions
+  - Rename the flag, for example to SAVER_CD_ON. SCREENSAVER_ON = False while a
+    screensaver is still built would be confusing.
+  - Option: shrink the image instead of dropping it. The CD is one colour with
+    soft edges, so it doesn't need full RGB. LVGL has alpha-only image formats
+    that are drawn in the recolour colour, which is exactly what CD/c already
+    uses. A 4-bit alpha version of the same 64 px CD would be about 2 KB instead
+    of 12 KB. I haven't checked whether this firmware's LVGL build includes the
+    decoder for those formats, so I'd verify that first.
+
+❯ I think all are good ideas. Instead of SCREENSAVER_ON, have SAVER_CD_ON as a  
+  boolean flag. This should also slightly change SAVER_TEXT. The default should 
+  include in 'NONE', 'DIM', 'DARK'. Then have a second SAVER_TEXT_CD with       
+  'CD/w', 'CD/c'. If SAVER_CD_ON, the two are merged.                           
+  Additionally also shrink the image itself.                                    
+
+⏺ The changes are in. The new build is patch/IAP_PL100_1v1_b250219_all_v28.hex,
+  which also includes the power-off fix. Everything is tested in the emulator
+  only, not on the player.
+
+  The CD image is 2 KB now instead of 12 KB. It stores only the transparency, in
+  16 levels, and LVGL draws it in the CD object's image colour. Before using
+  that, I checked the firmware:
+  - Its LVGL has the decoder for transparency-only images.
+  - The image cache treats a new colour as a new image, so CD/c's colour changes
+    still get redrawn.
+  - LVGL only reads that colour while the tint strength is above 0; otherwise
+    the CD would be drawn black. So both CD modes now set full strength:
+    - CD/w sets the colour to SAVER_CD_WHITE, the same light grey as the
+      firmware's icons.
+    - CD/c starts the same way, and its first move sets a colour.
+    - On wake the strength goes back to 0, so the hourglass looks as before.
+
+  The 4-bit image differs from the original by at most 8/255 in opacity, so it
+  should look the same on the screen.
+
+  Configuration:
+  - SCREENSAVER_ON is gone. Putting saver on the command line now controls
+    everything: the screensaver, the MENU mode cycle in the key hook, and the
+    MENU remap. The key-hook code became a function, key_hook_code(saver), so it
+    can depend on the command line.
+  - SAVER_CD_ON = True adds the CD modes. With False, MENU cycles NONE → DIM →
+    DARK.
+  - SAVER_TEXT / SAVER_TEXT_CD: SAVER_TEXT holds 'NONE', 'DIM', 'DARK'.
+    SAVER_TEXT_CD holds 'CD/w', 'CD/c' and is added after them when SAVER_CD_ON
+    is set.
+  - New SAVER_CD_WHITE: the colour for CD/w.
+
+  Sizes:
+
+  ┌──────────────────────┬──────────────────────────────────────────────────┐
+  │        Build         │                 Screensaver size                 │
+  ├──────────────────────┼──────────────────────────────────────────────────┤
+  │ v27                  │ 13,268 bytes                                     │
+  ├──────────────────────┼──────────────────────────────────────────────────┤
+  │ v28, with CD         │ 3,052 bytes                                      │
+  ├──────────────────────┼──────────────────────────────────────────────────┤
+  │ v28, SAVER_CD_ON =   │ 236 bytes plus about 135 bytes for MENU          │
+  │ False                │ (_all_v28_nocd.hex)                              │
+  └──────────────────────┴──────────────────────────────────────────────────┘
+
+  Emulator checks:
+  - v28 with CD:
+    - The MENU cycle is unchanged.
+    - Every mode, waking, and switching off while the screensaver runs behave as
+      before.
+    - CD/w is white at full strength.
+    - Over 31 moves, CD/c starts white and then uses only palette colours, never
+      the same one twice in a row, using all eight.
+    - Wake sets the strength back to 0.
+  - Without the CD:
+    - MENU cycles NONE/DIM/DARK.
+    - A saved CD/w or CD/c from an earlier build counts as NONE, and the next
+      MENU press gives DIM.
+    - DIM, DARK, waking and switching off work.
+    - No CD or style calls are made.
+  - Without saver on the command line: byte-identical to the same build from the
+    committed code with the old SCREENSAVER_ON = False.
+
+  I also had to add one more jump step in the screensaver code, because the
+  longer CD start put a branch out of range. The docstring is updated.
+
+  For the README:
+  - SCREENSAVER_ON is gone; saver on the command line controls the screensaver.
+  - New options SAVER_CD_ON and SAVER_CD_WHITE.
+  - Without the CD modes, MENU cycles NONE/DIM/DARK.
+
+  Nothing is committed. The changed files are build_patch.py and icons.py;
+  README.md and the chat log have your own changes.
