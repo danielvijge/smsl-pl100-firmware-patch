@@ -167,6 +167,9 @@ Patch saver - screensaver while stopped.
     state other than paused (3), playing (6) or seeking (7/8). key_hook (brightness patch) notes
     the key, a tick hook after the display update does the rest, so the
     display update's own hide/show logic is overridden every pass.
+  * Except the power key: it switches off before that pass's display update
+    and standby follows on the next pass, so the screensaver stays as it is
+    (no flash of the normal screen) and wakes at the next power-on.
   * MENU (SAVER_IR, no function so far) cycles the mode, saved in a settings
     byte of the dead settings menu (0x200004DB, record +0x2D) and shown on
     line 1 like the brightness: NONE (no screensaver), DIM (dim to
@@ -2266,6 +2269,23 @@ def saver_code(restore):
         ('strb', 'r0', 'r4', 11),
         ('strh', 'r5', 'r4', 0),
         'st_init_done:',
+        # Power just switched off (the dispatcher runs before this pass's
+        # display update; standby follows on the next pass): stay as it is,
+        # waking would light the screen for a moment (the CD still hides what
+        # the display update showed). The key stays noted, so the first pass
+        # after power-on wakes it.
+        ('ldr_lit', 'r0', 'lit_power'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('cmp', 'r0', 0),
+        ('bne', 'st_on'),
+        ('ldrb', 'r0', 'r4', 4),
+        ('cmp', 'r0', 0),
+        ('beq', 'to_ret'),
+        ('ldrb', 'r0', 'r4', 6),
+        ('cmp', 'r0', 3),
+        ('blo', 'to_ret'),               # DIM / DARK
+        ('b', 'st_hide'),
+        'st_on:',
         # activity: a key (a disc going in or out, or playing, is not allowed below)
         ('ldr_lit', 'r3', 'lit_state'),
         ('ldrb', 'r1', 'r3', 4),
@@ -2402,6 +2422,7 @@ def saver_code(restore):
         'lit_setting:', ('word', SAVER_SETTING),
         'lit_ui:', ('word', UI),
         'lit_bright:', ('word', BRIGHTNESS),
+        'lit_power:', ('word', POWER_ON),
         'lit_last_min:', ('word', LAST_SHOWN_MIN),
         'lit_redraw:', ('word', DISPLAY_REDRAW),
         'lit_cd_dsc:', ('word', 'cd_dsc'),
