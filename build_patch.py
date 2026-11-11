@@ -154,9 +154,12 @@ Patch 7 - gaps between tracks after fast forward / rewind.
 Patch saver - screensaver while stopped.
   * After SAVER_IDLE_S without a key (remote, panel or knob), while stopped
     with a disc (TOC read) or at the empty slot ("Disc"), the backlight dims to SAVER_DIM_LEVEL (not saved)
-    and everything is hidden except a 64 px CD (icons.py) that moves to a
-    random position every SAVER_MOVE_S; for CD/c each time in a random colour
-    from SAVER_CD_COLOURS (LVGL image recolor on the object's own style). The CD borrows the hourglass object
+    or goes off (DARK). The CD modes (SAVER_CD_ON) also hide everything
+    except a 64 px CD (icons.py) that moves to a random position every
+    SAVER_MOVE_S; for CD/c each time in a random colour from
+    SAVER_CD_COLOURS. The CD is an ALPHA_4BIT image (2 KB; the firmware's
+    LVGL decodes it, 0x0801D95A), drawn in the image recolor colour of the
+    object's own style: SAVER_CD_WHITE for CD/w. The CD borrows the hourglass object
     (ui+0x24, always hidden when not playing); on waking it gets its own
     image, place and size back (the firmware's unused shuffle icon when the
     remaining patch or its icon is not built). Never while playing,
@@ -174,8 +177,11 @@ Patch saver - screensaver while stopped.
     byte of the dead settings menu (0x200004DB, record +0x2D) and shown on
     line 1 like the brightness: NONE (no screensaver), DIM (dim to
     SAVER_DIM_LEVEL only), DARK (backlight off), CD/w (dim + moving white
-    CD), CD/c (the same, a new colour on every move). After flashing it is
-    NONE. While the screensaver runs, MENU only wakes it.
+    CD), CD/c (the same, a new colour on every move); the CD modes only with
+    SAVER_CD_ON (a saved CD mode then counts as NONE). After flashing it is
+    NONE. While the screensaver runs, MENU only wakes it. This part lives in
+    key_hook (brightness patch, added automatically) and is only built with
+    the saver patch.
   * The firmware's own idle dimmer (setting 0x200004D5, timer 0x2000054C)
     stays unused: it is only reachable from the dead settings menu and sets
     the backlight PWM to 1, which on the PL100 (active-low) is full brightness.
@@ -193,7 +199,7 @@ Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,..
 import argparse
 import struct
 
-from icons import cd, hourglass, lv_img_true_color_alpha
+from icons import cd, hourglass, lv_img_alpha4, lv_img_true_color_alpha
 from thumbasm import assemble, reglist
 
 BASE = 0x08004000
@@ -280,9 +286,10 @@ PANEL_VOLDN_KEY = 0x11     # key of the player's Vol- button (PC6)
 PANEL_VOL_PEND = 0x2000028C  # u8 spare (0 after boot, unused): key to hand out on the next pass
 PANEL_VOL_LAST = 0x2000028D  # u8 spare (0 after boot, unused): last panel volume key
 SAVER_SETTING = 0x200004DB  # saved setting byte of the dead settings menu (record +0x2D, loaded
-                           # unchecked): 2 DIM, 3 DARK, 4 white CD, 5 colour-changing CD,
-                           # anything else (1, 0, erased) NONE
-SAVER_TEXT = ('NONE', 'DIM', 'DARK', 'CD/w', 'CD/c')  # line 1 per mode; the font has no space or comma
+                           # unchecked): 2 DIM, 3 DARK, 4 white CD, 5 colour-changing CD (only
+                           # with SAVER_CD_ON), anything else (1, 0, erased) NONE
+SAVER_TEXT = ('NONE', 'DIM', 'DARK')  # line 1 per mode; the font has no space or comma
+SAVER_TEXT_CD = ('CD/w', 'CD/c')        # after those with SAVER_CD_ON
 SAVER_DARK_LEVEL = 6       # backlight off
 SAVER = 0x20000430         # 12 bytes spare (dead menu table): +0 u16 last activity (CLOCK_75MS),
                            # +2 u16 last move, +4 active, +5 key seen (key_hook), +6 mode running
@@ -323,10 +330,11 @@ TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, the
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
 LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
-SCREENSAVER_ON = True      # key_hook notes keys for the saver patch (screensaver while stopped)
+SAVER_CD_ON = True         # saver patch: also the moving CD modes CD/w and CD/c (~2.6 KB more)
 SAVER_IDLE_S = 180         # idle time before the screensaver starts
 SAVER_DIM_LEVEL = 5        # backlight level for DIM and CD (5 = 10 %; the brightness levels run backwards)
-SAVER_CD_COLOURS = (0xFF4040, 0xFF9020, 0xFFE030, 0x40E040,   # CD: a random one of these on every move,
+SAVER_CD_WHITE = 0xE8E8E8  # CD/w colour (the same white as the firmware's icons)
+SAVER_CD_COLOURS = (0xFF4040, 0xFF9020, 0xFFE030, 0x40E040,   # CD/c: a random one of these on every move,
                     0x30E0E0, 0x4080FF, 0xA060FF, 0xFF50C0)   # never the same twice; () keeps it white
 SAVER_MOVE_S = 10          # the icons move to a new position this often
 PANEL_VOL_ON = True        # without headphone the player's own Vol- = time toggle, Vol+ = play mode cycle
@@ -1062,221 +1070,224 @@ FMT_TIME = [
 # Key 0x14 (BRIGHT_IR; natively DISP, no function on the PL100) cycles the
 # backlight brightness while powered on. With IR_DIAG_ON, also records the
 # last IR command.
-KEY_HOOK = [
-    'key_hook:',
-    ('push', reglist('r4', lr=True)),
-] + ([
-    ('ldr_lit', 'r1', 'lit_vol_pend'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cbz', 'r0', 'kh_get'),
-    ('movs', 'r2', 0),               # second key of a panel Vol+ press
-    ('strb', 'r2', 'r1', 0),
-    ('mov', 'r4', 'r0'),
-    ('b', 'key_ret'),
-    'kh_get:',
-    ('ldr_lit', 'r1', 'lit_ir_pending'),
-    ('ldrb', 'r4', 'r1', 0),         # key will come from the remote?
-] if PANEL_VOL_ON else []) + [
-    ('bl', GET_KEY),
-] + ([
-    ('mov', 'r1', 'r4'),
-    ('bl', 'panel_vol'),
-] if PANEL_VOL_ON else []) + [
-    ('mov', 'r4', 'r0'),
-] + ([
-    ('cmp', 'r4', 0xFF),
-    ('beq', 'kh_no_key'),
-    ('ldr_lit', 'r1', 'lit_saver'),      # a key: tell the screensaver
-    ('movs', 'r0', 1),
-    ('strb', 'r0', 'r1', 5),
-    ('cmp', 'r4', SAVER_KEY),
-    ('bne', 'kh_no_key'),
-    ('movs', 'r4', 0xFF),                # MENU: consumed
-    ('ldrb', 'r0', 'r1', 4),
-    ('cmp', 'r0', 1),
-    ('beq', 'kh_no_key'),                # the screensaver runs: only wake it
-    ('ldr_lit', 'r1', 'lit_power'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cbz', 'r0', 'kh_no_key'),          # standby
-    ('bl', 'saver_cycle'),
-    'kh_no_key:',
-] if SCREENSAVER_ON else []) + ([
-    ('cmp', 'r4', 0xFF),
-    ('beq', 'no_diag'),
-    ('ldr_lit', 'r1', 'lit_ir_raw'),
-    ('ldrb', 'r0', 'r1', 0),         # raw IR command, 0 if the key was not IR
-    ('cbz', 'r0', 'no_diag'),
-    ('ldr_lit', 'r1', 'lit_ir_diag'),
-    ('strb', 'r0', 'r1', 0),
-    'no_diag:',
-] if IR_DIAG_ON else []) + [
-    ('cmp', 'r4', BRIGHT_KEY),
-    ('bne', 'key_ret'),
-    ('ldr_lit', 'r1', 'lit_power'),
-    ('ldrb', 'r0', 'r1', 0),
-    ('cbz', 'r0', 'key_ret'),        # standby: leave it to the standby handler
-    ('bl', 'bright_cycle'),
-    ('movs', 'r4', 0xFF),            # consumed
-    'key_ret:',
-    ('mov', 'r0', 'r4'),
-    ('pop', reglist('r4', pc=True)),
+def key_hook_code(saver):
+    texts = SAVER_TEXT + (SAVER_TEXT_CD if SAVER_CD_ON else ())   # screensaver modes
+    return [
+        'key_hook:',
+        ('push', reglist('r4', lr=True)),
+    ] + ([
+        ('ldr_lit', 'r1', 'lit_vol_pend'),
+        ('ldrb', 'r0', 'r1', 0),
+        ('cbz', 'r0', 'kh_get'),
+        ('movs', 'r2', 0),               # second key of a panel Vol+ press
+        ('strb', 'r2', 'r1', 0),
+        ('mov', 'r4', 'r0'),
+        ('b', 'key_ret'),
+        'kh_get:',
+        ('ldr_lit', 'r1', 'lit_ir_pending'),
+        ('ldrb', 'r4', 'r1', 0),         # key will come from the remote?
+    ] if PANEL_VOL_ON else []) + [
+        ('bl', GET_KEY),
+    ] + ([
+        ('mov', 'r1', 'r4'),
+        ('bl', 'panel_vol'),
+    ] if PANEL_VOL_ON else []) + [
+        ('mov', 'r4', 'r0'),
+    ] + ([
+        ('cmp', 'r4', 0xFF),
+        ('beq', 'kh_no_key'),
+        ('ldr_lit', 'r1', 'lit_saver'),      # a key: tell the screensaver
+        ('movs', 'r0', 1),
+        ('strb', 'r0', 'r1', 5),
+        ('cmp', 'r4', SAVER_KEY),
+        ('bne', 'kh_no_key'),
+        ('movs', 'r4', 0xFF),                # MENU: consumed
+        ('ldrb', 'r0', 'r1', 4),
+        ('cmp', 'r0', 1),
+        ('beq', 'kh_no_key'),                # the screensaver runs: only wake it
+        ('ldr_lit', 'r1', 'lit_power'),
+        ('ldrb', 'r0', 'r1', 0),
+        ('cbz', 'r0', 'kh_no_key'),          # standby
+        ('bl', 'saver_cycle'),
+        'kh_no_key:',
+    ] if saver else []) + ([
+        ('cmp', 'r4', 0xFF),
+        ('beq', 'no_diag'),
+        ('ldr_lit', 'r1', 'lit_ir_raw'),
+        ('ldrb', 'r0', 'r1', 0),         # raw IR command, 0 if the key was not IR
+        ('cbz', 'r0', 'no_diag'),
+        ('ldr_lit', 'r1', 'lit_ir_diag'),
+        ('strb', 'r0', 'r1', 0),
+        'no_diag:',
+    ] if IR_DIAG_ON else []) + [
+        ('cmp', 'r4', BRIGHT_KEY),
+        ('bne', 'key_ret'),
+        ('ldr_lit', 'r1', 'lit_power'),
+        ('ldrb', 'r0', 'r1', 0),
+        ('cbz', 'r0', 'key_ret'),        # standby: leave it to the standby handler
+        ('bl', 'bright_cycle'),
+        ('movs', 'r4', 0xFF),            # consumed
+        'key_ret:',
+        ('mov', 'r0', 'r4'),
+        ('pop', reglist('r4', pc=True)),
 
-    # bright_cycle(): levels 5,4,3,2,1,0 = 10,20,35,55,65,100 % (active-low
-    # backlight), then back to 5. Level 6 (off) is skipped. Saved like the
-    # settings menu does.
-    'bright_cycle:',
-    ('push', reglist('r4', lr=True)),
-    ('ldr_lit', 'r4', 'lit_bright'),
-    ('ldrb', 'r0', 'r4', 0),
-    ('cbz', 'r0', 'bright_wrap'),
-    ('cmp', 'r0', 5),
-    ('bhi', 'bright_wrap'),
-    ('subs_i3', 'r0', 'r0', 1),
-    ('b', 'bright_set'),
-    'bright_wrap:',
-    ('movs', 'r0', 5),
-    'bright_set:',
-    ('strb', 'r0', 'r4', 0),
-    ('bl', SET_BRIGHTNESS),
-    ('bl', SCHEDULE_SAVE),
-    ('ldrb', 'r0', 'r4', 0),         # show the new level on line 1
-    ('lsls', 'r0', 'r0', 2),
-    ('ldr_lit', 'r1', 'lit_level_text'),
-    ('adds', 'r1', 'r1', 'r0'),
-    ('ldr', 'r0', 'r1', 0),
-    ('bl', 'OSD_SHOW'),
-    ('pop', reglist('r4', pc=True)),
+        # bright_cycle(): levels 5,4,3,2,1,0 = 10,20,35,55,65,100 % (active-low
+        # backlight), then back to 5. Level 6 (off) is skipped. Saved like the
+        # settings menu does.
+        'bright_cycle:',
+        ('push', reglist('r4', lr=True)),
+        ('ldr_lit', 'r4', 'lit_bright'),
+        ('ldrb', 'r0', 'r4', 0),
+        ('cbz', 'r0', 'bright_wrap'),
+        ('cmp', 'r0', 5),
+        ('bhi', 'bright_wrap'),
+        ('subs_i3', 'r0', 'r0', 1),
+        ('b', 'bright_set'),
+        'bright_wrap:',
+        ('movs', 'r0', 5),
+        'bright_set:',
+        ('strb', 'r0', 'r4', 0),
+        ('bl', SET_BRIGHTNESS),
+        ('bl', SCHEDULE_SAVE),
+        ('ldrb', 'r0', 'r4', 0),         # show the new level on line 1
+        ('lsls', 'r0', 'r0', 2),
+        ('ldr_lit', 'r1', 'lit_level_text'),
+        ('adds', 'r1', 'r1', 'r0'),
+        ('ldr', 'r0', 'r1', 0),
+        ('bl', 'OSD_SHOW'),
+        ('pop', reglist('r4', pc=True)),
 
-    # saver_cycle(): MENU - next screensaver mode, saved, shown on line 1
-    *(['saver_cycle:',
-       ('push', reglist('r4', lr=True)),
-       ('ldr_lit', 'r4', 'lit_saver_setting'),
-       ('ldrb', 'r0', 'r4', 0),
-       ('subs_i3', 'r0', 'r0', 1),       # mode 0..4 = NONE, DIM, DARK, CD/w, CD/c
-       ('cmp', 'r0', len(SAVER_TEXT) - 1),
-       ('bls', 'sc_mode'),
-       ('movs', 'r0', 0),                # 0, erased, junk: NONE
-       'sc_mode:',
-       ('adds_i8', 'r0', 1),
-       ('cmp', 'r0', len(SAVER_TEXT)),
-       ('blo', 'sc_store'),              # next mode
-       ('movs', 'r0', 0),                # after CD/c: NONE
-       'sc_store:',
-       ('adds_i3', 'r1', 'r0', 1),
-       ('strb', 'r1', 'r4', 0),
-       ('lsls', 'r0', 'r0', 2),
-       ('ldr_lit', 'r1', 'lit_saver_text'),
-       ('adds', 'r1', 'r1', 'r0'),
-       ('ldr', 'r0', 'r1', 0),
-       ('bl', 'OSD_SHOW'),
-       ('bl', SCHEDULE_SAVE),
-       ('pop', reglist('r4', pc=True))] if SCREENSAVER_ON else []),
+        # saver_cycle(): MENU - next screensaver mode, saved, shown on line 1
+        *(['saver_cycle:',
+           ('push', reglist('r4', lr=True)),
+           ('ldr_lit', 'r4', 'lit_saver_setting'),
+           ('ldrb', 'r0', 'r4', 0),
+           ('subs_i3', 'r0', 'r0', 1),       # mode: index in texts (NONE, DIM, DARK, CD/w, CD/c)
+           ('cmp', 'r0', len(texts) - 1),
+           ('bls', 'sc_mode'),
+           ('movs', 'r0', 0),                # 0, erased, junk (CD without SAVER_CD_ON): NONE
+           'sc_mode:',
+           ('adds_i8', 'r0', 1),
+           ('cmp', 'r0', len(texts)),
+           ('blo', 'sc_store'),              # next mode
+           ('movs', 'r0', 0),                # after the last: NONE
+           'sc_store:',
+           ('adds_i3', 'r1', 'r0', 1),
+           ('strb', 'r1', 'r4', 0),
+           ('lsls', 'r0', 'r0', 2),
+           ('ldr_lit', 'r1', 'lit_saver_text'),
+           ('adds', 'r1', 'r1', 'r0'),
+           ('ldr', 'r0', 'r1', 0),
+           ('bl', 'OSD_SHOW'),
+           ('bl', SCHEDULE_SAVE),
+           ('pop', reglist('r4', pc=True))] if saver else []),
 
-    # panel_vol(r0 = key, r1 = from remote) -> key. The player's own Vol- / Vol+
-    # do nothing without a headphone; then Vol- toggles elapsed / remaining
-    # (like DISP) and Vol+ cycles normal -> repeat one -> repeat disc ->
-    # shuffle -> normal through the firmware's Repeat / Shuffle keys (from
-    # repeat disc: Repeat, then Shuffle on the next pass). Key events closer
-    # than 300 ms are one press (holding repeats, release after a hold).
-    *(['panel_vol:',
-       ('push', reglist('r4', lr=True)),
-       ('mov', 'r4', 'r0'),
-       ('cmp', 'r0', 0x10),
-       ('beq', 'pv_vol'),
-       ('cmp', 'r0', 0x11),
-       ('bne', 'pv_out'),
-       'pv_vol:',
-       ('cmp', 'r1', 0),
-       ('bne', 'pv_out'),            # remote: unchanged
-       ('ldr_lit', 'r1', 'lit_headphone'),
-       ('ldrb', 'r1', 'r1', 0),
-       ('cmp', 'r1', 1),
-       ('beq', 'pv_out'),            # headphone: volume
-       ('ldr_lit', 'r1', 'lit_power'),
-       ('ldrb', 'r1', 'r1', 0),
-       ('cmp', 'r1', 0),
-       ('beq', 'pv_out'),            # standby
-       ('ldr_lit', 'r3', 'lit_vol_t'),
-       ('ldrh', 'r1', 'r3', 0),
-       ('ldr_lit', 'r2', 'lit_clock_kh'),
-       ('ldrh', 'r2', 'r2', 0),
-       ('strh', 'r2', 'r3', 0),
-       ('subs', 'r1', 'r2', 'r1'),
-       ('uxth', 'r1', 'r1'),         # 75 ms steps since the previous event
-       ('ldr_lit', 'r3', 'lit_vol_last'),
-       ('ldrb', 'r2', 'r3', 0),
-       ('strb', 'r0', 'r3', 0),
-       ('cmp', 'r2', 'r0'),
-       ('bne', 'pv_new'),
-       ('cmp', 'r1', PANEL_VOL_HOLD_STEPS),
-       ('bhs', 'pv_new'),
-       ('movs', 'r4', 0xFF),         # same press
-       ('b', 'pv_out'),
-       'pv_new:',
-       ('cmp', 'r0', PANEL_VOLDN_KEY),
-       ('bne', 'pv_mode'),
-       ('movs', 'r4', 'VOLDN_FN'),   # the time toggle key if the remaining patch is built
-       ('b', 'pv_out'),
-       'pv_mode:',
-       ('ldr_lit', 'r1', 'lit_play_mode'),
-       ('ldrb', 'r1', 'r1', 0),
-       ('movs', 'r4', REPEAT_KEY),   # normal / repeat one: Repeat
-       ('cmp', 'r1', 2),
-       ('bne', 'pv_m3'),
-       ('ldr_lit', 'r2', 'lit_vol_pend'),
-       ('movs', 'r3', SHUFFLE_KEY),  # repeat disc: Repeat (-> normal), then Shuffle
-       ('strb', 'r3', 'r2', 0),
-       ('b', 'pv_out'),
-       'pv_m3:',
-       ('cmp', 'r1', 3),
-       ('bne', 'pv_out'),
-       ('movs', 'r4', SHUFFLE_KEY),  # shuffle: Shuffle (-> normal)
-       'pv_out:',
-       ('mov', 'r0', 'r4'),
-       ('pop', reglist('r4', pc=True))] if PANEL_VOL_ON else []),
+        # panel_vol(r0 = key, r1 = from remote) -> key. The player's own Vol- / Vol+
+        # do nothing without a headphone; then Vol- toggles elapsed / remaining
+        # (like DISP) and Vol+ cycles normal -> repeat one -> repeat disc ->
+        # shuffle -> normal through the firmware's Repeat / Shuffle keys (from
+        # repeat disc: Repeat, then Shuffle on the next pass). Key events closer
+        # than 300 ms are one press (holding repeats, release after a hold).
+        *(['panel_vol:',
+           ('push', reglist('r4', lr=True)),
+           ('mov', 'r4', 'r0'),
+           ('cmp', 'r0', 0x10),
+           ('beq', 'pv_vol'),
+           ('cmp', 'r0', 0x11),
+           ('bne', 'pv_out'),
+           'pv_vol:',
+           ('cmp', 'r1', 0),
+           ('bne', 'pv_out'),            # remote: unchanged
+           ('ldr_lit', 'r1', 'lit_headphone'),
+           ('ldrb', 'r1', 'r1', 0),
+           ('cmp', 'r1', 1),
+           ('beq', 'pv_out'),            # headphone: volume
+           ('ldr_lit', 'r1', 'lit_power'),
+           ('ldrb', 'r1', 'r1', 0),
+           ('cmp', 'r1', 0),
+           ('beq', 'pv_out'),            # standby
+           ('ldr_lit', 'r3', 'lit_vol_t'),
+           ('ldrh', 'r1', 'r3', 0),
+           ('ldr_lit', 'r2', 'lit_clock_kh'),
+           ('ldrh', 'r2', 'r2', 0),
+           ('strh', 'r2', 'r3', 0),
+           ('subs', 'r1', 'r2', 'r1'),
+           ('uxth', 'r1', 'r1'),         # 75 ms steps since the previous event
+           ('ldr_lit', 'r3', 'lit_vol_last'),
+           ('ldrb', 'r2', 'r3', 0),
+           ('strb', 'r0', 'r3', 0),
+           ('cmp', 'r2', 'r0'),
+           ('bne', 'pv_new'),
+           ('cmp', 'r1', PANEL_VOL_HOLD_STEPS),
+           ('bhs', 'pv_new'),
+           ('movs', 'r4', 0xFF),         # same press
+           ('b', 'pv_out'),
+           'pv_new:',
+           ('cmp', 'r0', PANEL_VOLDN_KEY),
+           ('bne', 'pv_mode'),
+           ('movs', 'r4', 'VOLDN_FN'),   # the time toggle key if the remaining patch is built
+           ('b', 'pv_out'),
+           'pv_mode:',
+           ('ldr_lit', 'r1', 'lit_play_mode'),
+           ('ldrb', 'r1', 'r1', 0),
+           ('movs', 'r4', REPEAT_KEY),   # normal / repeat one: Repeat
+           ('cmp', 'r1', 2),
+           ('bne', 'pv_m3'),
+           ('ldr_lit', 'r2', 'lit_vol_pend'),
+           ('movs', 'r3', SHUFFLE_KEY),  # repeat disc: Repeat (-> normal), then Shuffle
+           ('strb', 'r3', 'r2', 0),
+           ('b', 'pv_out'),
+           'pv_m3:',
+           ('cmp', 'r1', 3),
+           ('bne', 'pv_out'),
+           ('movs', 'r4', SHUFFLE_KEY),  # shuffle: Shuffle (-> normal)
+           'pv_out:',
+           ('mov', 'r0', 'r4'),
+           ('pop', reglist('r4', pc=True))] if PANEL_VOL_ON else []),
 
-    # bright_load(): replaces the generic 1..6 clamp when the saved brightness
-    # is loaded, so level 0 (100 %) survives a power cycle. Anything else -> 3.
-    'bright_load:',
-    ('cmp', 'r0', 5),
-    ('bls', 'bright_ok'),
-    ('movs', 'r0', 3),
-    'bright_ok:',
-    ('bx_lr',),
-    ('align',),
-    'lit_ir_raw:',
-    ('word', IR_RAW),
-    'lit_ir_diag:',
-    ('word', IR_DIAG),
-    'lit_power:',
-    ('word', POWER_ON),
-    'lit_bright:',
-    ('word', BRIGHTNESS),
-    *(['lit_saver:', ('word', SAVER),
-       'lit_saver_setting:', ('word', SAVER_SETTING),
-       'lit_saver_text:', ('word', 'saver_text')] if SCREENSAVER_ON else []),
-    *(['lit_vol_pend:', ('word', PANEL_VOL_PEND),
-       'lit_vol_last:', ('word', PANEL_VOL_LAST),
-       'lit_vol_t:', ('word', PANEL_VOL_T),
-       'lit_ir_pending:', ('word', IR_PENDING),
-       'lit_headphone:', ('word', HEADPHONE),
-       'lit_clock_kh:', ('word', CLOCK_75MS),
-       'lit_play_mode:', ('word', PLAY_MODE)] if PANEL_VOL_ON else []),
-    'lit_level_text:',
-    ('word', 'osd_text'),
-    'osd_text:',                     # text pointer per level
-    *[('word', f'osd_text_{i}') for i in range(len(BRIGHT_OSD_TEXT))],
-    *[x for i, t in enumerate(BRIGHT_OSD_TEXT) for x in (f'osd_text_{i}:', ('bytes', t.encode() + b'\0'))],
-    *([('align',), 'saver_text:', *[('word', f'saver_text_{i}') for i in range(len(SAVER_TEXT))],
-       *[x for i, t in enumerate(SAVER_TEXT) for x in (f'saver_text_{i}:', ('bytes', t.encode() + b'\0'))]]
-      if SCREENSAVER_ON else []),
-]
+        # bright_load(): replaces the generic 1..6 clamp when the saved brightness
+        # is loaded, so level 0 (100 %) survives a power cycle. Anything else -> 3.
+        'bright_load:',
+        ('cmp', 'r0', 5),
+        ('bls', 'bright_ok'),
+        ('movs', 'r0', 3),
+        'bright_ok:',
+        ('bx_lr',),
+        ('align',),
+        'lit_ir_raw:',
+        ('word', IR_RAW),
+        'lit_ir_diag:',
+        ('word', IR_DIAG),
+        'lit_power:',
+        ('word', POWER_ON),
+        'lit_bright:',
+        ('word', BRIGHTNESS),
+        *(['lit_saver:', ('word', SAVER),
+           'lit_saver_setting:', ('word', SAVER_SETTING),
+           'lit_saver_text:', ('word', 'saver_text')] if saver else []),
+        *(['lit_vol_pend:', ('word', PANEL_VOL_PEND),
+           'lit_vol_last:', ('word', PANEL_VOL_LAST),
+           'lit_vol_t:', ('word', PANEL_VOL_T),
+           'lit_ir_pending:', ('word', IR_PENDING),
+           'lit_headphone:', ('word', HEADPHONE),
+           'lit_clock_kh:', ('word', CLOCK_75MS),
+           'lit_play_mode:', ('word', PLAY_MODE)] if PANEL_VOL_ON else []),
+        'lit_level_text:',
+        ('word', 'osd_text'),
+        'osd_text:',                     # text pointer per level
+        *[('word', f'osd_text_{i}') for i in range(len(BRIGHT_OSD_TEXT))],
+        *[x for i, t in enumerate(BRIGHT_OSD_TEXT) for x in (f'osd_text_{i}:', ('bytes', t.encode() + b'\0'))],
+        *([('align',), 'saver_text:', *[('word', f'saver_text_{i}') for i in range(len(texts))],
+           *[x for i, t in enumerate(texts) for x in (f'saver_text_{i}:', ('bytes', t.encode() + b'\0'))]]
+          if saver else []),
+    ]
 
 
 def patch_brightness(img):
     ensure_osd(img)
     voldn = TIME_KEY if 'remaining' in BUILD_NAMES else 0xFF
-    prog = [('movs', 'r4', voldn) if ins == ('movs', 'r4', 'VOLDN_FN') else ins for ins in resolve(KEY_HOOK)]
+    prog = resolve(key_hook_code('saver' in BUILD_NAMES))
+    prog = [('movs', 'r4', voldn) if ins == ('movs', 'r4', 'VOLDN_FN') else ins for ins in prog]
     cave, lab = assemble(prog, cave_addr(img))
     # main loop: bl get_key -> bl key_hook
     code, _ = assemble([('bl', lab['key_hook'])], 0x08004300)
@@ -2163,7 +2174,7 @@ SAVER_HIDE = (0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x2C, 0x30)  # ui slots hidden
                            # line 1, line 2, play, pause, stop, play mode, two status icons
 SAVER_CD = 0x24            # ui slot borrowed for the CD (hourglass / unused shuffle icon)
 SAVER_CD_SIZE = 64
-SAVER_CD_HEADER, SAVER_CD_DATA = lv_img_true_color_alpha(cd(SAVER_CD_SIZE), SAVER_CD_SIZE, SAVER_CD_SIZE)
+SAVER_CD_HEADER, SAVER_CD_DATA = lv_img_alpha4(cd(SAVER_CD_SIZE), SAVER_CD_SIZE, SAVER_CD_SIZE)  # 2 KB
 SHUFFLE_ICON = (0x08030338, 89, 4, 49, 27)  # ui+0x24 as setup_ui (0x08029184) leaves it: src, x, y, w, h
 SAVER_MAX_X = 230 - SAVER_CD_SIZE - 4       # the panel window hides the screen beyond x ~230
 SAVER_MAX_Y = 135 - SAVER_CD_SIZE
@@ -2171,14 +2182,21 @@ SAVER_IDLE_STEPS = SAVER_IDLE_S * 40 // 3   # in 75 ms steps
 SAVER_MOVE_STEPS = SAVER_MOVE_S * 40 // 3
 RAND = 0x08029C14          # C library rand()
 CD_STYLE = 0x200007C0      # style setup_ui gives ui+0x24 alone: image recolor white, recolor opa 0, opa 255
+                           # (the alpha-only CD is drawn in the recolor colour, which LVGL only
+                           # reads while the recolor opa is not 0)
 STYLE_SET_IMG_RECOLOR = 0x08029B5A      # setup_ui's helpers: (style, state, value)
 STYLE_SET_IMG_RECOLOR_OPA = 0x08029B8C
 REFRESH_STYLE = 0x08013C14  # lv_obj_refresh_style(obj, part, prop); LVGL caches "recolor transparent"
 STYLE_PROP_ALL = 0xFF
 
 
+def rgb565(c):
+    return (c >> 19 & 31) << 11 | (c >> 10 & 63) << 5 | (c >> 3 & 31)
+
+
 def saver_code(restore):
-    """restore = (src, x, y, w, h) of the borrowed object after the screensaver."""
+    """restore = (src, x, y, w, h) of the borrowed object after the screensaver
+    (SAVER_CD_ON), else None."""
     hide = []
     for n, slot in enumerate(SAVER_HIDE):
         skip = f'sh_skip{n}'
@@ -2212,14 +2230,19 @@ def saver_code(restore):
                 ('bl', STYLE_SET_IMG_RECOLOR_OPA)] + cd_obj(REFRESH_STYLE, 0, STYLE_PROP_ALL)
     n = len(SAVER_CD_COLOURS)
     assert n != 1, 'SAVER_CD_COLOURS: at least two colours, or none'
+    modes = len(SAVER_TEXT) - 1 + (len(SAVER_TEXT_CD) if SAVER_CD_ON else 0)   # without NONE
+    if not SAVER_CD_ON:
+        restore = (0, 0, 0, 0, 0)    # unused
     src, x, y, w, h = restore
     restore_code = (cd_obj(IMG_SET_SRC, 'lit_restore_src') + cd_obj(OBJ_SET_POS, x, y)
-                    + cd_obj(OBJ_SET_SIZE, w, h) + cd_obj(OBJ_SET_HIDDEN, 1)
-                    + (recolor_opa(0) if n else []))
-    cd_start = (cd_obj(IMG_SET_SRC, 'lit_cd_dsc') + cd_obj(OBJ_SET_SIZE, SAVER_CD_SIZE, SAVER_CD_SIZE)
-                + ([('ldrb', 'r0', 'r4', 6), ('cmp', 'r0', 4), ('bne', 'cd_white'),  # CD/c: tint at full strength
-                    ('ldr_lit', 'r0', 'lit_cd_style'), ('movs', 'r1', 0), ('movs', 'r2', 0xFF),
-                    ('bl', STYLE_SET_IMG_RECOLOR_OPA), 'cd_white:'] if n else []))
+                    + cd_obj(OBJ_SET_SIZE, w, h) + cd_obj(OBJ_SET_HIDDEN, 1) + recolor_opa(0))
+    # the CD (alpha only) in SAVER_CD_WHITE at full strength; CD/c's first move colours it
+    cd_start = ([('ldr_lit', 'r0', 'lit_cd_style'), ('movs', 'r1', 0), ('ldr_lit', 'r2', 'lit_cd_white'),
+                 ('bl', STYLE_SET_IMG_RECOLOR),
+                 ('ldr_lit', 'r0', 'lit_cd_style'), ('movs', 'r1', 0), ('movs', 'r2', 0xFF),
+                 ('bl', STYLE_SET_IMG_RECOLOR_OPA)]
+                + cd_obj(IMG_SET_SRC, 'lit_cd_dsc') + cd_obj(OBJ_SET_SIZE, SAVER_CD_SIZE, SAVER_CD_SIZE)
+                + cd_obj(REFRESH_STYLE, 0, STYLE_PROP_ALL))
     move = [('ldr_lit', 'r0', 'lit_ui'), ('ldr', 'r0', 'r0', SAVER_CD),
             ('ldrb', 'r1', 'r4', 8), ('ldrb', 'r2', 'r4', 9), ('bl', OBJ_SET_POS)]
     if n:
@@ -2277,6 +2300,7 @@ def saver_code(restore):
         ('ldr_lit', 'r0', 'lit_power'),
         ('ldrb', 'r0', 'r0', 0),
         ('cmp', 'r0', 0),
+    ] + ([
         ('bne', 'st_on'),
         ('ldrb', 'r0', 'r4', 4),
         ('cmp', 'r0', 0),
@@ -2286,6 +2310,9 @@ def saver_code(restore):
         ('blo', 'to_ret'),               # DIM / DARK
         ('b', 'st_hide'),
         'st_on:',
+    ] if SAVER_CD_ON else [
+        ('beq', 'to_ret'),
+    ]) + [
         # activity: a key (a disc going in or out, or playing, is not allowed below)
         ('ldr_lit', 'r3', 'lit_state'),
         ('ldrb', 'r1', 'r3', 4),
@@ -2318,7 +2345,7 @@ def saver_code(restore):
         ('ldr_lit', 'r0', 'lit_setting'),
         ('ldrb', 'r0', 'r0', 0),
         ('subs_i3', 'r0', 'r0', 2),      # DIM 0, DARK 1, CD/w 2, CD/c 3
-        ('cmp', 'r0', 3),
+        ('cmp', 'r0', modes - 1),
         ('bhi', 'to_wake'),              # NONE (or junk): no screensaver
         ('cbz', 'r6', 'st_idle'),
         'to_wake:',                      # conditional branches only reach 256 bytes
@@ -2356,16 +2383,19 @@ def saver_code(restore):
         ('mov', 'r0', 'r1'),             # already darker than the dim level: keep it
         'st_level:',
         ('bl', SET_BRIGHTNESS),
+    ] + ([
         ('cmp', 'r6', 2),
         ('blo', 'to_ret'),
         # CD: note what is visible, the CD image, first position
         *save,
         *cd_start,
         ('b', 'st_move'),
+        'to_ret2:',
+        ('b', 'st_ret'),
         'st_active:',
         ('ldrb', 'r0', 'r4', 6),
         ('cmp', 'r0', 3),
-        ('blo', 'to_ret'),               # DIM / DARK: nothing to do while it runs
+        ('blo', 'to_ret2'),              # DIM / DARK: nothing to do while it runs
         ('ldrh', 'r0', 'r4', 2),
         ('subs', 'r0', 'r5', 'r0'),
         ('uxth', 'r0', 'r0'),
@@ -2389,6 +2419,10 @@ def saver_code(restore):
         'st_hide:',                      # the display update shows its objects again every pass
         *hide,
         ('b', 'st_ret'),
+    ] if SAVER_CD_ON else [
+        'st_active:',                    # DIM / DARK: nothing to do while it runs
+        ('b', 'st_ret'),
+    ]) + [
         'st_wake:',
         ('strh', 'r5', 'r4', 0),         # idle time starts again
         ('ldrb', 'r0', 'r4', 4),
@@ -2399,12 +2433,14 @@ def saver_code(restore):
         ('ldr_lit', 'r0', 'lit_bright'),
         ('ldrb', 'r0', 'r0', 0),
         ('bl', SET_BRIGHTNESS),
+    ] + ([
         ('ldrb', 'r0', 'r4', 6),
         ('cmp', 'r0', 3),
         ('blo', 'st_redraw'),
         *restore_code,
         *show,
         'st_redraw:',
+    ] if SAVER_CD_ON else []) + [
         ('ldr_lit', 'r0', 'lit_last_min'),  # rewrite the time label
         ('movs', 'r1', 0xFF),
         ('str', 'r1', 'r0', 0),
@@ -2425,29 +2461,32 @@ def saver_code(restore):
         'lit_power:', ('word', POWER_ON),
         'lit_last_min:', ('word', LAST_SHOWN_MIN),
         'lit_redraw:', ('word', DISPLAY_REDRAW),
+    ] + ([
         'lit_cd_dsc:', ('word', 'cd_dsc'),
         'lit_restore_src:', ('word', src),
         'lit_cd_style:', ('word', CD_STYLE),
+        'lit_cd_white:', ('word', rgb565(SAVER_CD_WHITE)),
         'lit_palette:', ('word', 'palette'),
-        'palette:', *[('bytes', struct.pack('<H', (c >> 19 & 31) << 11 | (c >> 10 & 63) << 5 | (c >> 3 & 31)))
-                      for c in SAVER_CD_COLOURS],
+        'palette:', *[('bytes', struct.pack('<H', rgb565(c))) for c in SAVER_CD_COLOURS],
         ('align',),
         # lv_img_dsc_t: header, data_size, data
         'cd_dsc:', ('word', SAVER_CD_HEADER), ('word', len(SAVER_CD_DATA)), ('word', 'cd_data'),
         'cd_data:', ('bytes', SAVER_CD_DATA),
-    ]
+    ] if SAVER_CD_ON else [])
 
 
 def patch_saver(img):
-    assert SCREENSAVER_ON, 'the saver patch needs SCREENSAVER_ON (key_hook notes the keys)'
-    if 'hourglass' in EXPORTS:
+    if not SAVER_CD_ON:
+        restore = None
+    elif 'hourglass' in EXPORTS:
         restore = (EXPORTS['hourglass'], ICON_X, ICON_Y, ICON_SIZE, ICON_SIZE)
     else:
         restore = SHUFFLE_ICON
     cave, lab = assemble(saver_code(restore), cave_addr(img))
     put(img, lab['saver_tick'], cave)
     TICK_HOOKS.append(lab['saver_tick'])     # last: after play_icon / osd have set the icons
-    print(f"saver: saver_tick at {lab['saver_tick']:#x}, {len(cave)} bytes")
+    print(f"saver: saver_tick at {lab['saver_tick']:#x}, {len(cave)} bytes"
+          + (' (with CD)' if SAVER_CD_ON else ' (no CD)'))
 
 
 def patch_splash(img, version):

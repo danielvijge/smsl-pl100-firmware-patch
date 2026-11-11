@@ -95,3 +95,14 @@ def lv_img_true_color_alpha(alpha, w, h, rgb=(232, 232, 232)):
     data = b''.join(struct.pack('<HB', c565, a) for a in alpha)
     header = 5 | w << 10 | h << 21          # cf = TRUE_COLOR_ALPHA
     return header, data
+
+
+def lv_img_alpha4(alpha, w, h):
+    """(header, pixel data) for an LVGL v7 ALPHA_4BIT image: opacity only, 2
+    pixels per byte (left one in the high nibble), each row starting on a byte;
+    drawn in the object's image recolor colour."""
+    nib = [round(a * 15 / 255) for a in alpha]
+    rows = [nib[y * w:(y + 1) * w] + [0] * (w % 2) for y in range(h)]
+    data = bytes(r[x] << 4 | r[x + 1] for r in rows for x in range(0, len(r), 2))
+    header = 13 | w << 10 | h << 21         # cf = ALPHA_4BIT
+    return header, data
