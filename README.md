@@ -79,6 +79,11 @@ Optionally a version can be supplied. When supplied this version is shown on the
 boot, below the SMSL logo and "Ver 1.1". When omitted the splash screen remains unchanged.
 The version that can be downloaded here has all patches applied and displays the patch version number.
 
+The AI built a very configurable script where patches can be selectively applied, and often there are configuration
+options per patch as well through variables. I only ever test the version with all patches applied and the default
+configuration options. If you produce your own build with different options, this might or might not work as
+expected.
+
 ## Preparation before flashing
 
 To flash the firmware you need a Windows PC and a good USB-C cable. At least the connector that goes into
