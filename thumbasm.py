@@ -103,8 +103,10 @@ def assemble(prog, base):
             elif op == 'bics':
                 h = 0x4380 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'lsls':  # lsls rd, rm, #imm
+                assert 0 <= a[2] < 32, ins
                 h = 0x0000 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'lsrs':  # lsrs rd, rm, #imm
+                assert 0 <= a[2] < 32, ins
                 h = 0x0800 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'ands':  # ands rdn, rm
                 h = 0x4000 | reg(a[1]) << 3 | reg(a[0])
@@ -115,6 +117,7 @@ def assemble(prog, base):
             elif op == 'subs':  # subs rd, rn, rm
                 h = 0x1A00 | reg(a[2]) << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'subs_i3':
+                assert 0 <= a[2] < 8, ins
                 h = 0x1E00 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'str_sp':  # str rt, [sp, #imm]
                 assert a[1] % 4 == 0 and a[1] < 1024
@@ -132,16 +135,19 @@ def assemble(prog, base):
                 assert a[2] < 32
                 h = 0x7000 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'movs':
-                assert 0 <= a[1] < 256
+                assert 0 <= a[1] < 256, ins
                 h = 0x2000 | reg(a[0]) << 8 | a[1]
             elif op == 'cmp':
                 if isinstance(a[1], str):
                     h = 0x4280 | reg(a[1]) << 3 | reg(a[0])
                 else:
+                    assert 0 <= a[1] < 256, ins
                     h = 0x2800 | reg(a[0]) << 8 | a[1]
             elif op == 'adds_i8':
+                assert 0 <= a[1] < 256, ins
                 h = 0x3000 | reg(a[0]) << 8 | a[1]
             elif op == 'adds_i3':
+                assert 0 <= a[2] < 8, ins
                 h = 0x1C00 | a[2] << 6 | reg(a[1]) << 3 | reg(a[0])
             elif op == 'adds':
                 h = 0x1800 | reg(a[2]) << 6 | reg(a[1]) << 3 | reg(a[0])

@@ -2180,6 +2180,8 @@ SAVER_MAX_X = 230 - SAVER_CD_SIZE - 4       # the panel window hides the screen 
 SAVER_MAX_Y = 135 - SAVER_CD_SIZE
 SAVER_IDLE_STEPS = SAVER_IDLE_S * 40 // 3   # in 75 ms steps
 SAVER_MOVE_STEPS = SAVER_MOVE_S * 40 // 3
+assert 0 < SAVER_IDLE_STEPS < 0x10000 and 0 < SAVER_MOVE_STEPS < 0x10000, \
+    'SAVER_IDLE_S / SAVER_MOVE_S: 1 s .. 81 min (16-bit 75 ms clock)'
 RAND = 0x08029C14          # C library rand()
 CD_STYLE = 0x200007C0      # style setup_ui gives ui+0x24 alone: image recolor white, recolor opa 0, opa 255
                            # (the alpha-only CD is drawn in the recolor colour, which LVGL only
@@ -2399,7 +2401,8 @@ def saver_code(restore):
         ('ldrh', 'r0', 'r4', 2),
         ('subs', 'r0', 'r5', 'r0'),
         ('uxth', 'r0', 'r0'),
-        ('cmp', 'r0', SAVER_MOVE_STEPS),
+        ('ldr_lit', 'r1', 'lit_move'),   # (a literal: SAVER_MOVE_S > 19 does not fit cmp #imm8)
+        ('cmp', 'r0', 'r1'),
         ('blo', 'st_hide'),
         'st_move:',
         ('strh', 'r5', 'r4', 2),
@@ -2462,6 +2465,7 @@ def saver_code(restore):
         'lit_last_min:', ('word', LAST_SHOWN_MIN),
         'lit_redraw:', ('word', DISPLAY_REDRAW),
     ] + ([
+        'lit_move:', ('word', SAVER_MOVE_STEPS),
         'lit_cd_dsc:', ('word', 'cd_dsc'),
         'lit_restore_src:', ('word', src),
         'lit_cd_style:', ('word', CD_STYLE),
