@@ -65,6 +65,13 @@ Patch 5 - track time remaining, with an hourglass icon.
   * PREGAP_MINUS_ON: the gap before a track, which the module counts down,
     is shown as "-0.03".."-0.01" (rounded up) in both modes. Needs cdtime's
     gap detection (added automatically).
+  * REMAINING_ADD_S: the module's track length is the time from this track's
+    start to the next one's minus 2 s (tested on discs with no gap and with
+    0.3, 5 and 35.7 s gaps). Remaining time adds it back, so it counts down to
+    the start of the next track's music: gapless tracks end at 0:00, a track
+    before a g-second gap ends at g, then the gap counts down from -g (the
+    track number changes when the gap starts). Display only: the stored length
+    (end-of-track check, length request) stays as reported.
 
 Patch shuffle - true shuffle and a safer end-of-track check.
   * Repeat and shuffle are one play mode (0x20000189: 0 normal, 1 repeat one,
@@ -325,6 +332,7 @@ IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagn
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
+REMAINING_ADD_S = 2        # added to the module's track length for remaining time (0..255; 0 = as reported)
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
@@ -982,6 +990,7 @@ FMT_TIME = [
     ('muls', 'r1', 'r0'),
     ('adds', 'r1', 'r1', 'r2'),      # length in s
     ('cbz', 'r1', 'show'),
+    *([('adds_i8', 'r1', REMAINING_ADD_S)] if REMAINING_ADD_S else []),   # the module's 2 s
     ('muls', 'r4', 'r0'),
     ('adds', 'r4', 'r4', 'r5'),      # elapsed in s
     ('subs', 'r1', 'r1', 'r4'),
