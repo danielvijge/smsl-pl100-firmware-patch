@@ -11,15 +11,15 @@ It adds the following fixes and enhancements:
 1. Instead of `Tr03` display `03/09`, where `09` is the total number of tracks on the CD.
 2. Option to change the brightness of the display using six settings using the remote's FN button. The brightness
 percentage is shown on the screen, briefly replacing the track number, similar to the volume indicator.
-3. Show `-0.02` (and counting down) for gaps between tracks. 
+3. Show `-0.02` (and counting down) for gaps between tracks in time elapsed mode.
 4. Toggle between elapsed time and remaining time of a track using the remote's DISP button. When displaying remaining
 time it displays an hourglass icon. The time remaining of a new track should be correct within 0-2 seconds of starting
-the track. If not headphone is connected, remaining time can also be toggled by the vol- button on the player, but not
-vol- on the remote.
+the track. If no headphone is connected, remaining time can also be toggled by the vol- button on the player, but not
+vol- on the remote. The track always changes at `00.00` regardless of gap length or gapless discs.
 5. Option to automatically play when inserting a disc.
    * When no disc is loaded (screen showing `Disc`) press the play button to enable auto play. The play icon is shown on
-   the screen, and in the top right is briefly shows `AUTO`. Inserting a disc will automatically start playing it. This
-   mode is remember, also when putting the player in standby mode or removing power altogether.
+   the screen, and in the top right it briefly shows `AUTO`. Inserting a disc will automatically start playing it. This
+   mode is remembered, also when putting the player in standby mode or removing power altogether.
 6. The vol- and vol+ buttons on the player now have a function when no headphone is plugged in.
    * Vol- toggles time remaining/time elapsed
    * Vol+ toggles between repeat-one, repeat-all, shuffle, and normal mode.
@@ -27,7 +27,7 @@ vol- on the remote.
    * `NONE`: screen saver is not enabled.
    * `DIM`: screen dims to the lowest brightness. If the screen is already at 10% this has no noticeable effect.
    * `DARK`: screen goes completely off.
-   * `CD/w`: A CD icon is shown at a random position on the screen, changing every 10 seconds. (`/w` for white)
+   * `CD/w`: A CD icon is shown at a random position on the screen, changing every 10 seconds, as well as dimming the screen to 10%. (`/w` for white)
    * `CD/c`: Similar to `CD/w`, but now the CD icon also changes to a random colour. (`/c` for colour)
 
 **Bug fixes:**
@@ -42,9 +42,20 @@ fade-out, so it might not have always been noticeable.
 6. Gapless playback even after using fast forward or rewind. In the original firmware it would add a small delay after
 seeking in a track.
 7. Skipping seconds is no longer there. The CD module sends the current time every second. As a result the time on the
-screen is updated. About 7% of these message are corrupted. When that happens the time remains the same. The next good
-message would then change again the time. The display could show `00:22` -> `0:22` -> `0:24`. This is resolved by always
+screen is updated. About 7% of these messages are corrupted. When that happens the time remains the same. The next good
+message would then change again the time. The display could show `00:22` -> `00:22` -> `00:24`. This is resolved by always
 changing the time, even if there is a corrupt time message.
+8. Changing tracks by entering a number on the remote has a number of fixes. In the original firmware, entering a track number
+above 39 was not possible. Entering a number above the disc's length would play the last track. In the patched firmware:
+   * Entering a number (for example 1) displays `Tr1-` on the screen, indicating that another number can be entered.
+   * If another valid number is entered, that is shown and it immediately jumps to that track.
+   * If nothing is entered after `Tr1-`, after 2.25 seconds it jumps to track 1.
+   * If the first number only can lead to one track, it immediately jumps to that track (e.g. `Tr8` on a 12 track disc will not show `Tr8-`
+     to wait for another number. Nothing after 8 can produce a valid track number so it jumps immediately to track 8).
+   * To immediately jump to a track below 10 (if higher track exists) enter `Tr02`. This jumps immediately. Entering `Tr2-` will jump to 
+     track 2 after 2.25 seconds.
+   * If an invalid track number is entered, nothing happens (e.g. `0` or a number higher than the total tracks).
+   
 
 ## Original firmware
 
@@ -72,7 +83,7 @@ Clone this repository and run:
 build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
 ```
 
-Options for patches are: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless, screen.
+Options for patches are: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless, number, saver.
 When nothing is specified, all patches are applied.
 
 Optionally a version can be supplied. When supplied this version is shown on the splash screen during
@@ -88,7 +99,7 @@ expected.
 
 To flash the firmware you need a Windows PC and a good USB-C cable. At least the connector that goes into
 the CD player needs to be USB-C, the end that connects to your PC can be anything. I tried different USB
-cable and only quality ones work correctly. Lesser quality can power the CD player, but the PC will not
+cables and only quality ones work correctly. Lesser quality can power the CD player, but the PC will not
 connect to the player.
 
 Before flashing your CD player can be at version 1.0 or 1.1. It should not be needed to first flash the original
@@ -97,9 +108,9 @@ version 1.1. The version installed is shown when powering on the player, below t
 ## Steps to flash the patched firmware
 
 :warning: Flash firmware at your own risk. In my testing it was all safe. The firmware itself does not contain the code
-to flash the firmware, this is on a different chip. So even if flashing fails you should always be able to flash
-the original firmware again. However, do understand that this is not a guarantee. You accept the risk by flashing
-this patched firmware.
+to flash the firmware, this is on a different part of the chip that a flash cannot touch. So even if flashing fails you
+should always be able to flash the original firmware again. However, do understand that this is not a guarantee. You
+accept the risk by flashing this patched firmware.
 
 1. Download the firmware from the [release page](https://github.com/danielvijge/smsl-pl100-firmware-patch/releases).
 2. Download the [flash utility from SMSL](https://www.smsl-audio.com/upload/portal/undefined/SMSLPL200MCUFW24126.zip). This is the firmware for a different CD player (PL200), but we only need the flash utility contained in the zip file.
@@ -121,5 +132,5 @@ this patched firmware.
 
 ## Licence
 
-The original firmware [IAP_PL100_1v1_b250219.hex](IAP_PL100_1v1_b250219.hex) owned by SMSL and does not fall under any open source licence.
+The original firmware [IAP_PL100_1v1_b250219.hex](IAP_PL100_1v1_b250219.hex) is owned by SMSL and does not fall under any open source licence.
 All other files are licensed under the MIT License. See [LICENSE-MIT](LICENSE-MIT).
