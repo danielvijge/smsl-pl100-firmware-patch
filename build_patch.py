@@ -170,6 +170,22 @@ Patch 7 - gaps between tracks after fast forward / rewind.
     later track change has a gap, until Play is pressed again.
   * Send 0x25 before that play command, as the Play key does.
 
+Patch number - track number entry on the remote.
+  * The digit keys build a number (0x20000182) shown as "Tr12" on line 2;
+    2.25 s after the last digit (timer 0x20000186, in the TIM1 interrupt) the
+    firmware presses Play, which plays that track. A helper (0x0800E518)
+    starts it at once when no further digit seems possible, with fixed
+    limits per disc size: on discs with 30-99 tracks every number from 4 on,
+    so 40-99 could never be entered (likewise 160-199 on 100-199 tracks). A
+    number above the track count played the last track.
+  * Now another digit can follow while number x 10 <= track count and fewer
+    digits were typed than the track count has; line 2 then shows a "-"
+    ("Tr1-"), and the number plays after the 2.25 s. Otherwise it plays at
+    once. Digits show as typed, so a leading 0 is a quick way to a track
+    below 10 ("0" "2" on a 50-track disc plays track 2 at once; "Tr05-" on
+    a disc with 100 or more). A number above the track count, or only
+    zeros, cancels the entry: the time shows again and play goes on.
+
 Patch saver - screensaver while stopped.
   * After SAVER_IDLE_S without a key (remote, panel or knob), while stopped
     with a disc (TOC read) or at the empty slot ("Disc"), the backlight dims to SAVER_DIM_LEVEL (not saved)
@@ -213,7 +229,7 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
 
 Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
   patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless,
-           saver (default: all)
+           number, saver (default: all)
 """
 import argparse
 import struct
@@ -2279,6 +2295,183 @@ def patch_gapless(img):
     print(f"gapless: seek_end at {lab['seek_end']:#x}, {len(cave)} bytes")
 
 
+# Number entry (see "Patch number"). The digit key handlers (0x0800E8C2..,
+# keys 1-9 and 0x0A for 0) each start with mov.w r0, #300 (the timer), then
+# update NEXT_TRACK / NEXT_FLAG, call the helper 0x0800E518 and sprintf
+# "Tr%d" into the line 2 text.
+NUM_ENTRY = 0x2000029F     # u8 spare (dead menu table): digits typed, bit 7 another may follow
+NUM_TIMER = 0x20000186     # u16 TIM1 ticks until the entry plays (Play key, 0x0800E202)
+NUM_SHOWN = 0x20000188     # u8: line 2 shows the entry, not the time
+NUM_HELPER = 0x0800E518
+NUM_TIMEOUT_SITE = 0x0800E202  # bl PLAY_HANDLER, in the TIM1 interrupt when the timer runs out
+SPRINTF = 0x0802A2EC
+NUM_DIGIT_KEYS = (0x0800E8C2, 0x0800E94E, 0x0800E9BA, 0x0800EA26, 0x0800EA92,
+                  0x0800EAFE, 0x0800EB6A, 0x0800EBD6, 0x0800EC42, 0x0800ECAE)  # keys 0x0A, 1..9
+NUM_SPRINTF_SITES = (0x0800E934, 0x0800E9A0, 0x0800EA0C, 0x0800EA78, 0x0800EAE4,
+                     0x0800EB50, 0x0800EBBC, 0x0800EC28, 0x0800EC94, 0x0800ED00)  # their bl sprintf
+NUM_WAIT = 300             # the firmware's 2.25 s (7.5 ms ticks)
+
+NUMBER = [
+    # num_pre(): replaces mov.w r0, #300 at the start of each digit key
+    'num_pre:',
+    ('ldr_lit', 'r1', 'lit_flag'),
+    ('ldrb', 'r1', 'r1', 0),
+    ('cbnz', 'r1', 'np_more'),
+    ('ldr_lit', 'r1', 'lit_entry'),  # a new entry: no digits yet
+    ('movs', 'r0', 0),
+    ('strb', 'r0', 'r1', 0),
+    'np_more:',
+    ('ldr_lit', 'r0', 'lit_wait'),
+    ('bx_lr',),
+
+    # num_check(): replaces the helper; NEXT_TRACK has the new digit
+    'num_check:',
+    ('push', reglist('r4', 'r5', lr=True)),
+    ('ldr_lit', 'r3', 'lit_entry'),
+    ('ldrb', 'r4', 'r3', 0),
+    ('lsls', 'r4', 'r4', 25),
+    ('lsrs', 'r4', 'r4', 25),
+    ('cmp', 'r4', 4),
+    ('bhs', 'nc_count'),             # (only zeros keep the number small)
+    ('adds_i8', 'r4', 1),            # digits typed
+    'nc_count:',
+    ('ldr_lit', 'r1', 'lit_total'),
+    ('ldr', 'r1', 'r1', 0),
+    ('ldr_lit', 'r2', 'lit_next'),
+    ('ldrh', 'r2', 'r2', 0),
+    ('cmp', 'r2', 'r1'),
+    ('bhi', 'nc_cancel'),            # above the track count
+    ('movs', 'r5', 10),
+    ('movs', 'r0', 1),               # digits of the track count
+    ('movs', 'r3', 10),
+    'nc_digits:',
+    ('cmp', 'r1', 'r3'),
+    ('blo', 'nc_has'),
+    ('adds_i8', 'r0', 1),
+    ('muls', 'r3', 'r5'),
+    ('cmp', 'r0', 4),
+    ('blo', 'nc_digits'),
+    'nc_has:',
+    ('cmp', 'r4', 'r0'),
+    ('bhs', 'nc_last'),
+    ('mov', 'r3', 'r2'),
+    ('muls', 'r3', 'r5'),
+    ('cmp', 'r3', 'r1'),
+    ('bhi', 'nc_last'),
+    ('movs', 'r0', 0x80),            # another digit may follow: wait the 2.25 s
+    ('orrs', 'r4', 'r0'),
+    ('b', 'nc_store'),
+    'nc_last:',
+    ('cbnz', 'r2', 'nc_play'),
+    'nc_cancel:',
+    ('movs', 'r0', 0),               # number 0: the timeout cancels the entry
+    ('ldr_lit', 'r3', 'lit_next'),
+    ('strh', 'r0', 'r3', 0),
+    'nc_play:',
+    ('ldr_lit', 'r3', 'lit_timer'),
+    ('movs', 'r0', 2),               # 15 ms
+    ('strh', 'r0', 'r3', 0),
+    'nc_store:',
+    ('ldr_lit', 'r3', 'lit_entry'),
+    ('strb', 'r4', 'r3', 0),
+    ('pop', reglist('r4', 'r5', pc=True)),
+
+    # num_text(buf, -, -, number): replaces sprintf(buf, "%s%d", "Tr", number):
+    # "Tr" + the digits as typed (leading zeros) + "-" while another may follow
+    'num_text:',
+    ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+    ('movs', 'r1', 0x54),            # 'T'
+    ('strb', 'r1', 'r0', 0),
+    ('movs', 'r1', 0x72),            # 'r'
+    ('strb', 'r1', 'r0', 1),
+    ('ldr_lit', 'r1', 'lit_entry'),
+    ('ldrb', 'r1', 'r1', 0),
+    ('lsls', 'r1', 'r1', 25),
+    ('lsrs', 'r1', 'r1', 25),
+    ('cbnz', 'r1', 'nt_count'),
+    ('movs', 'r1', 1),
+    'nt_count:',
+    ('adds_i3', 'r2', 'r0', 2),      # first digit
+    ('adds', 'r4', 'r2', 'r1'),      # after the last
+    ('mov', 'r1', 'r4'),
+    ('movs', 'r5', 10),
+    'nt_digit:',
+    ('subs_i3', 'r1', 'r1', 1),
+    ('udiv', 'r6', 'r3', 'r5'),
+    ('mov', 'r7', 'r6'),
+    ('muls', 'r7', 'r5'),
+    ('subs', 'r7', 'r3', 'r7'),
+    ('adds_i8', 'r7', 0x30),
+    ('strb', 'r7', 'r1', 0),
+    ('mov', 'r3', 'r6'),
+    ('cmp', 'r1', 'r2'),
+    ('bhi', 'nt_digit'),
+    ('ldr_lit', 'r1', 'lit_entry'),
+    ('ldrb', 'r1', 'r1', 0),
+    ('lsrs', 'r1', 'r1', 7),
+    ('cbz', 'r1', 'nt_end'),
+    ('movs', 'r1', 0x2D),            # '-'
+    ('strb', 'r1', 'r4', 0),
+    ('adds_i8', 'r4', 1),
+    'nt_end:',
+    ('movs', 'r1', 0),
+    ('strb', 'r1', 'r4', 0),
+    ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+    # num_timeout(): replaces bl PLAY_HANDLER when the timer runs out (TIM1
+    # interrupt): an entry with number 0 is cancelled instead of played
+    'num_timeout:',
+    ('ldr_lit', 'r0', 'lit_flag'),
+    ('ldrb', 'r1', 'r0', 0),
+    ('cbz', 'r1', 'nto_play'),
+    ('ldr_lit', 'r2', 'lit_next'),
+    ('ldrh', 'r3', 'r2', 0),
+    ('cbnz', 'r3', 'nto_play'),
+    ('movs', 'r1', 0),
+    ('strb', 'r1', 'r0', 0),
+    ('ldr_lit', 'r0', 'lit_shown'),
+    ('strb', 'r1', 'r0', 0),         # line 2: the time again
+    ('ldr_lit', 'r0', 'lit_entry'),
+    ('strb', 'r1', 'r0', 0),
+    ('ldr_lit', 'r0', 'lit_last_min'),
+    ('movs', 'r1', 0xFF),
+    ('str', 'r1', 'r0', 0),
+    ('ldr_lit', 'r0', 'lit_redraw'),
+    ('movs', 'r1', 1),
+    ('strb', 'r1', 'r0', 0),
+    ('bx_lr',),
+    'nto_play:',
+    ('b.w', PLAY_HANDLER),
+    ('align',),
+    'lit_flag:', ('word', NEXT_FLAG),
+    'lit_next:', ('word', NEXT_TRACK),
+    'lit_entry:', ('word', NUM_ENTRY),
+    'lit_wait:', ('word', NUM_WAIT),
+    'lit_total:', ('word', CD_STATE + 0xF4),
+    'lit_timer:', ('word', NUM_TIMER),
+    'lit_shown:', ('word', NUM_SHOWN),
+    'lit_last_min:', ('word', LAST_SHOWN_MIN),
+    'lit_redraw:', ('word', DISPLAY_REDRAW),
+]
+
+
+def patch_number(img):
+    cave, lab = assemble(NUMBER, cave_addr(img))
+    for handler, call in zip(NUM_DIGIT_KEYS, NUM_SPRINTF_SITES):
+        site, _ = assemble([('bl', lab['num_pre'])], handler)
+        patch(img, handler, bytes.fromhex('4ff49670'), site)       # mov.w r0, #300
+        old, _ = assemble([('bl', SPRINTF)], call)
+        site, _ = assemble([('bl', lab['num_text'])], call)
+        patch(img, call, old, site)
+    site, _ = assemble([('b.w', lab['num_check'])], NUM_HELPER)
+    patch(img, NUM_HELPER, bytes.fromhex('f948d0f8'), site)        # ldr r0, =CD_STATE; ldr.w ...
+    old, _ = assemble([('bl', PLAY_HANDLER)], NUM_TIMEOUT_SITE)
+    site, _ = assemble([('bl', lab['num_timeout'])], NUM_TIMEOUT_SITE)
+    patch(img, NUM_TIMEOUT_SITE, old, site)
+    put(img, lab['num_pre'], cave)
+    print(f"number: num_check at {lab['num_check']:#x}, {len(cave)} bytes")
+
+
 # saver_tick(): tick hook for the screensaver (see "Patch saver"). r4 = SAVER
 # throughout; r5 = now (CLOCK_75MS).
 SAVER_HIDE = (0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x2C, 0x30)  # ui slots hidden while it runs:
@@ -2644,7 +2837,8 @@ def remap_buttons(img, names):
 
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
-           'brightness': patch_brightness, 'gapless': patch_gapless, 'saver': patch_saver}
+           'brightness': patch_brightness, 'gapless': patch_gapless, 'number': patch_number,
+           'saver': patch_saver}
 # 'play' relies on disctime clearing the disc-ready state when the tray opens;
 # the gap display in 'remaining' needs cdtime's gap detection; cdtime's length request
 # needs the track of the stored length, which 'shuffle' notes
