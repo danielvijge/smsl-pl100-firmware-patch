@@ -63,8 +63,11 @@ Patch 5 - track time remaining, with an hourglass icon.
     REMAINING_ICON_ON = False leaves the icon (code, image and hooks) out.
   * The mode lives in spare byte 0x20000239.
   * PREGAP_MINUS_ON: the gap before a track, which the module counts down,
-    is shown as "-0.03".."-0.01" (rounded up) in both modes. Needs cdtime's
-    gap detection (added automatically).
+    is shown as "-0.03".."-0.01" (rounded up). Needs cdtime's gap detection
+    (added automatically). In remaining mode without the "-" ("0.03".."0.01",
+    unless PREGAP_MINUS_REMAINING): with REMAINING_ADD_S the track ends at
+    the gap's length, so the gap continues the count down to 0:00, where the
+    next track's music starts.
   * REMAINING_ADD_S: the module's track length is the time from this track's
     start to the next one's minus 2 s (tested on discs with no gap and with
     0.3, 5 and 35.7 s gaps). Remaining time adds it back, so it counts down to
@@ -346,6 +349,7 @@ REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-t
 TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
 TIME_FILL_PHASE_ON = True  # time fill on the tracked start of each second, not 1.125 s after a message
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
+PREGAP_MINUS_REMAINING = False  # also the "-" in remaining mode (else "0.02": counts on to 0:00)
 REMAINING_ADD_S = 2        # added to the module's track length for remaining time (0..255; 0 = as reported)
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
@@ -1029,6 +1033,10 @@ FMT_TIME = [
     *([('ldr_lit', 'r0', 'lit_pregap'),
        ('ldrb', 'r0', 'r0', 0),
        ('cbz', 'r0', 'fmt_done'),
+       *([] if PREGAP_MINUS_REMAINING else
+         [('ldr_lit', 'r0', 'lit_mode'),
+          ('ldrb', 'r0', 'r0', 0),
+          ('cbnz', 'r0', 'fmt_done')]),   # remaining mode: no '-'
        ('movs', 'r0', 0),
        ('movs', 'r1', 0x2D),         # '-' over the minutes' tens digit: "-0.03"
        ('bl', PUT_CHAR_L2),
