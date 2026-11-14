@@ -192,7 +192,14 @@ Boot screen version (--version) - "patch VERSION" below "Ver 1.1".
     the same 12x16 font, centred, 12 px per char (max 18 chars).
   * Without --version the boot screen stays original.
 
-Usage: build_patch.py [--version VERSION] <original.hex> <patched.hex> [patch,...]
+Track end diagnostic (--track-diag) - for investigation only, not for normal use.
+  * Why remaining time often ends at 0:02: instead of the normal display,
+    shows the CD module's length and time messages with their frames (1/75 s,
+    which the firmware drops) and, at every track change, what the finished
+    track ended with. See track_diag() for the screen layout.
+  * Needs cdtime (gap detection) and shuffle; not with saver (same RAM).
+
+Usage: build_patch.py [--version VERSION] [--track-diag] <original.hex> <patched.hex> [patch,...]
   patches: track, backlight, disctime, shuffle, play, cdtime, remaining, brightness, gapless,
            saver (default: all)
 """
@@ -2531,6 +2538,480 @@ def remap_buttons(img, names):
             patch(img, IR_TABLE + ir, bytes([key]), bytes([new]))
 
 
+# --- Track end diagnostic (--track-diag) -------------------------------------
+# Replaces the normal display (LVGL keeps running, its flush does nothing)
+# with 8 text lines, drawn straight to the LCD in the boot screen font:
+#   0  T05 3:12.00        last time message: track, elapsed m:ss.ff (frames
+#                         1/75 s); in the gap before a track "-0:02.40 GAP"
+#   1  L05 3:58.40        last track length message: its track, m:ss.ff
+#   2  R 0:46             length - elapsed in whole seconds (what remaining
+#                         time shows), "?" while the length is for another track
+#   3  TRACK ENDS:
+#   4  05 L3:58.40 R0:02  last finished track: its length (L? = none
+#   5    E3:56.00 G-2.40  received), remaining at its end, its last elapsed
+#                         time, then the first message after it: G = gap
+#                         countdown s.ff, N = next track already at s.ff
+#   6-7                   the track change before that
+# A track change is any time message with another track than the previous
+# one (also Next/Prev or a new disc).
+TD = 0x20000430            # 36 bytes spare (dead menu tables; the saver's RAM, so no saver):
+                           # +0 length msg track, m, s, f; +4 time msg track, m, s, f;
+                           # +8, +18 track ends (10 bytes: track, L m s f, E m s f,
+                           # next s f... see td_msg), +28 dirty bits, +29 screen cleared,
+                           # +32 u32 magic
+TD_MAGIC = 0x47414454      # 'TDAG'
+CD_MSG = CD_STATE + 0x8E   # [len][class][type][data..][chk] of the last message
+CD_FLAGS = CD_STATE + 0x118  # bit 16: last message had a good checksum
+CD_PARSE = 0x0800D890      # parse the received message (called at 0x0800E0A2)
+SPLASH = 0x08004AFA        # boot screen, drawn on every wake (called at 0x0800A868)
+LCD_CLEAR = 0x08008E90     # whole panel black (direct, not LVGL)
+LV_FLUSH_PTR = 0x08028114  # literal: LVGL display driver flush_cb (0x08028065)
+LV_FLUSH_READY = 0x080283EE  # lv_disp_flush_ready(drv)
+TD_COL0, TD_ROW0, TD_ROW_END = 3, 6, 6 + 12 * 19   # panel col = screen y, row = screen x
+WHITE, YELLOW, CYAN, GREEN = 0xFFFF, 0xFFE0, 0x07FF, 0x07E0
+
+
+def track_diag():
+    def col(line):
+        return TD_COL0 + 16 * line
+
+    def ch(c):
+        return [('movs', 'r0', ord(c)), ('bl', 'pc_char')]
+
+    return [
+        # LVGL flush_cb: draw nothing, report done
+        'td_flush:',
+        ('b.w', LV_FLUSH_READY),
+
+        # replaces bl SPLASH on wake: clear the screen again afterwards
+        'td_wake:',
+        ('ldr_lit', 'r0', 'lit_td'),
+        ('movs', 'r1', 0),
+        ('strb', 'r1', 'r0', 29),
+        ('b.w', SPLASH),
+
+        # first call after reset: the area still holds the menu tables
+        'td_init:',
+        ('ldr_lit', 'r0', 'lit_td'),
+        ('ldr', 'r1', 'r0', 32),
+        ('ldr_lit', 'r2', 'lit_magic'),
+        ('cmp', 'r1', 'r2'),
+        ('beq', 'ti_done'),
+        ('str', 'r2', 'r0', 32),
+        ('movs', 'r1', 0),
+        ('movs', 'r3', 8),
+        'ti_loop:',
+        ('str', 'r1', 'r0', 0),
+        ('adds_i8', 'r0', 4),
+        ('subs_i3', 'r3', 'r3', 1),
+        ('bne', 'ti_loop'),
+        'ti_done:',
+        ('bx_lr',),
+
+        # replaces bl CD_PARSE: parse, then note length / time messages
+        'td_msg:',
+        ('push', reglist('r4', 'r5', 'r6', lr=True)),
+        ('bl', 'td_init'),
+        ('ldr_lit', 'r0', 'lit_flags'),
+        ('ldr', 'r0', 'r0', 0),
+        ('ldr_lit', 'r1', 'lit_bit16'),
+        ('ands', 'r0', 'r1'),
+        ('mov', 'r5', 'r0'),             # good checksum
+        ('bl', CD_PARSE),                # (time messages: cdtime sets PREGAP)
+        ('cmp', 'r5', 0),
+        ('beq', 'td_done'),
+        ('ldr_lit', 'r4', 'lit_msg'),
+        ('ldr_lit', 'r6', 'lit_td'),
+        ('ldrb', 'r0', 'r4', 1),
+        ('cmp', 'r0', 4),                # class 4
+        ('bne', 'td_done'),
+        ('ldrb', 'r0', 'r4', 2),
+        ('cmp', 'r0', 0x20),
+        ('beq', 'td_len'),
+        ('cmp', 'r0', 0x21),
+        ('bne', 'td_done'),
+        # time message: +0x99 track, +0x9B m, +0x9C s, +0x9D frames
+        ('ldrb', 'r0', 'r4', 11),
+        ('ldrb', 'r1', 'r6', 4),
+        ('cmp', 'r0', 'r1'),
+        ('beq', 'td_time'),
+        ('cmp', 'r1', 0),
+        ('beq', 'td_time'),
+        # track change: the previous end moves down, then note this one:
+        # track, L m s f (L m = 0xFF: no length for it), E m s f, next s f, gap
+        ('movs', 'r2', 9),
+        'td_shift:',
+        ('adds', 'r3', 'r6', 'r2'),
+        ('ldrb', 'r0', 'r3', 8),
+        ('strb', 'r0', 'r3', 18),
+        ('subs_i3', 'r2', 'r2', 1),
+        ('bpl', 'td_shift'),
+        ('ldrb', 'r1', 'r6', 4),
+        ('strb', 'r1', 'r6', 8),
+        ('ldrb', 'r0', 'r6', 0),
+        ('cmp', 'r0', 'r1'),
+        ('bne', 'td_nolen'),
+        ('ldrb', 'r0', 'r6', 1),
+        ('strb', 'r0', 'r6', 9),
+        ('ldrb', 'r0', 'r6', 2),
+        ('strb', 'r0', 'r6', 10),
+        ('ldrb', 'r0', 'r6', 3),
+        ('strb', 'r0', 'r6', 11),
+        ('b', 'td_end_e'),
+        'td_nolen:',
+        ('movs', 'r0', 0xFF),
+        ('strb', 'r0', 'r6', 9),
+        'td_end_e:',
+        ('ldrb', 'r0', 'r6', 5),
+        ('strb', 'r0', 'r6', 12),
+        ('ldrb', 'r0', 'r6', 6),
+        ('strb', 'r0', 'r6', 13),
+        ('ldrb', 'r0', 'r6', 7),
+        ('strb', 'r0', 'r6', 14),
+        ('ldrb', 'r0', 'r4', 14),
+        ('strb', 'r0', 'r6', 15),
+        ('ldrb', 'r0', 'r4', 15),
+        ('strb', 'r0', 'r6', 16),
+        ('ldr_lit', 'r0', 'lit_pregap'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('strb', 'r0', 'r6', 17),
+        ('ldrb', 'r0', 'r6', 28),
+        ('movs', 'r1', 2),
+        ('orrs', 'r0', 'r1'),
+        ('strb', 'r0', 'r6', 28),
+        'td_time:',
+        ('ldrb', 'r0', 'r4', 11),
+        ('strb', 'r0', 'r6', 4),
+        ('ldrb', 'r0', 'r4', 13),
+        ('strb', 'r0', 'r6', 5),
+        ('ldrb', 'r0', 'r4', 14),
+        ('strb', 'r0', 'r6', 6),
+        ('ldrb', 'r0', 'r4', 15),
+        ('strb', 'r0', 'r6', 7),
+        ('b', 'td_dirty'),
+        # length message: +0x93 1 = a track, +0x95 track, +0x97 m, +0x98 s, +0x99 frames
+        'td_len:',
+        ('ldrb', 'r0', 'r4', 5),
+        ('cmp', 'r0', 1),
+        ('bne', 'td_done'),
+        ('ldrb', 'r0', 'r4', 7),
+        ('strb', 'r0', 'r6', 0),
+        ('ldrb', 'r0', 'r4', 9),
+        ('strb', 'r0', 'r6', 1),
+        ('ldrb', 'r0', 'r4', 10),
+        ('strb', 'r0', 'r6', 2),
+        ('ldrb', 'r0', 'r4', 11),
+        ('strb', 'r0', 'r6', 3),
+        'td_dirty:',
+        ('ldrb', 'r0', 'r6', 28),
+        ('movs', 'r1', 1),
+        ('orrs', 'r0', 'r1'),
+        ('strb', 'r0', 'r6', 28),
+        'td_done:',
+        ('pop', reglist('r4', 'r5', 'r6', pc=True)),
+
+        # tick hook: clear after reset / wake, redraw what changed
+        'td_draw:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('bl', 'td_init'),
+        ('ldr_lit', 'r4', 'lit_td'),
+        ('ldrb', 'r0', 'r4', 29),
+        ('cmp', 'r0', 1),
+        ('beq', 'tw_scr_ok'),
+        ('bl', LCD_CLEAR),
+        ('movs', 'r0', 1),
+        ('strb', 'r0', 'r4', 29),
+        ('movs', 'r0', 3),
+        ('strb', 'r0', 'r4', 28),
+        'tw_scr_ok:',
+        ('ldrb', 'r0', 'r4', 28),
+        ('movs', 'r1', 1),
+        ('tst', 'r0', 'r1'),
+        ('beq', 'tw_no_live'),
+        ('bics', 'r0', 'r1'),
+        ('strb', 'r0', 'r4', 28),
+        ('bl', 'draw_live'),
+        'tw_no_live:',
+        ('ldrb', 'r0', 'r4', 28),
+        ('movs', 'r1', 2),
+        ('tst', 'r0', 'r1'),
+        ('beq', 'tw_done'),
+        ('bics', 'r0', 'r1'),
+        ('strb', 'r0', 'r4', 28),
+        ('bl', 'draw_ends'),
+        'tw_done:',
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        'draw_live:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('ldr_lit', 'r4', 'lit_td'),
+        ('ldr_lit', 'r5', 'lit_white'),
+        ('movs', 'r6', col(0)),
+        ('movs', 'r7', TD_ROW0),
+        *ch('T'),
+        ('ldrb', 'r0', 'r4', 4),
+        ('bl', 'pc_dec2'),
+        *ch(' '),
+        ('ldr_lit', 'r0', 'lit_pregap'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('cbz', 'r0', 'dl_nogap'),
+        *ch('-'),
+        'dl_nogap:',
+        ('ldrb', 'r0', 'r4', 5),
+        ('ldrb', 'r1', 'r4', 6),
+        ('ldrb', 'r2', 'r4', 7),
+        ('bl', 'pc_time'),
+        ('ldr_lit', 'r0', 'lit_pregap'),
+        ('ldrb', 'r0', 'r0', 0),
+        ('cbz', 'r0', 'dl_pad0'),
+        ('ldr_lit', 'r0', 'lit_s_gap'),
+        ('bl', 'pc_str'),
+        'dl_pad0:',
+        ('bl', 'pc_pad'),
+        ('movs', 'r6', col(1)),
+        ('movs', 'r7', TD_ROW0),
+        *ch('L'),
+        ('ldrb', 'r0', 'r4', 0),
+        ('bl', 'pc_dec2'),
+        *ch(' '),
+        ('ldrb', 'r0', 'r4', 1),
+        ('ldrb', 'r1', 'r4', 2),
+        ('ldrb', 'r2', 'r4', 3),
+        ('bl', 'pc_time'),
+        ('bl', 'pc_pad'),
+        ('movs', 'r6', col(2)),
+        ('movs', 'r7', TD_ROW0),
+        *ch('R'),
+        *ch(' '),
+        ('ldrb', 'r0', 'r4', 0),
+        ('ldrb', 'r1', 'r4', 4),
+        ('cmp', 'r0', 'r1'),
+        ('bne', 'dl_r_unknown'),
+        ('ldrb', 'r0', 'r4', 1),
+        ('ldrb', 'r1', 'r4', 2),
+        ('ldrb', 'r2', 'r4', 5),
+        ('ldrb', 'r3', 'r4', 6),
+        ('bl', 'pc_diff'),
+        ('b', 'dl_r_pad'),
+        'dl_r_unknown:',
+        *ch('?'),
+        'dl_r_pad:',
+        ('bl', 'pc_pad'),
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        'draw_ends:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('ldr_lit', 'r5', 'lit_cyan'),
+        ('movs', 'r6', col(3)),
+        ('movs', 'r7', TD_ROW0),
+        ('ldr_lit', 'r0', 'lit_s_head'),
+        ('bl', 'pc_str'),
+        ('bl', 'pc_pad'),
+        ('ldr_lit', 'r4', 'lit_td'),
+        ('adds_i8', 'r4', 8),
+        ('ldr_lit', 'r5', 'lit_yellow'),
+        ('movs', 'r6', col(4)),
+        ('bl', 'draw_end'),
+        ('ldr_lit', 'r4', 'lit_td'),
+        ('adds_i8', 'r4', 18),
+        ('ldr_lit', 'r5', 'lit_green'),
+        ('movs', 'r6', col(6)),
+        ('bl', 'draw_end'),
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        # draw_end(r4 = track end record, r5 colour, r6 first line): two lines
+        'draw_end:',
+        ('push', reglist('r4', 'r5', 'r6', 'r7', lr=True)),
+        ('movs', 'r7', TD_ROW0),
+        ('ldrb', 'r0', 'r4', 0),
+        ('cbnz', 'r0', 'de_have'),
+        ('bl', 'pc_pad'),                # none yet: blank lines
+        ('adds_i8', 'r6', 16),
+        ('movs', 'r7', TD_ROW0),
+        ('bl', 'pc_pad'),
+        ('b', 'de_done'),
+        'de_have:',
+        ('bl', 'pc_dec2'),
+        *ch(' '),
+        *ch('L'),
+        ('ldrb', 'r0', 'r4', 1),
+        ('cmp', 'r0', 0xFF),
+        ('beq', 'de_nolen'),
+        ('ldrb', 'r1', 'r4', 2),
+        ('ldrb', 'r2', 'r4', 3),
+        ('bl', 'pc_time'),
+        *ch(' '),
+        *ch('R'),
+        ('ldrb', 'r0', 'r4', 1),
+        ('ldrb', 'r1', 'r4', 2),
+        ('ldrb', 'r2', 'r4', 4),
+        ('ldrb', 'r3', 'r4', 5),
+        ('bl', 'pc_diff'),
+        ('b', 'de_line2'),
+        'de_nolen:',
+        *ch('?'),
+        'de_line2:',
+        ('bl', 'pc_pad'),
+        ('adds_i8', 'r6', 16),
+        ('movs', 'r7', TD_ROW0),
+        *ch(' '),
+        *ch(' '),
+        *ch('E'),
+        ('ldrb', 'r0', 'r4', 4),
+        ('ldrb', 'r1', 'r4', 5),
+        ('ldrb', 'r2', 'r4', 6),
+        ('bl', 'pc_time'),
+        *ch(' '),
+        ('ldrb', 'r0', 'r4', 9),
+        ('cbz', 'r0', 'de_next'),
+        *ch('G'),
+        *ch('-'),
+        ('b', 'de_first'),
+        'de_next:',
+        *ch('N'),
+        'de_first:',
+        ('ldrb', 'r0', 'r4', 7),
+        ('bl', 'pc_num'),
+        *ch('.'),
+        ('ldrb', 'r0', 'r4', 8),
+        ('bl', 'pc_dec2'),
+        ('bl', 'pc_pad'),
+        'de_done:',
+        ('pop', reglist('r4', 'r5', 'r6', 'r7', pc=True)),
+
+        # text output at (col r6, row r7) in colour r5; r4-r6 kept, r7 advances
+        'pc_char:',                      # r0 = character
+        ('push', reglist(lr=True)),
+        ('sub_sp', 8),
+        ('movs', 'r1', 0),
+        ('str_sp', 'r1', 0),             # background black
+        ('mov', 'r2', 'r0'),
+        ('mov', 'r0', 'r6'),
+        ('mov', 'r1', 'r7'),
+        ('mov', 'r3', 'r5'),
+        ('bl', DRAW_CHAR),
+        ('adds_i8', 'r7', 12),
+        ('add_sp', 8),
+        ('pop', reglist(pc=True)),
+
+        'pc_num:',                       # r0: 1 or 2 digits
+        ('cmp', 'r0', 10),
+        ('bhs', 'pc_dec2'),
+        ('adds_i8', 'r0', 0x30),
+        ('b', 'pc_char'),
+
+        'pc_dec2:',                      # r0: 2 digits (max 99)
+        ('push', reglist('r4', lr=True)),
+        ('cmp', 'r0', 99),
+        ('bls', 'pd_ok'),
+        ('movs', 'r0', 99),
+        'pd_ok:',
+        ('movs', 'r1', 10),
+        ('udiv', 'r4', 'r0', 'r1'),
+        ('muls', 'r1', 'r4'),
+        ('subs', 'r1', 'r0', 'r1'),
+        ('mov', 'r0', 'r4'),
+        ('mov', 'r4', 'r1'),             # ones
+        ('adds_i8', 'r0', 0x30),
+        ('bl', 'pc_char'),
+        ('mov', 'r0', 'r4'),
+        ('adds_i8', 'r0', 0x30),
+        ('bl', 'pc_char'),
+        ('pop', reglist('r4', pc=True)),
+
+        'pc_time:',                      # r0 m, r1 s, r2 frames: "m:ss.ff"
+        ('push', reglist('r4', lr=True)),
+        ('lsls', 'r1', 'r1', 8),
+        ('orrs', 'r1', 'r2'),
+        ('mov', 'r4', 'r1'),
+        ('bl', 'pc_num'),
+        *ch(':'),
+        ('lsrs', 'r0', 'r4', 8),
+        ('bl', 'pc_dec2'),
+        *ch('.'),
+        ('movs', 'r0', 0xFF),
+        ('ands', 'r0', 'r4'),
+        ('bl', 'pc_dec2'),
+        ('pop', reglist('r4', pc=True)),
+
+        'pc_diff:',                      # (r0 m, r1 s) - (r2 m, r3 s) as [-]m:ss
+        ('push', reglist('r4', lr=True)),
+        ('movs', 'r4', 60),
+        ('muls', 'r0', 'r4'),
+        ('adds', 'r0', 'r0', 'r1'),
+        ('muls', 'r2', 'r4'),
+        ('adds', 'r2', 'r2', 'r3'),
+        ('subs', 'r4', 'r0', 'r2'),
+        ('bpl', 'pf_pos'),
+        *ch('-'),
+        ('movs', 'r0', 0),
+        ('subs', 'r4', 'r0', 'r4'),
+        'pf_pos:',
+        ('movs', 'r1', 60),
+        ('udiv', 'r0', 'r4', 'r1'),
+        ('muls', 'r1', 'r0'),
+        ('subs', 'r4', 'r4', 'r1'),
+        ('bl', 'pc_num'),
+        *ch(':'),
+        ('mov', 'r0', 'r4'),
+        ('bl', 'pc_dec2'),
+        ('pop', reglist('r4', pc=True)),
+
+        'pc_str:',                       # r0 = NUL-terminated text
+        ('push', reglist('r4', lr=True)),
+        ('mov', 'r4', 'r0'),
+        'ps_loop:',
+        ('ldrb', 'r0', 'r4', 0),
+        ('cbz', 'r0', 'ps_done'),
+        ('bl', 'pc_char'),
+        ('adds_i8', 'r4', 1),
+        ('b', 'ps_loop'),
+        'ps_done:',
+        ('pop', reglist('r4', pc=True)),
+
+        'pc_pad:',                       # spaces to the end of the line
+        ('push', reglist(lr=True)),
+        'pp_loop:',
+        ('cmp', 'r7', TD_ROW_END),
+        ('bhs', 'pp_done'),
+        *ch(' '),
+        ('b', 'pp_loop'),
+        'pp_done:',
+        ('pop', reglist(pc=True)),
+
+        ('align',),
+        'lit_td:', ('word', TD),
+        'lit_magic:', ('word', TD_MAGIC),
+        'lit_flags:', ('word', CD_FLAGS),
+        'lit_bit16:', ('word', 1 << 16),
+        'lit_msg:', ('word', CD_MSG),
+        'lit_pregap:', ('word', PREGAP),
+        'lit_white:', ('word', WHITE),
+        'lit_yellow:', ('word', YELLOW),
+        'lit_cyan:', ('word', CYAN),
+        'lit_green:', ('word', GREEN),
+        'lit_s_gap:', ('word', 's_gap'),
+        'lit_s_head:', ('word', 's_head'),
+        's_gap:', ('bytes', b' GAP\0'),
+        's_head:', ('bytes', b'TRACK ENDS:\0'),
+        ('align',),
+    ]
+
+
+def patch_track_diag(img):
+    assert 'saver' not in BUILD_NAMES, '--track-diag uses the saver patch RAM: leave saver out'
+    assert 'cdtime' in BUILD_NAMES and 'shuffle' in BUILD_NAMES, '--track-diag needs cdtime and shuffle'
+    cave, lab = assemble(track_diag(), cave_addr(img))
+    for site, orig, new in ((0x0800E0A2, CD_PARSE, 'td_msg'), (0x0800A868, SPLASH, 'td_wake')):
+        old, _ = assemble([('bl', orig)], site)
+        code, _ = assemble([('bl', lab[new])], site)
+        patch(img, site, old, code)
+    patch(img, LV_FLUSH_PTR, struct.pack('<I', 0x08028065), struct.pack('<I', lab['td_flush'] | 1))
+    put(img, lab['td_flush'], cave)
+    TICK_HOOKS.append(lab['td_draw'])
+    print(f"track-diag: at {lab['td_flush']:#x}, {len(cave)} bytes (DIAGNOSTIC BUILD: normal display replaced)")
+
+
 PATCHES = {'track': patch_track, 'backlight': patch_backlight, 'disctime': patch_disctime,
            'shuffle': patch_shuffle, 'play': patch_play, 'cdtime': patch_cdtime, 'remaining': patch_remaining,
            'brightness': patch_brightness, 'gapless': patch_gapless, 'saver': patch_saver}
@@ -2547,6 +3028,8 @@ def main():
     ap.add_argument('dst')
     ap.add_argument('patches', nargs='?', default=','.join(PATCHES))
     ap.add_argument('--version', help='show "patch VERSION" on the boot screen, e.g. v2026-10-25')
+    ap.add_argument('--track-diag', action='store_true',
+                    help='diagnostic build: show length/time messages and track ends instead of the normal display')
     args = ap.parse_args()
 
     names = args.patches.split(',')
@@ -2560,6 +3043,8 @@ def main():
     BUILD_NAMES.update(names)
     for name in names:
         PATCHES[name](img)
+    if args.track_diag:
+        patch_track_diag(img)
     install_tick_hooks(img)
     remap_buttons(img, names)
     if args.version:
