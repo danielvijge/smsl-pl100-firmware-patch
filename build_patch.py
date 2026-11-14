@@ -106,6 +106,15 @@ Patch cdtime - time messages of the CD module.
     and the filled time is never ahead of the disc. Counted from the last
     message instead, a late or repeated message delayed the fill until just
     before the next real one, which then showed it only briefly.
+  * TIME_FILL_PHASE_ON: the fill follows the estimated start of each second
+    (phase P, in 7.5 ms TIM1 ticks) instead. A message can only arrive after
+    its second began, so each one gives P = min(arrival, P + 1 s) when it is
+    the next second (P = min(arrival, P) for the same second again); P then
+    settles on the earliest arrivals and late ones no longer shift it. Any
+    other change (a jump, another track, into or out of the gap, the first
+    message since playing) restarts P at the arrival. The fill comes at
+    P + 1 s + 37.5 ms, so a filled second appears about when it really
+    starts and the real message after it changes nothing.
   * Notes for each time message whether it is from the gap before a track,
     for PREGAP_MINUS_ON: the module counts the gap down, and those messages
     have a non-zero frames byte (normal play does too, occasionally, so a
@@ -313,6 +322,10 @@ CD_FRAMES = CD_STATE + 0x9D  # time message: frames byte, only non-zero in the g
 TIME_FILL_STEPS = 15       # shown second unchanged for 15 x 75 ms = 1.125 s: its successor was lost
 TIME_FILL_STEP = 14        # a fill counts as that second's start + 1.05 s (14 x 75 ms), so further
                            # fills follow every 1.05 s; both include a step for the 75 ms rounding
+TIME_SUB_TICKS = 0x2000018A  # u16: TIM1 ticks (7.5 ms) left until CLOCK_75MS counts (10..1)
+TIME_PHASE_SEC = 134       # TIME_FILL_PHASE_ON: 1 s in 7.5 ms ticks (133.3, rounded up: the
+                           # estimate drifts late, never early, and early messages pull it back)
+TIME_PHASE_MARGIN = 5      # fill 37.5 ms after the estimated start of the next second
 TICK_HOOKS = []            # cave functions to run after every display update (see install_tick_hooks)
 BRIGHT_OSD_TEXT = ['100%', '65%', '55%', '35%', '20%', '10%']   # levels 0..5
 DRAW_STR = 0x08009A42      # boot screen: (col, row, str, fg, [sp] bg), 13 px per char
@@ -331,6 +344,7 @@ BRIGHT_IR = 0x08           # brightness cycle: FN
 IR_DIAG_ON = False         # show the last IR command as "IRxx" on line 1 (diagnostic)
 REMAINING_ICON_ON = True   # hourglass icon next to the play icon in remaining-time mode
 TIME_FILL_ON = True        # advance the time by 1 s when a time message of the CD module is lost
+TIME_FILL_PHASE_ON = True  # time fill on the tracked start of each second, not 1.125 s after a message
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
 REMAINING_ADD_S = 2        # added to the module's track length for remaining time (0..255; 0 = as reported)
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
@@ -1429,12 +1443,17 @@ def resolve(prog):
 # elapsed time by 1 s (count down in the gap), then every 1.05 s while they
 # stay missing. The next message overwrites it with the module's own time;
 # one with the second the fill already shows does not restart the count.
+PH_RESTART = 100           # TIME_FILL_PHASE_ON: not a step of one second
+
+
 def cd_time():
+    ph = TIME_FILL_ON and TIME_FILL_PHASE_ON
     return [
         'time_msg:',
-        ('push', reglist('r4', 'r5', 'r6', lr=True)),
+        ('push', reglist('r4', 'r5', 'r6', *(['r7'] if ph else []), lr=True)),
         ('ldr_lit', 'r2', 'lit_elapsed'),
         ('ldrb', 'r6', 'r2', 4),         # second shown so far (by a message or a fill)
+        *([('subs', 'r7', 'r0', 'r6')] if ph else []),   # seconds on from the shown one
         ('subs', 'r6', 'r6', 'r0'),      # r6 != 0: the shown time changes
         ('cbnz', 'r6', 'changed'),
         ('ldr_lit', 'r3', 'lit_msg_track'),
@@ -1483,21 +1502,59 @@ def cd_time():
         ('ldr_lit', 'r3', 'lit_last_min'),  # gap ended / began: the firmware only rewrites the
         ('movs', 'r5', 0xFF),               # time label when min/sec change (the gap's last
         ('str', 'r5', 'r3', 0),             # 0:00 and the track's first 0:00 are equal)
+        *([('movs', 'r7', PH_RESTART)] if ph else []),
         'gap_same:',
         ('strb', 'r4', 'r2', 0),
         ('ldr_lit', 'r5', 'lit_prev'),   # remember track, sec, min
         ('ldr_lit', 'r3', 'lit_msg_track'),
         ('ldrb', 'r3', 'r3', 0),
+        *([('ldrb', 'r2', 'r5', 0),
+           ('cmp', 'r2', 'r3'),
+           ('beq', 'ph_same_track'),
+           ('movs', 'r7', PH_RESTART),   # another track: its seconds start elsewhere
+           'ph_same_track:'] if ph else []),
         ('strb', 'r3', 'r5', 0),
         ('strb', 'r0', 'r5', 1),
         ('ldr_lit', 'r3', 'lit_elapsed'),
         ('ldr', 'r3', 'r3', 0),
         ('strb', 'r3', 'r5', 2),
+    ] + ([
+        # TIME_FILL_PHASE_ON: P = estimated start of the shown second.
+        # r7 = seconds on from the shown one, or PH_RESTART; r4 = in the gap
+        ('bl', 'now_fine'),              # r0 = now (r1 survives)
+        ('ldr_lit', 'r2', 'lit_stamp'),
+        ('ldr_lit', 'r3', 'lit_armed'),
+        ('ldrb', 'r3', 'r3', 0),
+        ('cbz', 'r3', 'ph_set'),         # first message since playing
+        ('ldrh', 'r3', 'r2', 0),
+        ('cmp', 'r7', 0),
+        ('beq', 'ph_min'),               # the same second again
+        ('cbz', 'r4', 'ph_up'),
+        ('adds_i8', 'r7', 1),            # gap (counts down): -1, or 59 from x:00
+        ('b', 'ph_next'),
+        'ph_up:',
+        ('adds_i8', 'r7', 59),           # +1, or -59 from x:59
+        'ph_next:',
+        ('cmp', 'r7', 0),
+        ('beq', 'ph_one'),
+        ('cmp', 'r7', 60),
+        ('bne', 'ph_set'),               # a jump: restart
+        'ph_one:',
+        ('adds_i8', 'r3', TIME_PHASE_SEC),
+        'ph_min:',
+        ('subs', 'r7', 'r0', 'r3'),
+        ('lsls', 'r7', 'r7', 16),
+        ('bmi', 'ph_set'),               # arrived before P (+ 1 s): it began earlier
+        ('mov', 'r0', 'r3'),
+        'ph_set:',
+        ('strh', 'r0', 'r2', 0),
+    ] if ph else [
         ('cbz', 'r6', 'same_time'),
         ('ldr_lit', 'r0', 'lit_clock'),
         ('ldrh', 'r3', 'r0', 0),
         ('ldr_lit', 'r0', 'lit_stamp'),
         ('strh', 'r3', 'r0', 0),
+    ]) + [
         'same_time:',
         ('ldr_lit', 'r0', 'lit_armed'),
         ('movs', 'r3', 1),
@@ -1542,7 +1599,7 @@ def cd_time():
         ('strb', 'r0', 'r2', 0),
         'lr_done:',
     ] if LENGTH_REQUEST_ON else []) + [
-        ('pop', reglist('r4', 'r5', 'r6', pc=True)),
+        ('pop', reglist('r4', 'r5', 'r6', *(['r7'] if ph else []), pc=True)),
 
         'time_fill:',
         ('ldr_lit', 'r3', 'lit_state'),
@@ -1556,6 +1613,41 @@ def cd_time():
         'tf_play:',
         ('ldrb', 'r0', 'r2', 0),
         ('cbz', 'r0', 'tf_ret'),         # no message yet since play started
+    ] + ([
+        ('push', reglist('r4', lr=True)),
+        ('bl', 'now_fine'),
+        ('ldr_lit', 'r2', 'lit_stamp'),
+        ('ldrh', 'r1', 'r2', 0),
+        ('subs', 'r0', 'r0', 'r1'),
+        ('uxth', 'r0', 'r0'),            # ticks since the shown second began
+        ('cmp', 'r0', TIME_PHASE_SEC + TIME_PHASE_MARGIN),
+        ('blo', 'tf_pop'),
+        ('adds_i8', 'r1', TIME_PHASE_SEC),
+        ('strh', 'r1', 'r2', 0),
+        ('bl', 'tf_advance'),
+        'tf_pop:',
+        ('pop', reglist('r4', pc=True)),
+
+        # now_fine() -> r0 = time in 7.5 ms TIM1 ticks (u16); uses r2, r3
+        'now_fine:',
+        ('push', reglist('r4', lr=True)),
+        ('ldr_lit', 'r3', 'lit_clock'),
+        'nf_again:',
+        ('ldrh', 'r4', 'r3', 0),
+        ('ldr_lit', 'r2', 'lit_sub'),
+        ('ldrh', 'r2', 'r2', 0),
+        ('ldrh', 'r0', 'r3', 0),
+        ('cmp', 'r0', 'r4'),
+        ('bne', 'nf_again'),             # the clock counted in between
+        ('movs', 'r4', 10),
+        ('muls', 'r0', 'r4'),
+        ('subs', 'r0', 'r0', 'r2'),
+        ('adds_i8', 'r0', 10),
+        ('uxth', 'r0', 'r0'),
+        ('pop', reglist('r4', pc=True)),
+
+        'tf_advance:',
+    ] if ph else [
         ('ldr_lit', 'r2', 'lit_stamp'),
         ('ldrh', 'r0', 'r2', 0),
         ('ldr_lit', 'r1', 'lit_clock'),
@@ -1566,6 +1658,7 @@ def cd_time():
         ('blo', 'tf_ret'),
         ('adds_i8', 'r0', TIME_FILL_STEP),
         ('strh', 'r0', 'r2', 0),
+    ]) + [
         ('ldr_lit', 'r2', 'lit_elapsed'),
         ('ldrb', 'r1', 'r2', 4),         # seconds
         ('ldr_lit', 'r0', 'lit_pregap'),
@@ -1610,6 +1703,7 @@ def cd_time():
         ('word', CD_MSG_TRACK),
         'lit_cur_track:',
         ('word', CD_STATE + 0xFC),
+        *(['lit_sub:', ('word', TIME_SUB_TICKS)] if ph else []),
         *(['lit_skip:', ('word', LEN_REQ_SKIP),
            'lit_len_track:', ('word', SH),        # +0: track of the stored length (shuffle patch)
            'lit_period:', ('word', LEN_PERIOD_TIMER),
