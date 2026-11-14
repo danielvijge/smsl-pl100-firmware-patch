@@ -4411,3 +4411,1460 @@ Opus 5.5 · Claude Team
 
   Nothing is committed. The changed files are build_patch.py and icons.py;
   README.md and the chat log have your own changes.
+
+❯ There are now a lot of really nice improvements. I cannot think of anything   
+  that should be improved or fixed. Are there still suggestions or active bugs  
+  spotted in the analyses?                                                      
+
+⏺ No active bugs that I know of in the current code. One check did find a latent
+  bug that a config change would trigger, and a few things remain open.
+
+  1. Latent bug: SAVER_MOVE_S above 19 builds broken code without any error
+  - Cause: the screensaver compares the time since the last move with
+    SAVER_MOVE_S converted to 75 ms steps. That comparison only fits numbers up
+    to 255, which is 19 s. My assembler (thumbasm.py) doesn't check the range
+    for cmp and adds_i8.
+  - What happens: with 20 s (266 steps), the extra bits land in the register
+    field, and it silently becomes a different instruction (cmp r1, #10). The CD
+    would then move at random moments.
+  - Today: your 10 s is fine, and the other values that use these instructions
+    are fixed constants within range.
+  - Fix: range checks in the assembler, so such a build stops with an error,
+    plus loading the move time from a constant so any value works. It's a small
+    change.
+
+  2. Known limitations, by design or not testable here
+  - Auto-play at power-on: if a disc inside reports "Disc" twice, more than 1 s
+    apart while reloading after power-on, it would auto-play. This has never
+    been seen on the device.
+  - Last track in normal mode: it now relies on the CD unit's own end-of-disc
+    message. Whether the unit sends it isn't confirmed on the device. The safety
+    net stops it 3 s after the track's length.
+  - Track lengths: the CD unit reports them 2 s shorter than a PC does, so the
+    remaining time ends at about 0:02.
+  - Shuffle: discs with more than 255 tracks fall back to the original random
+    play.
+  - MP3/WMA discs: never tested. The CD unit plays them, but whether its track,
+    time and length messages behave the same as on audio CDs is unknown. A test
+    with an MP3 disc would be worth doing.
+
+  3. Not yet confirmed on the device
+  - v25: remaining time for the first track after inserting a disc.
+  - v26: auto-play after Stop at an empty slot.
+  - v27: screen staying dark when switching off from the screensaver.
+  - v28: the 4-bit CD image, in white and in colour. This is the one most worth
+    checking, since the image format is new on this player.
+  - No explicit confirmation yet for:
+    - gapless after FF/REW;
+    - the length request after each track change;
+    - the smoother time fill.
+
+  4. Optional improvements, already discussed
+  - Hourglass as a 4-bit image: saves about 2.2 KB. I'm waiting for your yes.
+  - Phase-tracking time fill: designed, not built. Only worth it if you still
+    see time jumps.
+
+  5. Housekeeping
+  - patch/CLAUDE.md isn't committed yet, but everything else is.
+  - After your device tests, its status section should be updated.
+  - The memory file now duplicates CLAUDE.md, so it could be cut back to the
+    README rule.
+
+  I'd fix point 1 first. Shall I do that, together with the hourglass, as v29?
+
+❯ Remind me what Phase-tracking time fill is                                    
+
+⏺ It's an alternative to how the patch now fills in a lost second. It was
+  designed but never built.
+
+  How the time fill works now (v18):
+  - About 7 % of the CD unit's once-a-second time messages fail their checksum
+    and are dropped. The patch notes when the first message for a new second
+    arrives.
+  - If no message for the next second has come 1.125 s later, it assumes that
+    message was lost and shows the next second itself. If more go missing, it
+    repeats every 1.05 s.
+  - The next real message overwrites the display with the CD unit's own time.
+
+  The limitation is that it counts from when a message arrived, not from when
+  the second really began on the disc. Messages arrive a variable time after
+  their second starts. If a message is late, the fill comes late as well, and
+  the filled second may show only briefly before the real next message follows.
+
+  Phase tracking:
+  - The estimate: keep track of when each second actually begins, called the
+    phase P, rather than when the last message happened to arrive.
+  - The update rule: with each message, P = min(arrival time, P + 1 s). A
+    message can never arrive before its second began, so an early arrival tells
+    us the boundary was earlier. A late arrival is ignored, because P + 1 s is
+    the better estimate.
+  - Effect: P settles on the earliest arrivals, which are the closest to the
+    real second boundaries, and late messages no longer shift the timing.
+  - When to fill: at P + 1 s, plus a small margin. A filled second then appears
+    about when it really starts on the disc, so it looks like a normal tick, and
+    the real message after it changes nothing.
+  - Clock resolution: the patch's 75 ms clock is too coarse for this. It would
+    count in 25 ms units from the 7.5 ms timer tick.
+
+  Why it wasn't built: v18 already removed the very briefly shown times you
+  reported. Phase tracking would make the remaining small timing differences
+  more regular, at the cost of more code and RAM. It's only worth doing if you
+  still see seconds that last noticeably shorter or longer than others on the
+  device.
+
+❯ Some housekeeping for memory:                                                 
+  - gapless replay is resolved after using FF/REW                               
+  - length of a track in time remaining mode is almost immediately on track     
+  change                                                                        
+  - hourglass, I don't think there is a need to optimise it to save 2.2 KB      
+
+❯ For SAVER_MODE_S, would it be better to solve it on the player, or set a      
+  maximum of 19 in the python script?                                           
+
+⏺ I'd fix it in the player code, and also add a range check to the assembler.
+
+  Fix the player code rather than cap the setting:
+  - The 19 s limit isn't a real limit. It comes from one instruction encoding: a
+    compare with a number written directly into the instruction, which only
+    fits 0–255. Moving the CD every 30 or 60 s is a reasonable choice, and
+    nothing else in the screensaver needs the cap.
+  - The fix is small. I'd load the step count from a constant stored next to the
+    code, then compare two registers. That costs one extra instruction and 4
+    bytes of flash. Any value up to about 80 minutes then works, which is the
+    limit of the 16-bit 75 ms clock.
+  - SAVER_IDLE_S already works this way, which is why 180 s is no problem there.
+
+  Also fix the assembler:
+  - This was the real fault. A number out of range built wrong code without any
+    error, and the same could happen to any other value that goes straight into
+    a cmp or adds instruction. They're all in range today.
+  - Range checks in thumbasm.py would make such a build stop with a clear error.
+
+  Both changes are a few lines. With your current 10 s the firmware behaves the
+  same; I'd confirm that in the emulator, along with a test that moves at 30 s.
+  Shall I make both changes as v29?
+
+❯ yes, make both changes as v29                                                 
+
+⏺ Both changes are in patch/IAP_PL100_1v1_b250219_all_v29.hex, tested in the
+  emulator only. With your 10 s it behaves exactly like v28 there, so there's
+  nothing new to test on the player.
+
+  Screensaver (build_patch.py):
+  - The move interval is now loaded from a stored constant and compared register
+    to register, like the idle time already was. This adds 4 bytes in total,
+    and any value works.
+  - The script now checks both times. Below 1 s or above 81 minutes (the limit
+    of the 16-bit 75 ms clock), the build stops with: "SAVER_IDLE_S /
+    SAVER_MOVE_S: 1 s .. 81 min".
+
+  Assembler (thumbasm.py):
+  - Every number written directly into an instruction is now range-checked, so a
+    value that doesn't fit stops the build instead of silently producing wrong
+    code.
+  - Run on the committed v28 code with SAVER_MOVE_S = 20, the build now stops at
+    ('cmp', 'r0', 266). Before, that value built without any error and produced
+    a different instruction.
+
+  Emulator check:
+  - 10 s: the full screensaver test gives the same output as v28 (modes, wake,
+    power-off, colours, RAM).
+  - Move interval:
+
+  | SAVER_MOVE_S | Measured interval |
+  |--------------|-------------------|
+  | 10           | 9.97 s            |
+  | 20           | 19.95 s           |
+  | 30           | 30.0 s            |
+  | 3600         | 3600 s            |
+    The small deviations come from the clock counting in 75 ms steps.
+  - Builds without the screensaver, and without the CD: byte-identical to the
+    v28 equivalents. This also shows the new checks don't change any output.
+
+  I added a note on the range checks to patch/CLAUDE.md. If the README describes
+  SAVER_MOVE_S, you could add that 1 s to 81 min is allowed. Nothing is
+  committed, and CLAUDE.md is still untracked.
+
+❯ For the track lengths in time remaining mode, they often end at 00:02, as     
+  discovered. Is this purely due to how the CD module reports it? I might need  
+  to do some more tests. I have CDs with a 5s gap (at least they show -0:05)    
+  when playing. But these don't end at 00:05. Is this something that the        
+  firmware can reasonable correct, so each track always ends at 00:00, then     
+  potentially show the negative time for the gap, then the time remaining for   
+  the next track.                                                               
+
+⏺ Not purely, as far as I can tell. The data so far doesn't fully fit the
+  simplest explanation, so I'd want a few measurements before changing anything.
+  What we know, what it suggests, and what a fix could look like:
+
+  What we know
+  - The CD unit's track lengths are 2 s shorter than a PC shows. You measured
+    that with the diagnostic builds.
+  - During the gap before a track, the CD unit counts that gap down, which is
+    the "-0:05" you see. Elapsed time then starts at 0:00.
+  - Remaining time = stored length − elapsed, in whole seconds.
+
+  The likely model
+  A disc's table of contents lists only where each track starts, not where the
+  gaps start. A PC's length is the distance from one track start to the next, so
+  it includes the next track's gap. The CD unit seems to subtract a fixed 2 s
+  from that, the standard gap length.
+
+  If that were all, a track followed by a 2 s gap would end at 0:00, and one
+  followed by a 5 s gap at 0:03. You see 0:02 on normal tracks, and something
+  other than 0:05 on the 5 s ones. So something else adds about 2 s. Candidates:
+  - Rounding: the length messages include frames (1/75 s), but the firmware
+    stores only minutes and seconds, and elapsed is rounded down too. Together
+    that explains up to 1 s.
+  - Late time messages: time messages come about once a second and may report
+    the time a little late.
+  - A different subtraction: the CD unit may subtract something other than 2 s.
+
+  What would settle it: a few tracks on both kinds of disc, noting for each:
+  1. the last remaining time shown before the gap or the next track;
+  2. the first gap value shown (−0:02, −0:05, …);
+  3. ideally, the track and gap lengths from the PC. Tools that read the disc's
+     track positions show these; EAC, for example, lists the gaps per track.
+
+  What the firmware could correct
+  - The end value doesn't depend on the gap length (always about 0:02): a
+    simple, safe fix. Subtract a fixed correction from the length, as a setting
+    in build_patch.py. Every track would then end at 0:00, followed by the gap
+    countdown and the next track's remaining time, which is what you describe.
+  - It does depend on the gap length: a reliable fix isn't really possible. The
+    firmware only learns how long a gap is when the countdown starts, which is
+    after the track has ended. A fixed correction would still make 2 s-gap discs
+    end at 0:00, while discs with longer gaps would end a few seconds early.
+  - Rounding: the firmware could also keep the frames of the length message, so
+    the rounding doesn't add a second. That's a small, independent improvement.
+
+  If reading the values off the display during playback is awkward, I can make a
+  diagnostic build. On each track change it would show the length message
+  including frames, the last elapsed time, and the gap value. You'd then only
+  need to note those down. Do you want that, or would you rather first try the
+  measurements by eye?
+
+❯ please make a build for diagnostic. Then I can try with a few different CDs   
+
+⏺ I made the diagnostic build: patch/IAP_PL100_1v1_b250219_track_diag.hex. It's
+  tested in the emulator only.
+
+  What changes on the player: the normal display is replaced by 8 lines of text.
+  Playback and all buttons work as before. It contains every patch except the
+  screensaver, which uses the same memory.
+
+  The screen, as the emulator draws it after two track changes:
+
+  T07 0:01.00         ← now: track, elapsed m:ss.ff  (in a gap: "-0:02.40 GAP")
+  L06 4:10.12         ← last track length received: its track, m:ss.ff
+  R ?                 ← length − elapsed, what remaining time shows ("?" = 
+  length is for another track)
+  TRACK ENDS:
+  06 L4:10.12 R0:01   ← last finished track: its length, remaining time at its 
+  end
+    E4:09.00 N0.05    ←   its last elapsed time; then G-2.40 = gap countdown 
+  started at 2.40 s,
+  05 L3:58.40 R0:02   ←   or N0.05 = next track started directly at 0.05 s
+    E3:56.00 G-2.40   ← the track change before that
+
+  .ff are frames, 1/75 of a second, so they run from 00 to 74. The firmware
+  normally drops them. If you ever see a value above 74 in the L line, my guess
+  of where the length message stores its frames is wrong; tell me if that
+  happens.
+
+  For each CD, let a few track changes happen without pressing keys, and note 
+  the two "TRACK ENDS" entries:
+  - L and R: whether R is always about 0:02, or depends on the gap.
+  - E: whether the last elapsed time also has frames.
+  - G or N: how long the gap is, or whether the next track starts directly.
+
+  Pressing Next/Prev or changing the disc also counts as a track change, so
+  ignore entries from those. If you can also note the PC's track lengths and
+  gaps, that's the most useful comparison.
+
+  Emulator check:
+  - The sample sequence produces the screen above.
+  - A message with a bad checksum changes nothing, and a disc-total message
+    doesn't overwrite the track length.
+  - The first run clears the leftover data in the spare memory.
+  - It writes only its own 36 bytes.
+
+  Code: branch diagnostic-track-end, as the --track-diag option. It's in a
+  separate git worktree in my temporary folder, so your main checkout is
+  untouched. It's not committed yet, and that temporary folder can be cleaned
+  up. Shall I commit it to the branch, as with the earlier diagnostics? Pushing
+  it is up to you.
+
+❯ I think the firmware should avoid making assumptions about gap lengths. I     
+  have a few different CDs that I want to use for test cases:                   
+  1. CD with 2s gaps between songs                                              
+  2. CD that is completely gapless                                              
+  3. CD with short tracks (30-60s) with 5 second gaps                           
+  4. CD that is gapless, except between track 4 & 5 where it has a 35 second    
+  gap                                                                           
+     Which is the first useful CD to test with. And what would be the expected  
+  result and desired result?                                                    
+
+⏺ Test CD 4 first. It has a gapless change (tracks 3→4) and a 35 s gap (4→5) on
+  the same disc. That's the most direct test of the main question: does the
+  remaining time at a track's end depend on the gap that follows? Comparing two
+  changes on one disc also rules out differences between discs. To save time,
+  fast-forward to the last 10–20 s of track 3, then let it play through to track
+  5 without pressing anything. Fast-forwarding within a track doesn't count as
+  a track change.
+
+  CD 3 next. With 30–60 s tracks you get many track ends within a few minutes,
+  which shows whether the result is consistent. Then CDs 1 and 2 as
+  confirmation.
+
+  What the diagnostic will show at the end of track 4, depending on the cause:
+
+  Cause: A. A constant offset, unrelated to gaps (rounding, late messages, the
+  CD
+  unit's own subtraction)
+  R at the end of 3→4 (gapless): about 0:02
+  R at the end of 4→5 (35 s gap): about 0:02, the same
+  G/N after it: G-35.xx
+  ────────────────────────────────────────
+  Cause: B. The CD unit's length runs up to the next track's start, so it
+  includes the gap that follows (minus a fixed 2 s)
+  R at the end of 3→4 (gapless): about 0:00 or below
+  R at the end of 4→5 (35 s gap): about 0:33–0:35
+  G/N after it: G-35.xx
+  ────────────────────────────────────────
+  Cause: C. The 35 s of silence is inside track 4 itself, not a gap before track
+
+  5
+  R at the end of 3→4 (gapless): normal
+  R at the end of 4→5 (35 s gap): normal: track 4 just plays its silence with
+  the
+  time running
+  G/N after it: N0.xx, no countdown
+
+  With C, CD 4 can't decide between A and B. Then CDs 3 and 2 decide it: does
+  the end value with 5 s gaps differ from gapless?
+
+  The desired result, with no assumptions about gaps, for every CD:
+  1. The remaining time counts down to 0:00 exactly when the track's audio ends.
+  2. In a gap, it shows the CD unit's own countdown (-0:35 … -0:01). The
+     firmware already does this.
+  3. The next track starts with its full length counting down. This works since
+     the length request.
+
+  What the firmware can do in each case:
+  - A: the offset can be measured instead of assumed. At each track end, the
+    firmware sees how much remaining time was left, and corrects the following
+    tracks by that amount. That works for every gap length, because the gap
+    isn't part of it.
+  - B: a track's true end only becomes known once the gap starts, after the
+    remaining time should already have reached 0:00. The firmware can't know the
+    next gap in advance, unless the CD unit can report where gaps start, which
+    nothing found so far suggests. The honest option would then be to leave it,
+    or to jump to the gap countdown as soon as it starts. That jump already
+    happens.
+  - Rounding: independent of the above, the diagnostic shows how much the
+    dropped frames contribute. Keeping them would let the countdown reach 0:00
+    exactly in the last second.
+
+  Note R and the G/N value for each track change. The PC's track lengths for CD
+  4's tracks 3–5 would help too, if you have them.
+
+❯ I inserted CD #4 and started playing at track 3. Important to state that      
+  during track 4 the information in the display changed, so both versions are   
+  included in the output:                                                       
+  T03 m:ss.0x                                                                   
+  L03 6:31.30                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  02 L?                                                                         
+    E0:00.00 N1.00                                                              
+  01 L6:36.36 R6:36                                                             
+     E0:00.00 N0.00                                                             
+                                                                                
+  T04 m:ss.0x                                                                   
+  L04 7:31.03                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  03 L6:31.30 R-0:02                                                            
+    E6:33.01 N0.00                                                              
+  02 L?                                                                         
+    E0:00.00 N1.00                                                              
+                                                                                
+  T04 m:ss.0x                                                                   
+  L04 7:31.03                                                                   
+  R 1:23                                                                        
+  TRACK ENDS:                                                                   
+  01 L?                                                                         
+    E1.11.01 N46.00                                                             
+  04 L7:31.03 R1.47                                                             
+    E5:44.0 N11.91                                                              
+                                                                                
+  T04 -0:ss.74 GAP                                                              
+  L05 9:55.10                                                                   
+  R 9:31                                                                        
+  TRACK ENDS:                                                                   
+  04 L7:31.03 R0:34                                                             
+    E6:57.01 G-35.70                                                            
+  01 L?                                                                         
+    E1:11.91 N46.00                                                             
+                                                                                
+  T05 m:ss.0x                                                                   
+  L05 9:55.10                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  04 L7:31.01 R0:34                                                             
+    E6:57.01 G-35.70                                                            
+  01 L?                                                                         
+    E1:11.91 N46.00                                                             
+  In the output 'm' is the changing minutes, 's' the changing seconds, 'x' is a 
+  0 or 1, and ? is a garbled character.    
+
+⏺ That run answers the main question. The anomaly mid-track 4 is a separate
+  finding.
+
+  The two track ends
+
+  ┌──────────────┬─────────┬────────────┬──────────────────────┬──────────┐
+  │    Change    │ Length  │   Last     │    What followed     │ R at the │
+  │              │    L    │ elapsed E  │                      │    end   │
+  ├──────────────┼─────────┼────────────┼──────────────────────┼──────────┤
+  │ 3 → 4        │ 6:31.30 │ 6:33.01    │ track 4 started      │ −0:02    │
+  │ (gapless)    │         │            │ directly (N0.00)     │          │
+  ├──────────────┼─────────┼────────────┼──────────────────────┼──────────┤
+  │ 4 → 5 (35 s  │ 7:31.03 │ 6:57.01    │ gap countdown from   │ 0:34     │
+  │ gap)         │         │            │ -35.70               │          │
+  └──────────────┴─────────┴────────────┴──────────────────────┴──────────┘
+
+  Both fit one rule:
+
+  CD unit's length = (start of the next track − start of this track) − 2 s
+
+  - Track 3: it really played to about 6:33.5, and L is 6:31.3, so 2 s less.
+  - Track 4:
+    - Its audio ended at about 6:57.5, and then the 35.7 s gap followed.
+    - Start to next start is therefore about 7:33.2, and minus 2 s that gives
+      7:31.2.
+    - L is 7:31.03, which matches.
+
+  So the CD unit measures from one track start to the next, which includes the
+  gap before the next track, and then subtracts a fixed 2 s. That 2 s is the CD
+  unit's own assumption that every gap is the standard 2 s. So at the end of a
+  track, the remaining time is gap − 2 s:
+  - Gapless (CDs 2 and 4, tracks 3→4): −2 s. The display stops at 0:00, but it
+    gets there 2 s early and stays there.
+  - 2 s gaps (CD 1): expected to end at exactly 0:00.
+  - 5 s gaps (CD 3): expected to end at 0:03.
+  - 35 s gap (CD 4, tracks 4→5): ended at 0:34.
+
+  What this means for a fix
+
+  A countdown that reaches 0:00 at every track end needs the length of the next
+  gap before that gap starts. The CD unit's messages don't give it, as far as we
+  know. It only becomes visible when the countdown starts, and at that point
+  the display already switches to -0:35 correctly. So the firmware can't make
+  every track end at exactly 0:00. The choice is which assumption to live with:
+  - Leave it: 2 s gaps end exactly. Gapless discs reach 0:00 2 s early, and
+    longer gaps end at gap − 2.
+  - Add the CD unit's 2 s back: gapless discs end exactly. 2 s gaps end at 0:02,
+    and longer gaps end at the gap length.
+
+  Neither is right for every disc; it depends which is more common in your
+  collection. I'd test CD 1 and CD 2 before deciding. If CD 1 really ends at
+  0:00 and CD 2 at −0:02, the rule above is confirmed. Your earlier impression
+  that tracks "often end at 0:02" doesn't fit this rule unless those discs have
+  4 s gaps, so CD 1 is worth checking.
+
+  The frames in the length messages (30, 03, 10, 36) are all below 75, so the
+  diagnostic reads them from the right place. Dropping them only adds up to 1 s
+  of rounding, which is minor next to the 2 s.
+
+  A separate finding: a strange time message during track 4
+
+  - At elapsed 5:44 a message arrived that looked like a time message for track 
+    01 at 1:11.91, then one with 46 s, and then normal messages for track 4
+    again.
+  - A frames value of 91 isn't possible, since frames only go up to 74. So this
+    is a different message that uses the same type code (0x21), not a real time
+    message.
+  - The firmware treats it as a time message too, so the normal display may
+    briefly show a wrong track or time at such a moment. Did you ever notice
+    that in normal use?
+
+  To find out what it is, I can extend the diagnostic to show the raw bytes of
+  any such message, in a spare line on the screen. Shall I do that, while you
+  test CDs 1 and 2 with the current build?
+
+❯ typed by hand, so if there is an aparant mismatch or error, I can verify.     
+  My earlier statement that it is gapless between track 3 and 4, I'm not 100%   
+  sure. I'll verify with a disc that is 100% sure to be gapless.                
+
+⏺ Thanks. A few values worth checking against the screen, because they're the
+  ones the analysis leans on, or that look odd:
+  - Track 3→4: E6:33.01 and N0.00. These show that L (6:31.30) was passed by 2
+    s.
+  - Track 4→5: E6:57.01 and G-35.70.
+  - The odd entries mid-track 4: E5:44.0 N11.91 and 01 … E1:11.91 N46.00. Was it
+    really 91 in both places? A frames value of 91 can't be a real time, so
+    that is what makes me think it's a different message.
+  - Last block: L7:31.01. The other blocks show 7:31.03; probably a typing slip,
+    and it doesn't matter for the conclusion.
+
+  About tracks 3→4: the diagnostic already shows what counts here. N0.00 means
+  the CD unit went straight to track 4 at 0:00 without a gap countdown. Even if
+  the music has silence at the end of track 3, that silence is part of track 3.
+  Silence like that runs as normal elapsed time and is included in the track's
+  length. For the remaining time, "gapless" means no countdown (N), not no
+  audible silence. So the 3→4 result should hold either way.
+
+  A disc that is certainly gapless is still a good confirmation. With the rule
+  from CD 4, every change on it should show R −0:02 with N0.00. If CD 1 (2 s
+  gaps) shows R 0:00 with G-2.xx, the rule is confirmed for both cases.
+
+❯ last block is a typo, should be indeed 04 L7:31.03 R0:34                      
+  For 91, that is indeed the value                                              
+
+⏺ Thanks, that confirms both.
+
+  L7:31.03: the CD 4 analysis stands as it is. The CD unit's length is the
+  distance from one track start to the next, minus a fixed 2 s.
+
+  91 frames: a real time can't have that, so the CD unit does send a different
+  message under the time-message type. The firmware's own time handling reads it
+  as a time message too. At that moment it takes "track 01" and "1:11" as the
+  current position, and my patches act on it as well:
+  - Length request: sees another track and asks for a length. That's harmless,
+    because the answer is for the track really playing.
+  - Time fill: gets confused for a moment.
+  - Display: could briefly show a wrong track or time. In the diagnostic you
+    only see it in the "TRACK ENDS" list.
+
+  If it happens regularly, it's a real (small) bug worth fixing. The fix would
+  be to ignore these messages, but that needs a reliable way to recognise them.
+  Frames above 74 is one sign, but the raw bytes would show what the message
+  really is.
+
+  I can add to the diagnostic build: on any time message with frames above 74,
+  show its raw bytes in hex on a spare line. Your next tests with CDs 1 and 2
+  would then also capture it if it happens again. Shall I add it now, before you
+  continue testing?
+
+❯ Real gapless CD, that without a debug build doesn't show the gap. It counts   
+  until 00:00 and then it's the next track.                                     
+  T01 m:sss.00                                                                  
+  L01 6:22.12                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  (nothing here)                                                                
+                                                                                
+  T02 m:sss.00                                                                  
+  L02 2:29.24                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  01 L6:22.12 R-0:02                                                            
+    E6:24.00 N0.00                                                              
+                                                                                
+  Mid track 2 the display froze, so don't know how track 3 would be. (no need   
+  to fix the freeze for the diagnostic build)                                   
+
+⏺ This confirms the rule on a disc that is certainly gapless:
+
+  ┌────────────────┬──────────────────────────────────┐
+  │                │                                  │
+  ├────────────────┼──────────────────────────────────┤
+  │ Length L       │ 6:22.12                          │
+  ├────────────────┼──────────────────────────────────┤
+  │ Last elapsed E │ 6:24.00                          │
+  ├────────────────┼──────────────────────────────────┤
+  │ What followed  │ track 2 started directly (N0.00) │
+  ├────────────────┼──────────────────────────────────┤
+  │ R at the end   │ −0:02                            │
+  └────────────────┴──────────────────────────────────┘
+
+  It matches CD 4's tracks 3→4 exactly. The normal build behaves as you describe
+  because it never shows negative remaining time. It counts down to 0:00, which
+  it reaches 2 s before the track really ends, stays there for those 2 s, and
+  then the next track starts. On a gapless disc, every track's countdown ends 2
+  s early.
+
+  The freeze: fine to leave for the diagnostic build. If you notice it in a
+  normal build, let me know. One thing that would help place it: when the screen
+  froze, did the music keep playing and did the buttons still work?
+
+  Remaining test: CD 1 (2 s gaps). The rule predicts R 0:00 with G-2.xx there,
+  so every track would end exactly. If that holds, all three cases follow from
+  "length = start to next start − 2 s":
+
+  ┌─────────────────────┬────────────────────────┬──────────────────────────┐
+  │ Gap after the track │     Display today      │   With +2 s correction   │
+  ├─────────────────────┼────────────────────────┼──────────────────────────┤
+  │ None (gapless)      │ reaches 0:00 2 s early │ ends exactly at 0:00     │
+  ├─────────────────────┼────────────────────────┼──────────────────────────┤
+  │ 2 s                 │ ends exactly at 0:00   │ ends at 0:02, then −0:02 │
+  ├─────────────────────┼────────────────────────┼──────────────────────────┤
+  │ Longer, g s         │ ends at g−2, then −g   │ ends at g, then −g       │
+  └─────────────────────┴────────────────────────┴──────────────────────────┘
+
+  Once CD 1 confirms it, the choice is between those two columns, or a setting
+  in build_patch.py to choose.
+
+❯ During freeze, music kept playing, but buttons didn't work. I had to pull the 
+  power                                                                         
+
+⏺ A frozen display with dead buttons while the music plays means the player's
+  main loop stopped running. The CD unit plays on by itself. You said there's no
+  need to fix it in the diagnostic, but I want to make sure it can't come from
+  the normal patches. Checking whether the diagnostic's own code could get
+  stuck. First, the firmware's character drawing function, which the diagnostic
+  calls directly:
+
+⏺ The garbled character comes from the diagnostic's ? glyph falling outside the
+  font, not from a hang. Next I'm running a fuzz test with thousands of random
+  length and time messages, including invalid ones like your 91 frames.
+
+⏺ The diagnostic code returns even with corrupt messages, so the hang is likely
+  in the CD-command queue's add function blocking when full; I'm checking that
+  next.
+
+⏺ The queue doesn't wait either: when it's full, it simply drops the new
+  command.
+
+  What I checked:
+  - The diagnostic code: 20,000 random and corrupt messages, including
+    impossible frames like your 91, run through its message and drawing code.
+    Every call returned, the longest after about 3,000 instructions, and nothing
+    outside its own memory was written. It has no loop that can get stuck.
+  - Characters outside the font, such as ?: they only draw as garbage (your
+    garbled character), not a hang.
+  - The CD command queue, which the length request uses: when it's full, it
+    drops the new command instead of waiting. So frequent length requests can't
+    block the main loop.
+
+  What I can't rule out:
+  - The direct screen drawing. The diagnostic writes to the screen itself
+    instead of through LVGL. That's the one thing it does differently from a
+    normal build. The earlier diagnostics drew the same way through long tests
+    without a freeze, though.
+  - The firmware's own communication with the CD unit or the screen: a hardware
+    wait that never ends. That could happen in the original firmware too.
+
+  With one occurrence and no traceable cause, I'd treat it as diagnostic-only
+  for now, as you suggested. If a normal build ever freezes, note what was
+  happening, such as the track, any key pressed, or a disc change. Pulling the
+  power is safe: the firmware only writes flash when saving settings, a moment
+  after you change one.
+
+  For CD 1, the current diagnostic build is fine. If it freezes again, the
+  "TRACK ENDS" entries up to that point are still useful.
+
+❯ I actually tried CD #2 first. Note that every 2 songs after each other have   
+  the exact same length. Playing tracks 1-3 shows:                              
+  T01 m:ss.00                                                                   
+  L01 1:00.00                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+                                                                                
+  T02 -0:0s.74 GAP                                                              
+  L02 1:00.09                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  01 L1:00.09 R0:03                                                             
+    E0:57.00 G-4.74                                                             
+                                                                                
+  T02 m:ss.00                                                                   
+  L02 1:00.09                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  01 L1:00.09 R0:03                                                             
+    E0:57.00 G-4.74                                                             
+                                                                                
+  T03 00:0s.74 GAP                                                              
+  L03 0:32.21                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  02 L1.00.09 R0:03                                                             
+    E0:57.00 G-4:74                                                             
+  01 L01:00.09 R0:03                                                            
+    E0:57.00 G-4.74                                                             
+                                                                                
+  T03 m:ss.00                                                                   
+  L03 0:32.21                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  02 L1.00.09 R0:03                                                             
+    E0:57.00 G-4:74                                                             
+  01 L01:00.09 R0:03                                                            
+    E0:57.00 G-4.74                                                             
+
+⏺ This data looks like CD 3 rather than CD 2: tracks of about 1:00 and 0:32,
+  with a gap countdown before each track (G-4.74). By your list, CD 2 is
+  completely gapless and CD 3 has short tracks with 5 s gaps. Was it CD 3, or
+  does CD 2 have gaps after all?
+
+  Either way, the result fits the rule exactly:
+
+  ┌─────────────────┬────────────────────────────┬─────────────┐
+  │                 │        Track 1 → 2         │ Track 2 → 3 │
+  ├─────────────────┼────────────────────────────┼─────────────┤
+  │ Length L        │ 1:00.09                    │ 1:00.09     │
+  ├─────────────────┼────────────────────────────┼─────────────┤
+  │ Last elapsed E  │ 0:57.00                    │ 0:57.00     │
+  ├─────────────────┼────────────────────────────┼─────────────┤
+  │ First gap value │ −4.74 (a gap of about 5 s) │ −4.74       │
+  ├─────────────────┼────────────────────────────┼─────────────┤
+  │ R at the end    │ 0:03                       │ 0:03        │
+  └─────────────────┴────────────────────────────┴─────────────┘
+
+  The rule predicted 0:03 for 5 s gaps (gap − 2 s), and that's what it shows.
+  All three cases so far fit "length = start to next start − 2 s":
+
+  ┌─────────────────────┬────────────────────────┬────────────────┐
+  │ Gap after the track │ Predicted R at the end │    Measured    │
+  ├─────────────────────┼────────────────────────┼────────────────┤
+  │ None (two discs)    │ −0:02                  │ −0:02 ✓        │
+  ├─────────────────────┼────────────────────────┼────────────────┤
+  │ About 5 s           │ 0:03                   │ 0:03 ✓         │
+  ├─────────────────────┼────────────────────────┼────────────────┤
+  │ About 35.7 s        │ about 0:34             │ 0:34 ✓         │
+  ├─────────────────────┼────────────────────────┼────────────────┤
+  │ 2 s                 │ 0:00                   │ not yet tested │
+  └─────────────────────┴────────────────────────┴────────────────┘
+
+  The two tracks with identical lengths aren't a problem. The length request
+  tracks which track a length belongs to, not the value, so equal lengths don't
+  confuse it. That's visible here: track 2 got its own length message (L02 
+  1:00.09).
+
+  A few small differences that look like typing, but check if you can:
+  - The first block shows L01 1:00.00; later entries show 1:00.09.
+  - In the fourth block the gap line reads T03 00:0s.74 without the minus sign.
+
+  The one case left is a disc with 2 s gaps (CD 1). If it ends at R 0:00, the
+  rule holds everywhere. Then the choice is how the firmware should treat it, as
+  in the table from before.
+
+❯ Yes, it was CD 3, with the short tracks and 4-5s gaps. Message before I wrote 
+  about real gapless CD, that was CD 2                                          
+
+⏺ Thanks, that's consistent then:
+
+  ┌───────────────────────┬──────────────────┬──────────────┬──────────────┐
+  │          CD           │  Gap after the   │ R at the end │    Rule      │
+  │                       │      track       │              │   predicts   │
+  ├───────────────────────┼──────────────────┼──────────────┼──────────────┤
+  │ CD 2 (certainly       │ none             │ −0:02        │ −0:02 ✓      │
+  │ gapless)              │                  │              │              │
+  ├───────────────────────┼──────────────────┼──────────────┼──────────────┤
+  │ CD 4, tracks 3→4      │ none             │ −0:02        │ −0:02 ✓      │
+  ├───────────────────────┼──────────────────┼──────────────┼──────────────┤
+  │ CD 3 (short tracks)   │ about 5 s        │ 0:03         │ 0:03 ✓       │
+  ├───────────────────────┼──────────────────┼──────────────┼──────────────┤
+  │ CD 4, tracks 4→5      │ about 35.7 s     │ 0:34         │ about 0:34 ✓ │
+  ├───────────────────────┼──────────────────┼──────────────┼──────────────┤
+  │ CD 1                  │ 2 s              │ not yet      │ 0:00         │
+  │                       │                  │ tested       │              │
+  └───────────────────────┴──────────────────┴──────────────┴──────────────┘
+
+  All four measured cases fit "length = start to next start − 2 s". CD 1 is the
+  last check. If it ends at R 0:00 with G-1.xx or G-2.xx, the rule is confirmed
+  for every gap type, and the choice is how the firmware should handle it.
+
+❯ I think this is a 2s gap CD (Keane - Hopes and Fears, UK edition), although I 
+  haven't verified it with a normal build if it shows -0:02.                    
+  T01 m:ss.00                                                                   
+  L01 3:55.40                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+                                                                                
+  T02 m:ss.0x                                                                   
+  L02 3:38.09                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  01 L3:55.40 R-0:02                                                            
+    E3:57.00 G-0.29                                                             
+                                                                                
+  T03 m:ss.00                                                                   
+  L03 3:10.24                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  02 L3:38.09 R-0:02                                                            
+    E3:40.00 M0.00                                                              
+  01 L3:55.40 R-0:02                                                            
+    E3:57.00 G-0.29                                                             
+  Ran 4 shell commands (ctrl+o to expand)
+
+⏺ CD 1 also fits the rule, but it doesn't have 2-second gaps. The pauses you
+  hear are silence recorded inside the tracks, not gaps the module counts down.
+
+  ┌────────┬────────────┬────────────┬─────────────┬──────────────┬────────┐
+  │ Change │ L (module  │  E (last   │ Next start  │   Gap seen   │ R at   │
+  │        │  length)   │  elapsed)  │  (L + 2 s)  │              │  end   │
+  ├────────┼────────────┼────────────┼─────────────┼──────────────┼────────┤
+  │        │            │            │             │ G-0.29:      │        │
+  │ 1→2    │ 3:55.40    │ 3:57.00    │ 3:57.40     │ about        │ −0:02  │
+  │        │            │            │             │ 0.3–0.4 s    │        │
+  ├────────┼────────────┼────────────┼─────────────┼──────────────┼────────┤
+  │ 2→3    │ 3:38.09    │ 3:40.00    │ 3:40.09     │ N0.00: none  │ −0:02  │
+  └────────┴────────────┴────────────┴─────────────┴──────────────┴────────┘
+
+  The diag code has no "M" flag, so M0.00 must be N0.00. A normal build would
+  show −0:01 for at most one message at the 1→2 change and nothing at 2→3.
+
+  The rule holds for every gap length tested (none, about 0.4 s, about 5 s, 35.7
+  s):
+
+  - The module's track length = time from this track's start to the next track's
+    start − 2 s.
+  - The track number changes when the gap before the next track begins.
+  - So R at the end of a track = gap − 2 s.
+
+  What the firmware can and can't do:
+  - It can't make every track end at exactly 0:00. The module only tells us
+    where each track starts, not how long the gap before the next one is. The
+    gap shows up only once the next track's countdown is already running.
+  - It can add back the 2 s the module always subtracts. That adds a fixed
+    module offset; it doesn't assume anything about gap lengths. Remaining time
+    would then always mean "time until the next track's music starts":
+
+  | Gap                     | Today                  | With +2 s              |
+  |-------------------------|------------------------|------------------------|
+  | None (most CDs)         | 0:00 reached 2 s early | ends exactly at 0:00   |
+  | About 0.4 s (CD 1, 1→2) | 0:00 early, −0:01 blip | about 0:00, −0:01 blip |
+  | 5 s (CD 3)              | 0:03, then −0:05…      | 0:05, then −0:05…      |
+  | 35.7 s (CD 4)           | 0:34, then −0:35…      | 0:36, then −0:35…      |
+
+  My recommendation: add the 2 s, but only in the remaining-time calculation.
+  The stored length at +0x108 would stay as it is, because the firmware's own
+  end-of-track check (END_CHECK 0x0800D190) and the length-request logic use it.
+  I'd make it a config option, REMAINING_ADD_S = 2; setting it to 0 gives
+  today's behaviour.
+
+  Should I build that as v30? It would be emulator-tested only until you try it
+  on the device.
+
+❯ M was a typo. Here up to track 4:                                             
+  T01 m:ss.00                                                                   
+  L01 3:55.40                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+                                                                                
+  T02 m:ss.0x                                                                   
+  L02 3:38.09                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  01 L3:55.40 R-0:02                                                            
+    E3:57.00 G-0.29                                                             
+                                                                                
+  T03 m:ss.00                                                                   
+  L03 3:10.24                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  02 L3:38.09 R-0:02                                                            
+    E3:40.00 N0.00                                                              
+  01 L3:55.40 R-0:02                                                            
+    E3:57.00 G-0.29                                                             
+                                                                                
+  T04 m:ss.00                                                                   
+  L04 3:33.06                                                                   
+  R m:ss                                                                        
+  TRACK ENDS:                                                                   
+  03 L3:10.24 R-0:02                                                            
+    E3:12.00 N0:00                                                              
+  02 L3:38.09 R-0:02                                                            
+    E3:40.00 N0:00                                                              
+
+⏺ Tracks 3→4 fit the rule as well:
+
+  ┌────────┬─────────┬─────────┬────────────────────┬────────────┬─────────┐
+  │ Change │    L    │    E    │ Next start (L + 2  │    Gap     │  R at   │
+  │        │         │         │         s)         │            │   end   │
+  ├────────┼─────────┼─────────┼────────────────────┼────────────┼─────────┤
+  │ 1→2    │ 3:55.40 │ 3:57.00 │ 3:57.40            │ about 0.3  │ −0:02   │
+  │        │         │         │                    │ s          │         │
+  ├────────┼─────────┼─────────┼────────────────────┼────────────┼─────────┤
+  │ 2→3    │ 3:38.09 │ 3:40.00 │ 3:40.09            │ none       │ −0:02   │
+  ├────────┼─────────┼─────────┼────────────────────┼────────────┼─────────┤
+  │ 3→4    │ 3:10.24 │ 3:12.00 │ 3:12.24            │ none       │ −0:02   │
+  └────────┴─────────┴─────────┴────────────────────┴────────────┴─────────┘
+
+  So every disc and every change tested gives the same result: the module's
+  length is exactly 2 s shorter than the time from one track start to the next.
+  Nothing else needs testing.
+
+  The proposal from my previous message is unchanged: add the 2 s back, but only
+  in the remaining-time display, as the config option REMAINING_ADD_S = 2 (0
+  keeps today's behaviour). Gapless tracks like these would then end exactly at
+  0:00. Tracks with a gap would end at the gap length and then count it down.
+
+  Do you want that as v30?
+
+❯ So CDs with gaps would shows 00:03 -> 00:02 -> -0:02 -> -0:01 ?               
+
+⏺ Yes, that is the sequence for a CD with 2 s gaps after the change. In general,
+  with the +2 s correction, a track followed by a gap of g seconds ends at +g
+  and then counts down from −g. The digits mirror each other:
+
+  ┌──────┬─────────────────────────────────┬─────────────────────────────────┐
+  │ Gap  │              Today              │            With +2 s            │
+  ├──────┼─────────────────────────────────┼─────────────────────────────────┤
+  │ None │ … 0:01, 0:00, 0:00, 0:00 → next │ … 0:01, 0:00 → next track       │
+  │      │  track                          │                                 │
+  ├──────┼─────────────────────────────────┼─────────────────────────────────┤
+  │ 2 s  │ … 0:01, 0:00 → −0:02, −0:01 →   │ … 0:03, 0:02 → −0:02, −0:01 →   │
+  │      │ next track                      │ next track                      │
+  ├──────┼─────────────────────────────────┼─────────────────────────────────┤
+  │ 5 s  │ … 0:04, 0:03 → −0:05 … −0:01    │ … 0:06, 0:05 → −0:05 … −0:01    │
+  └──────┴─────────────────────────────────┴─────────────────────────────────┘
+
+  Today the jump comes out uneven: you see 0:03 → −0:05 on a 5 s gap disc, and
+  the gapless discs sit at 0:00 for 2 s. With the correction the jump is always
+  symmetric (+g → −g), and gapless discs end exactly.
+
+  The firmware still can't count down to 0:00 and then continue into the gap
+  without a jump. It only learns the gap's length once the next track's
+  countdown has already started.
+
+❯ yes, make it v30                                                              
+
+⏺ I've built v30 as patch/IAP_PL100_1v1_b250219_all_v30.hex. It's tested in the
+  emulator only, not yet on the device, and nothing is committed.
+
+  Change in build_patch.py:
+  - New config option REMAINING_ADD_S = 2, next to PREGAP_MINUS_ON.
+  - The remaining-time calculation adds it to the track length. It's skipped
+    while the length is still unknown (0:00), so the display falls back to
+    elapsed time as before.
+  - Only the display changes. The stored length at +0x108 stays as the module
+    reports it, so the end-of-track check and the length request work as before.
+  - The docstring for patch 5 describes the module's −2 s and the +g → −g jump
+    at a gap.
+
+  Checks:
+  - With REMAINING_ADD_S = 0 the build is byte-identical to v29. The release
+    build is reproducible, with CRLF line endings.
+  - I ran the time formatting in the emulator for a 3:55 track:
+
+  | Elapsed | v29  | v30  |
+  |---------|------|------|
+  | 3:50    | 0:05 | 0:07 |
+  | 3:55    | 0:00 | 0:02 |
+  | 3:56    | 0:00 | 0:01 |
+  | 3:57    | 0:00 | 0:00 |
+    These also came out the same in both versions:
+    - elapsed mode;
+    - the gap display (−0:02);
+    - the fallback while the length is unknown.
+
+  On the device:
+  - A gapless disc (CD 2, or CD 1) should now count down to 0:00 exactly as the
+    next track starts.
+  - CD 3 (5 s gaps) should end at 0:05 and then show −0:05.
+  - CD 4, track 4 should end at about 0:36 and then show −0:35.
+
+  I added the finding to patch/CLAUDE.md (status now dated 2026-11-14) and to
+  memory.
+
+  For the README: the remaining-time section could mention that a track before a
+  gap ends at the gap length rather than 0:00, and the new REMAINING_ADD_S
+  option.
+
+  The track-end diagnostic is still uncommitted, in a scratchpad worktree on
+  branch diagnostic-track-end. It's lost if the scratchpad is cleaned, so tell
+  me if you want it committed to that branch.
+
+❯ For the last track, this was corrected already that this ends at 00:00. With  
+  this patch, what would happen there?                                          
+
+⏺ I don't know yet, because we haven't measured the last track. Every
+  measurement so far was at a track change, and the last track has no next
+  track. Its end is the disc's lead-out. There are two possibilities:
+
+  ┌─────────────────────┬────────────────────────────┬─────────────────────┐
+  │ The module's length │        Today (v29)         │         v30         │
+  │  for the last track │                            │                     │
+  ├─────────────────────┼────────────────────────────┼─────────────────────┤
+  │ Also 2 s short,     │ 0:00 is reached 2 s early  │ counts down to 0:00 │
+  │ like every other    │ and stays until the disc   │  exactly at the end │
+  │ track               │ stops                      │  ✓                  │
+  ├─────────────────────┼────────────────────────────┼─────────────────────┤
+  │ Exact (no −2 s)     │ ends at 0:00 ✓             │ stops at 0:02       │
+  └─────────────────────┴────────────────────────────┴─────────────────────┘
+
+  What you see today (it ends at 0:00) fits both. The display clamps at 0:00, so
+  a 2 s wait at 0:00 at the very end is easy to miss.
+
+  The earlier fix doesn't decide it either. LAST_TRACK_FULL_ON only removed the
+  firmware's own stop 2 s before the length. The module's end-of-disc message
+  now stops playback. v30 doesn't change any of that, because the stored length
+  and the stop logic are untouched. Only the number on the display changes.
+
+  My guess is the first case. The module most likely calculates every length the
+  same way, as next start − start − 2 s, with the lead-out as the "next start"
+  for the last track. But that's a guess.
+
+  How to check: play the last track of any disc to the end with the diagnostic
+  build, then read the screen after it stops:
+  - L is the last track's length;
+  - T is the last time message's elapsed time.
+
+  If T is about L + 2 s, v30 is right for the last track as well. If T is about
+  L, the last track needs an exception. I'd then add the 2 s only when it isn't
+  the last track. That's easy, because the total number of tracks is known
+  (+0xF4).
+
+  If the first case is right, the last-track safety net is tighter than I
+  assumed. It stops 3 s after the stored length, which would be only about 1 s
+  after the real end. It doesn't affect v30. The safety net only acts if the
+  module's end-of-disc message doesn't arrive, and on the device the message
+  does arrive.                                                                        
+
+❯ With the diagnostic build, the last song actually repeats, and no message is  
+  displayed for that on the screen. So might be inconclusive? I can test it on  
+  v30                                                                           
+
+⏺ Yes, the diagnostic result is inconclusive. It only records a track end when
+  the track number changes. A restart of the same track doesn't count, so the
+  end of the last track never reached the screen. The live lines could have
+  shown it, but only if you were watching in the last seconds before the
+  restart.
+
+  Testing on v30 works fine. Watch the last few seconds of the last track:
+
+  - The countdown reaches 0:00 just as the music stops: the module's last-track
+    length is also 2 s short, and v30 is right for every track.
+  - The music stops while the display still shows 0:01 or 0:02: the last track's
+    length is exact. I'd then add the 2 s only for tracks other than the last.
+
+  Use normal play mode, not repeat or shuffle, and a disc whose last track
+  doesn't fade out into a few seconds of silence. Otherwise it's hard to hear
+  exactly when it ends.
+
+  Also watch whether v30 repeats the last song. It shouldn't, because v29 stops
+  at the end of the disc as far as I know.
+  - If v30 stops normally: the repeat is something only the diagnostic build
+    does, like the freeze, and I'd leave it.
+  - If v30 also repeats it: that's a real bug. Tell me, and I'll look at the
+    end-of-disc handling.
+
+❯ also build a v31 with phase-tracking time fill so I can test if that works    
+  better                                                                        
+
+⏺ I've built v31 as patch/IAP_PL100_1v1_b250219_all_v31.hex. It's v30 plus
+  phase-tracking time fill, tested in the emulator only and not committed.
+
+  How it works
+  - Timing base: a new option TIME_FILL_PHASE_ON = True. The fill now works from
+    an estimate of when each second really starts on the disc, called the
+    phase, instead of from when the last message arrived.
+  - How the estimate is kept: a message can't arrive before its second has
+    begun. So each message for the next second sets the estimate to whichever is
+    earlier: the message's arrival, or the previous estimate + 1 s. A repeat of
+    the same second can only move it earlier. Late messages therefore no longer
+    shift the timing.
+  - When the estimate restarts: at a jump, another track, the start or end of
+    the gap before a track, and the first message after playing starts.
+  - When a fill happens: a missing second is filled 37.5 ms after the estimated
+    start of the next second. So a filled second appears about when it really
+    begins.
+  - Finer clock: the timing uses 7.5 ms timer ticks instead of the 75 ms clock.
+    The firmware's sub-counter for that clock is at 0x2000018A.
+  - Cost: 88 bytes of code, and no new RAM. It reuses the existing u16 time
+    stamp.
+
+  Checks
+  - With TIME_FILL_PHASE_ON = False the build is byte-identical to v30.
+  - Simulated disc, run on v30 and v31: 300 s of play, messages delayed by a
+    random 0–450 ms, 7 % lost, a main-loop pass every ~40 ms, 3 random seeds.
+
+  |                                                         | v30        | v31
+       |
+  |---------------------------------------------------------|------------|------
+  ------|
+  | Delay of a displayed second after its real start (mean) | 83–94 ms   | 56–62
+  ms   |
+  | Spread of that delay                                    | 66–78 ms   | 32–39
+  ms   |
+  | Shortest displayed second                               | 588–720 ms |
+  787–865 ms |
+  | Seconds shorter than 0.8 s                              | 5–12       | 0–1
+       |
+  | Times shown ahead of the disc                           | 0          | 0
+       |
+  | Writes outside the expected RAM                         | none       | none
+       |
+
+  - Other cases, all correct in v31: the gap countdown, the move from the gap to
+    the track, a lost message at the track start, and a seek jump.
+  - A v30 issue this fixes: at the start of a track, v30 can fill the track's
+    0:01 too early. That's because v30 keeps the timing from the gap's last
+    0:00. v31 restarts the timing there.
+
+  Testing on the device: compare v30 and v31 on a disc, watching whether the
+  seconds tick evenly.
+  - Look in particular for seconds that show only briefly.
+  - Also watch the first seconds after a track change.
+  - v31 includes v30's +2 s remaining time, so the last-track test works on
+    either build.
+
+  For the README: if v31 stays, the time-fill description could mention
+  TIME_FILL_PHASE_ON.
+
+❯ For the track length and gaps, can it be explained again in a short way, as   
+  it is in the original firmware before any of the patches? What is the track   
+  length reported by the module. Is that actual length, actual length + gap,    
+  actual length + fixed 2 seconds, something else?                              
+
+⏺ Short version, as the CD module reports it in the original firmware, before
+  any patches:
+
+  Reported length = the distance from this track's start to the next track's 
+  start, minus 2 s.
+
+  That distance is the track's real length plus the gap before the next track,
+  so:
+
+  Reported length = actual length + next gap − 2 s.
+
+  ┌───────────────────────────┬─────────────────┐
+  │ Gap before the next track │ Reported length │
+  ├───────────────────────────┼─────────────────┤
+  │ none (gapless)            │ actual − 2 s    │
+  ├───────────────────────────┼─────────────────┤
+  │ 2 s                       │ exactly actual  │
+  ├───────────────────────────┼─────────────────┤
+  │ 5 s                       │ actual + 3 s    │
+  ├───────────────────────────┼─────────────────┤
+  │ 35.7 s                    │ actual + 33.7 s │
+  └───────────────────────────┴─────────────────┘
+
+  So it isn't the actual length, and it isn't the actual length plus the gap.
+  It's the actual length plus the gap minus a fixed 2 s. The module most likely
+  assumes every gap is the standard 2 s, so it's right only for discs that
+  really have 2 s gaps. The last track probably follows the same rule, with the
+  end of the disc in place of the next track's start, but we haven't measured
+  that.
+
+  What else the module does:
+  - It changes the track number (and the elapsed time) as soon as the gap before
+    the next track begins. The gap is then counted down as part of the next
+    track.
+  - It sends a track length only when asked. The original firmware asked about
+    every 22 s and when Repeat was pressed.
+
+  The original firmware had no remaining-time display. It used the length only
+  for its own end-of-track check, which acts 2 s before the reported length.
+
+❯ And now with the latest patches, adding the 2 seconds back, why does that not 
+  fix all the exceptions?                                                       
+
+⏺ Because adding 2 s only gives back the distance from this track's start to the
+  next track's start. That distance still includes the gap:
+
+  Reported length + 2 s = actual length + next gap.
+
+  Remaining time is that minus elapsed. So it counts down to where the next
+  track's music starts, not to where this track's music ends.
+
+  The gap is where the two differ. The module switches to the next track as soon
+  as the gap begins. At that moment this track's countdown still shows the gap
+  length, and the display jumps to the gap countdown:
+
+  ┌────────┬────────────────────┬───────────────┐
+  │  Gap   │ End of track (v30) │     Then      │
+  ├────────┼────────────────────┼───────────────┤
+  │ none   │ 0:00               │ next track ✓  │
+  ├────────┼────────────────────┼───────────────┤
+  │ 2 s    │ 0:02               │ −0:02, −0:01  │
+  ├────────┼────────────────────┼───────────────┤
+  │ 5 s    │ 0:05               │ −0:05 … −0:01 │
+  ├────────┼────────────────────┼───────────────┤
+  │ 35.7 s │ 0:36               │ −0:35 … −0:01 │
+  └────────┴────────────────────┴───────────────┘
+
+  Every track would end at 0:00 only if we subtracted the next gap. We can't,
+  because the module doesn't report the gap. Its length message gives only the
+  distance between track starts. The gap length shows up only when the module
+  starts counting it down, after this track has already ended.
+
+  The firmware could only learn gap lengths in advance by playing through them
+  first, or by reading the disc's full table of contents with the gap start
+  points. The module doesn't provide that.
+
+❯ Can the firmware read the full table of contents when the disc is inserted?   
+
+⏺ No. It wouldn't help even if it could, because the gaps aren't in a CD's table
+  of contents.
+
+  - What the TOC holds: only the start of each track's music (index 1) and the
+    end of the disc (the lead-out). It doesn't hold where the gaps start
+    (index 0).
+  - Where the gaps are recorded: only in the subcode that plays along with the
+    audio. You find them only by playing or reading past each track change.
+    That's the countdown the module shows us during a gap.
+  - How PC rippers do it: they detect gaps by scanning the subcode around every
+    track change, which takes a while.
+
+  So the module's lengths already contain everything the TOC has: the distance
+  between track starts. The gap lengths simply aren't on the disc in any form
+  that can be read in advance.
+
+  On this player, the firmware can't even read the TOC itself. The CD module
+  does all disc reading, and the firmware only has the few module commands we
+  know about (the disc length and the current track's length). An index scan
+  through the module would mean jumping to the end of every track and listening
+  for the countdown. That's not something the module offers as a command, and it
+  would take minutes per disc.
+
+  What's possible: the firmware notes a gap's length when it plays through it.
+  It could then show the correct end of that track the next time it plays, for
+  as long as the disc stays in. That's a lot of code for a small gain, and it
+  wouldn't help the first time through. I wouldn't do it, but I can if you want.
+
+❯ no, leave it as it is.                                                        
+  What might be an option, need advice. In time elapsed mode, I think the       
+  negative time adds meaning. It counts down until the next track begins. But   
+  in time elapsed mode, the timing go 00:04 -> 00:03 -> -0:02 -> -0:01 ->       
+  (length of next track). Would it make sense to not do negative time in time   
+  elapsed mode. I think that way it would always count down to exactly 00:00    
+  before starting the next track, regardless of the length of the gap or no gap 
+  at all.                                                                       
+
+⏺ I think you mean remaining-time mode for that sequence. Then yes, it makes
+  sense, and it works neatly because of v30's +2 s.
+
+  - Why it fits together: with the +2 s, remaining time at the end of a track
+    equals the gap length. The gap countdown starts at that same value. If
+    remaining mode shows the gap without the minus sign, the two run straight
+    into each other: one continuous countdown to 0:00, exactly when the next
+    track's music starts.
+  - Sequences per gap, in remaining mode:
+
+  | Gap    | v30 (with minus)                   | Without minus in remaining
+  mode  |
+  |--------|------------------------------------|-------------------------------
+  ---|
+  | none   | … 0:01, 0:00 → next                | … 0:01, 0:00 → next
+    |
+  | 2 s    | … 0:03, 0:02, −0:02, −0:01 → next  | … 0:03, 0:02, 0:01, 0:00 →
+  next  |
+  | 5 s    | … 0:06, 0:05, −0:05 … −0:01 → next | … 0:06, 0:05, 0:04 … 0:00 →
+  next |
+  | 35.7 s | … 0:37, 0:36, −0:35 … → next       | … 0:37, 0:36, 0:35 … 0:00 →
+  next |
+
+  - Elapsed mode keeps the minus, so there you still see that it's a gap.
+  - Two small details:
+    - Where the track's countdown hands over to the gap countdown, one second
+      can show a little longer or shorter. The two are rounded separately, and
+      the gap isn't exactly whole seconds (CD 3's was 4.74 s).
+    - In remaining mode you no longer see that you're in a gap rather than at
+      the end of the track. That's the point, though.
+  - The change is small: the minus is only drawn in elapsed mode. The value
+    shown during the gap stays the same.
+
+  My advice is to do it. It makes remaining mode mean "time until the next music
+  starts" in every case, and v30's +2 s makes the handover seamless.
+
+  Should I build it as v32, on top of v31?
+
+❯ yes, make it v32                                                              
+
+⏺ I've built v32 as patch/IAP_PL100_1v1_b250219_all_v32.hex. It's v31 with the
+  gap shown without the minus sign in remaining-time mode. It's tested in the
+  emulator only and not committed.
+
+  Change: a new option, PREGAP_MINUS_REMAINING = False. In remaining mode the
+  gap shows as 0:05 … 0:01 without the minus sign. Elapsed mode still shows
+  -0:05 … -0:01. The gap's value itself hasn't changed. The docstring for patch
+  5 explains this.
+
+  Checks:
+  - With PREGAP_MINUS_REMAINING = True the build is byte-identical to v31.
+  - The time formatting in the emulator gives:
+
+  | Situation                          | v31       | v32       |
+  |------------------------------------|-----------|-----------|
+  | Gap, 4.xx s left, remaining mode   | −0:05     | 0:05      |
+  | Gap, 4.xx s left, elapsed mode     | −0:05     | −0:05     |
+  | Gap, last part, remaining mode     | −0:01     | 0:01      |
+  | Normal remaining and elapsed times | unchanged | unchanged |
+
+  On the device, in remaining mode:
+  - On CD 3, a track should count down through the 5 s gap without a jump and
+    reach 0:00 when the next track starts.
+  - On CD 4, track 4 should count from about 0:36 straight through the 35 s gap.
+  - One second at the handover may last a little longer or shorter, as mentioned
+    before.
+
+  I updated patch/CLAUDE.md (v30–v32 are now under emulator-tested) and memory.
+  I also noted your decision not to learn gap lengths while playing.
+
+  For the README: remaining mode now counts down to the start of the next
+  track's music, with the gap included and no minus sign. Elapsed mode keeps the
+  minus sign. The new options are REMAINING_ADD_S, TIME_FILL_PHASE_ON and
+  PREGAP_MINUS_REMAINING.
+
+❯ With the numbers on the remote it is possible to directly change to a new     
+  track. However, this behaves a bit weird. First of all, I'm wondering if      
+  there are clues why this is implemented this way.                             
+  - it is not possible to enter numbers higher than 39. On a disc with 50       
+  track, pressing 3 and 9 shortly after each other works, but pressing 4 and 0  
+  doesn't work.                                                                 
+  - entering a number that is higher than the total tracks will play the last   
+  track.                                                                        
+
+⏺ The number keys are implemented as "type a number, and it plays after a
+  pause". A helper tries to start the track early when no further digit could be
+  valid, but its thresholds are wrong for most disc sizes. Both things you saw
+  come from that helper (0x0800E518).
+
+  How it works:
+  - Each digit key (IR 0x10–0x19 → keys 0x0A, 0x01–0x09) does number = number × 
+    10 + digit. It shows the number on line 2 and restarts a 2.25 s timer
+    (0x20000186, counted down in the 7.5 ms timer interrupt).
+  - When the timer runs out, the firmware presses Play for you. Play sees that a
+    number entry is active (flag 0x20000184) and plays that track (0x20000182).
+  - After every digit, the helper decides whether to start at once instead of
+    waiting the 2.25 s. It does that by setting the timer to 2 ticks, 15 ms.
+
+  What the helper does:
+
+  ┌──────────────────┬──────────────────────────────────────────────────────┐
+  │  Tracks on the   │          Starts at once when the number is           │
+  │       disc       │                                                      │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ any              │ above the track count, after changing it to the last │
+  │                  │  track                                               │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ 10–19            │ 2 or more                                            │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ 20–29            │ 3 or more                                            │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ 30–99            │ 4 or more                                            │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ 100–199          │ 20 or more                                           │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ 200+             │ more than 30                                         │
+  ├──────────────────┼──────────────────────────────────────────────────────┤
+  │ under 10         │ never (it always waits 2.25 s)                       │
+  └──────────────────┴──────────────────────────────────────────────────────┘
+
+  Why 40 doesn't work: the developer apparently meant "start at once when
+  another digit can't give a valid track", which is when number × 10 > the track
+  count. They wrote fixed values per range instead. The value 4 is right for
+  30–39 tracks, but the 30–99 range uses it as well. On your 50-track disc:
+  - Pressing 4: 4 ≥ 4, so track 4 starts immediately.
+  - Then 0: it starts a new entry with the number 0, which plays "track 0" after
+    2.25 s.
+  - Pressing 3 then 9: 3 is below 4, so it waits, and 39 works.
+
+  The same mistake hides in the 100–199 range. With 150 tracks, typing 2 then 5
+  starts 25 straight away, which is right. But typing 1 then 6 starts 16, so you
+  can never reach 160 or above, while 150 itself is reachable.
+
+  Higher than the track count plays the last track: that's deliberate. It's the
+  first check in the helper (0x0800E518): it changes the number to the track
+  count and starts at once. It isn't a bug, but it's a debatable choice. A typo
+  like 60 instead of 6 on a 50-track disc jumps to the end.
+
+  A possible fix, a small patch to that helper:
+  - Start early: when number × 10 > track count. That's correct for every disc
+    size, and on discs under 10 tracks every single digit starts at once.
+  - Above the track count, one of:
+    - keep the jump to the last track;
+    - ignore the entry and keep playing what's playing;
+    - start a new entry with the last digit typed. With 50 tracks, typing 6 then
+      7 would then wait for more digits after the 7.
+  - "0" as the first digit: I'd ignore it, so "05" means track 5.
+
+  Do you want this as v33? And which behaviour do you want above the track
+  count?
+
+❯ During entry, the time on the display changes to "Tr#" where # is the number  
+  entered. For this patch, can this be extended to show some visual clue that   
+  another number could be entered? For example with the 50 track disk, pressing 
+  1 could show "Tr1-" to indicate that another number can be entered. If not    
+  entered, after the 2.25s it shows "Tr1" and plays track 1. If 6 is entered,   
+  immediately show "Tr6" and play track 6, as there are no other tracks         
+  starting with a 6. This would also allow entering 0 and it could show "Tr0-". 
+  Entering then 2 would play track 2, and it is a quick way to play track 2     
+  without waitinng for the 2.25s delay to finish.                               
+  Before building, first ask question and provide feedback.                     
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Your proposal works, but the rule needs a second condition for leading zeros:
+  stop once the typed digits equal the track count's digit count, so 50 tracks
+  plays track 2 at once after "0" and "2", while 150 tracks waits after "0" then
+  "5" for a third digit. I'll write the Tr text myself to keep leading zeros
+  visible, and leave the 2.25 s wait and existing behaviour unchanged.
+
+⏺ User answered Claude's questions:
+     · A number above the track count can still be typed: with 50 tracks, '5' 
+     shows 'Tr5-' (50 is valid), then '7' gives 57. What should happen? → Cancel
+     the entry (Recommended)
+     · What should happen when the entry is only zeros ('0' then the 2.25 s 
+     timeout, or '00' on a 10–99 track disc)? → Cancel the entry (Recommended)
+
+⏺ I've built v33 as patch/IAP_PL100_1v1_b250219_all_v33.hex. It's v32 plus a new
+  patch, number, which is included by default. It's tested in the emulator only
+  and not committed.
+
+  What it does:
+  - A digit that can still be followed by another: line 2 shows a dash, as in
+    Tr1-, and the track plays after the usual 2.25 s.
+  - Otherwise the track plays at once. Another digit can follow only while
+    number × 10 ≤ track count and fewer digits have been typed than the track
+    count has.
+  - Digits show as typed, so a leading 0 is a quick way to tracks below 10,
+    without the wait.
+  - A number above the track count, or only zeros, cancels the entry. Line 2
+    shows the time again and play continues, as you chose.
+
+  Emulator results: these ran the firmware's own digit-key handlers, with the
+  patch replacing the helper and the text formatting.
+
+  ┌────────┬─────────┬─────────────────┬────────────────────────────────────┐
+  │ Tracks │  Keys   │     Display     │               Result               │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 1       │ Tr1-            │ track 1 after 2.25 s               │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 6       │ Tr6             │ track 6 at once                    │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 4, 0    │ Tr4-, Tr40      │ track 40 at once (didn't work      │
+  │        │         │                 │ before)                            │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 5, 7    │ Tr5-            │ cancelled                          │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 0, 2    │ Tr0-, Tr02      │ track 2 at once                    │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 50     │ 0 / 0,  │ Tr0-            │ cancelled                          │
+  │        │ 0       │                 │                                    │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 9      │ 5       │ Tr5             │ track 5 at once                    │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 12     │ 1, 3    │ Tr1-            │ cancelled                          │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 150    │ 1, 6    │ Tr1-, Tr16      │ track 16 at once, since 160        │
+  │        │         │                 │ doesn't exist                      │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 150    │ 0, 5, 7 │ Tr0-, Tr05-,    │ track 57 at once                   │
+  │        │         │ Tr057           │                                    │
+  ├────────┼─────────┼─────────────────┼────────────────────────────────────┤
+  │ 150    │ 1, 5, 1 │ Tr1-, Tr15-     │ cancelled                          │
+  └────────┴─────────┴─────────────────┴────────────────────────────────────┘
+
+  The build without number is byte-identical to v32. The patch writes no RAM
+  except the entry variables, the display flags and one spare byte (0x2000029F)
+  for the digit count and dash.
+
+  How it's hooked:
+  - The 10 digit handlers each get two call replacements.
+  - The firmware's helper (0x0800E518) is replaced entirely.
+  - The timeout's call to Play (0x0800E202) checks for number 0 first. That call
+    runs in the timer interrupt, as in the original firmware.
+
+  As expected: the final Tr6 without the dash shows only for a moment, because
+  the track starts right away.
+
+  For the README: the new patch number (number keys), and the usage line now
+  lists it.
