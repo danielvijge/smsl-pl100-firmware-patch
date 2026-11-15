@@ -123,6 +123,13 @@ Patch cdtime - time messages of the CD module.
     message since playing) restarts P at the arrival. The fill comes at
     P + 1 s + 37.5 ms, so a filled second appears about when it really
     starts and the real message after it changes nothing.
+  * TIME_MSG_CHECK_ON: the module once sent a time message (class 4, type
+    0x21) for track 1 at 1:11 with frames 91 in the middle of track 4; frames
+    only go to 74. The firmware stored it like any other, so for one message
+    the track and time were wrong (and shuffle, the length request and the
+    time fill saw a track change). Time messages with frames > 74 or seconds
+    > 59 are now dropped before anything is stored, the way the firmware
+    already skips them while its timer 0x20000566 runs.
   * Notes for each time message whether it is from the gap before a track,
     for PREGAP_MINUS_ON: the module counts the gap down, and those messages
     have a non-zero frames byte (normal play does too, occasionally, so a
@@ -378,6 +385,7 @@ TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, the
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
 LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
+TIME_MSG_CHECK_ON = True   # drop time messages with impossible values (frames > 74, seconds > 59)
 SAVER_CD_ON = True         # saver patch: also the moving CD modes CD/w and CD/c (~2.6 KB more)
 SAVER_IDLE_S = 180         # idle time before the screensaver starts
 SAVER_DIM_LEVEL = 5        # backlight level for DIM and CD (5 = 10 %; the brightness levels run backwards)
@@ -1769,7 +1777,44 @@ LEN_PERIOD_TIMER = 0x20000562  # u16: main-loop passes until the firmware's next
 LEN_PERIOD = 2000
 
 
+# TIME_MSG_CHECK_ON: the time message handler (type 0x21, 0x0800DD7C) starts
+# with "ldr r0, =0x20000566; ldrh r0, [r0]; cbz r0, go; b 0x0800D89E" (a
+# firmware timer that skips time messages while set; 0x0800D89E returns from
+# the parser). time_check() replaces the load and also reports "skip" for a
+# message with impossible values, so nothing of it is stored.
+TIME_MSG_SITE = 0x0800DD7C
+TIME_MSG_HOLD = 0x20000566
+TIME_CHECK = [
+    'time_check:',
+    ('ldr_lit', 'r0', 'lit_hold'),
+    ('ldrh', 'r0', 'r0', 0),
+    ('cbnz', 'r0', 'tc_ret'),
+    ('ldr_lit', 'r1', 'lit_msg_sec'),
+    ('ldrb', 'r0', 'r1', 0),         # +0x9C seconds
+    ('cmp', 'r0', 59),
+    ('bhi', 'tc_bad'),
+    ('ldrb', 'r0', 'r1', 1),         # +0x9D frames (1/75 s)
+    ('cmp', 'r0', 74),
+    ('bhi', 'tc_bad'),
+    ('movs', 'r0', 0),
+    'tc_ret:',
+    ('bx_lr',),
+    'tc_bad:',
+    ('movs', 'r0', 1),
+    ('bx_lr',),
+    ('align',),
+    'lit_hold:', ('word', TIME_MSG_HOLD),
+    'lit_msg_sec:', ('word', CD_STATE + 0x9C),
+]
+
+
 def patch_cdtime(img):
+    if TIME_MSG_CHECK_ON:
+        cave, lab = assemble(TIME_CHECK, cave_addr(img))
+        site, _ = assemble([('bl', lab['time_check'])], TIME_MSG_SITE)
+        patch(img, TIME_MSG_SITE, bytes.fromhex('c0480088'), site)   # ldr r0, =0x20000566; ldrh r0, [r0]
+        put(img, lab['time_check'], cave)
+        print(f"cdtime: time_check at {lab['time_check']:#x}, {len(cave)} bytes")
     if not (TIME_FILL_ON or PREGAP_MINUS_ON or LENGTH_REQUEST_ON):
         print('cdtime: off (TIME_FILL_ON, PREGAP_MINUS_ON and LENGTH_REQUEST_ON are False)')
         return
