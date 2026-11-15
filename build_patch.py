@@ -51,6 +51,9 @@ Patch 4 - Play pressed while the disc is still loading is lost.
     dead settings menu (0x200004DA = 2, record +0x2C). While it is on, the
     play icon shows at the empty slot, and a disc inserted later queues a Play
     when it starts loading (once per disc). Not for the reload after power-on.
+  * The empty slot is tray status 3 or 6 with no disc ready ([+0x11C] bit1,
+    the display's own test for "Disc"): a stopped MP3 disc also reports 6,
+    and Play there must start the disc, not toggle auto-play.
 
 Patch 5 - track time remaining, with an hourglass icon.
   * Remote key DISP (TIME_IR) toggles line 2 between elapsed track time and
@@ -76,7 +79,8 @@ Patch 5 - track time remaining, with an hourglass icon.
     0.3, 5 and 35.7 s gaps). Remaining time adds it back, so it counts down to
     the start of the next track's music: gapless tracks end at 0:00, a track
     before a g-second gap ends at g, then the gap counts down from -g (the
-    track number changes when the gap starts). Not for the last track: its
+    track number changes when the gap starts). Only on audio CDs ([+0x118]
+    bit0): MP3 / WMA files have exact lengths. Not for the last track: its
     length (to the end of the disc) is exact, and with the 2 s added it
     stopped at 0:02. Display only: the stored length (end-of-track check,
     length request) stays as reported.
@@ -571,6 +575,30 @@ TRAY_OPEN = [
 ]
 
 
+# slot_empty() -> r0: 1 at an empty slot ("Disc" on screen): tray status 3
+# or 6 and no disc ready ([+0x11C] bit1, the display's own test). A stopped
+# MP3 disc also reports 6, with the disc ready. Clobbers r0, r1.
+SLOT_EMPTY = [
+    'slot_empty:',
+    ('ldr_lit', 'r1', 'lit_state'),
+    ('ldrb', 'r0', 'r1', 7),
+    ('cmp', 'r0', 3),
+    ('beq', 'se_ready'),
+    ('cmp', 'r0', 6),
+    ('bne', 'se_no'),
+    'se_ready:',
+    ('ldr_lit', 'r1', 'lit_state_f4'),
+    ('ldr', 'r0', 'r1', 0x28),       # +0x11C
+    ('lsls', 'r0', 'r0', 30),        # bit1 -> sign
+    ('bmi', 'se_no'),
+    ('movs', 'r0', 1),
+    ('bx_lr',),
+    'se_no:',
+    ('movs', 'r0', 0),
+    ('bx_lr',),
+]
+
+
 # disc_ready() -> r0: TOC done ([+0x11C] bit1), track count known and, for an
 # audio CD ([+0x118] bit0), the total time received. Clobbers r0-r2.
 DISC_READY = [
@@ -643,12 +671,9 @@ PLAY_KEY = [
        ('ldrb', 'r0', 'r3', 4),
        ('cmp', 'r0', 1),
        ('bne', 'pd_go'),
-       ('ldrb', 'r0', 'r3', 7),
-       ('cmp', 'r0', 3),
-       ('beq', 'pd_toggle'),
-       ('cmp', 'r0', 6),
-       ('bne', 'pd_go'),
-       'pd_toggle:',
+       ('bl', 'slot_empty'),
+       ('cmp', 'r0', 0),
+       ('beq', 'pd_go'),
        ('ldr_lit', 'r1', 'lit_ap_setting'),
        ('ldrb', 'r0', 'r1', 0),
        ('cmp', 'r0', 2),
@@ -732,13 +757,12 @@ PLAY_KEY = [
        ('strb', 'r0', 'r1', 0),
        ('b', 'ap_done'),
        'ap_insert:',
-       ('ldr_lit', 'r1', 'lit_latch'),
        ('cmp', 'r0', 2),
-       ('beq', 'ap_unlatch'),
-       ('cmp', 'r0', 3),
-       ('beq', 'ap_unlatch'),
-       ('cmp', 'r0', 6),
-       ('beq', 'ap_unlatch'),
+       ('beq', 'ap_unlatch_l'),
+       ('bl', 'slot_empty'),
+       ('cbnz', 'r0', 'ap_unlatch_l'),
+       ('ldrb', 'r0', 'r3', 7),
+       ('ldr_lit', 'r1', 'lit_latch'),
        ('ldrb', 'r2', 'r1', 0),
        ('cbnz', 'r2', 'ap_done'),        # already queued for this disc
        ('cmp', 'r0', 1),
@@ -762,7 +786,8 @@ PLAY_KEY = [
        ('ldr_lit', 'r1', 'lit_pending'),
        ('strb', 'r0', 'r1', 0),
        ('b', 'ap_done'),
-       'ap_unlatch:',
+       'ap_unlatch_l:',
+       ('ldr_lit', 'r1', 'lit_latch'),
        ('movs', 'r2', 0),
        ('strb', 'r2', 'r1', 0),
        'ap_done:'] if AUTOPLAY_ON else []),
@@ -770,12 +795,13 @@ PLAY_KEY = [
     ('ldrb', 'r0', 'r4', 0),
     ('cbz', 'r0', 'poll_done'),
     ('ldr_lit', 'r3', 'lit_state'),
-    ('ldrb', 'r0', 'r3', 7),         # tray status 2 Eject / 3 Disc / 4 Block
-    ('cmp', 'r0', 6),                # / 6 Disc (load failed: no disc, e.g. Stop
-    ('beq', 'poll_cancel'),          # at an empty slot retries the load)
-    ('subs_i3', 'r0', 'r0', 2),
-    ('cmp', 'r0', 2),
-    ('bls', 'poll_cancel'),
+    ('ldrb', 'r0', 'r3', 7),         # tray status 2 Eject / 4 Block / 3, 6 Disc
+    ('cmp', 'r0', 2),                # (6: load failed, no disc, e.g. Stop at an
+    ('beq', 'poll_cancel'),          # empty slot retries the load; but also a
+    ('cmp', 'r0', 4),                # stopped MP3 disc, see slot_empty)
+    ('beq', 'poll_cancel'),
+    ('bl', 'slot_empty'),
+    ('cbnz', 'r0', 'poll_cancel'),
     ('ldrb', 'r0', 'r3', 4),
     ('cmp', 'r0', 1),
     ('bne', 'poll_cancel'),
@@ -807,12 +833,9 @@ PLAY_KEY = [
        ('ldrb', 'r0', 'r3', 4),
        ('cmp', 'r0', 1),
        ('bne', 'pi_done'),
-       ('ldrb', 'r0', 'r3', 7),
-       ('cmp', 'r0', 3),
-       ('beq', 'pi_ap'),
-       ('cmp', 'r0', 6),
-       ('bne', 'pi_done'),
-       'pi_ap:',
+       ('bl', 'slot_empty'),
+       ('cmp', 'r0', 0),
+       ('beq', 'pi_done'),
        ('ldr_lit', 'r0', 'lit_ap_setting'),
        ('ldrb', 'r0', 'r0', 0),
        ('cmp', 'r0', 2),
@@ -854,7 +877,7 @@ PLAY_KEY = [
     ('bl', 'DISC_RESET'),            # disctime's disc_reset (filled in by patch_play)
     ('bl', STANDBY_FIRST_CALL),
     ('pop', reglist('r4', pc=True)),
-] + DISC_READY + [
+] + SLOT_EMPTY + DISC_READY + [
     ('align',),
     'lit_state:',
     ('word', CD_STATE),
@@ -1038,7 +1061,10 @@ FMT_TIME = [
     ('muls', 'r1', 'r0'),
     ('adds', 'r1', 'r1', 'r2'),      # length in s
     ('cbz', 'r1', 'show'),
-    *([('ldr', 'r2', 'r3', 0),       # +0xF4 total tracks
+    *([('ldr', 'r2', 'r3', 0x24),    # +0x118 disc type: bit0 audio CD
+       ('lsls', 'r2', 'r2', 31),
+       ('beq', 'add_done'),          # MP3 / WMA: the lengths are exact
+       ('ldr', 'r2', 'r3', 0),       # +0xF4 total tracks
        ('ldr', 'r0', 'r3', 8),       # +0xFC current track
        ('cmp', 'r0', 'r2'),
        ('beq', 'add_done'),          # the last track's length is exact
