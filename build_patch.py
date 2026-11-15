@@ -64,7 +64,10 @@ Patch 5 - track time remaining, with an hourglass icon.
   * The mode lives in spare byte 0x20000239.
   * PREGAP_MINUS_ON: the gap before a track, which the module counts down,
     is shown as "-0.03".."-0.01" (rounded up). Needs cdtime's gap detection
-    (added automatically). In remaining mode without the "-" ("0.03".."0.01",
+    (added automatically). MINUS_DIGIT_WIDTH_ON: the time font's "-" is 26.6
+    px wide, the digits 44 px, so the centred time shifted ~9 px between
+    "-0.01" and "00.00"; its glyph descriptor (0x0806E390) now has the
+    digits' advance with the dash centred in it. In remaining mode without the "-" ("0.03".."0.01",
     unless PREGAP_MINUS_REMAINING): with REMAINING_ADD_S the track ends at
     the gap's length, so the gap continues the count down to 0:00, where the
     next track's music starts.
@@ -366,6 +369,7 @@ TIME_FILL_ON = True        # advance the time by 1 s when a time message of the 
 TIME_FILL_PHASE_ON = True  # time fill on the tracked start of each second, not 1.125 s after a message
 PREGAP_MINUS_ON = True     # show the gap before a track as "-0.02" (needs the remaining patch)
 PREGAP_MINUS_REMAINING = False  # also the "-" in remaining mode (else "0.02": counts on to 0:00)
+MINUS_DIGIT_WIDTH_ON = True  # the time font's "-" as wide as a digit, so "-0.01" lines up with "00.00"
 REMAINING_ADD_S = 2        # added to the module's track length for remaining time (0..255; 0 = as reported)
 AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play on insert on/off
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
@@ -1348,6 +1352,11 @@ def patch_brightness(img):
           + (' (with IR code diagnostic)' if IR_DIAG_ON else ''))
 
 
+TIME_FONT_GLYPHS = 0x0806E330  # line-2 time font (88 px, lv_font_fmt_txt): glyph descriptors,
+                               # 8 bytes (bitmap index:20, adv_w:12 in 1/16 px; box w, h; ofs x, y)
+TIME_FONT_MINUS = TIME_FONT_GLYPHS + 8 * 12   # glyph 12 = "-" (cmap: '-'..'~' from glyph 12)
+
+
 def patch_remaining(img):
     cave, lab = assemble(FMT_TIME, cave_addr(img))
     # line-2 time in the play/pause (0x0800D70A) and seek (0x0800D77E) branches
@@ -1363,6 +1372,17 @@ def patch_remaining(img):
         # display update call in the main task -> disp_hook
         code, _ = assemble([('bl', lab['disp_hook'])], 0x0800E0B6)
         patch(img, 0x0800E0B6, bytes.fromhex('fff715fa'), code)
+    if PREGAP_MINUS_ON and MINUS_DIGIT_WIDTH_ON:
+        # time font: "-" advance 26.6 -> 44 px (the digits' width), its 24 px
+        # dash centred in that cell (x offset 1 -> 10)
+        o = TIME_FONT_MINUS - BASE
+        old = bytes(img[o:o + 8])
+        word, box_w, box_h, ofs_x, ofs_y = struct.unpack('<IBBbb', old)
+        assert word >> 20 == 425 and (box_w, ofs_x) == (24, 1), f'"-" glyph: unexpected {old.hex()}'
+        digit_adv = struct.unpack_from('<I', img, TIME_FONT_GLYPHS + 8 * 15 - BASE)[0] >> 20   # "0"
+        new = struct.pack('<IBBbb', word & 0xFFFFF | digit_adv << 20, box_w, box_h,
+                          (digit_adv // 16 - box_w) // 2, ofs_y)
+        patch(img, TIME_FONT_MINUS, old, new)
     if REMAINING_ICON_ON:
         # main: bl setup_ui -> bl ui_setup (set up the hourglass icon object)
         code, _ = assemble([('bl', lab['ui_setup'])], 0x080042C6)
