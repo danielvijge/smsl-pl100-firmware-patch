@@ -76,8 +76,10 @@ Patch 5 - track time remaining, with an hourglass icon.
     0.3, 5 and 35.7 s gaps). Remaining time adds it back, so it counts down to
     the start of the next track's music: gapless tracks end at 0:00, a track
     before a g-second gap ends at g, then the gap counts down from -g (the
-    track number changes when the gap starts). Display only: the stored length
-    (end-of-track check, length request) stays as reported.
+    track number changes when the gap starts). Not for the last track: its
+    length (to the end of the disc) is exact, and with the 2 s added it
+    stopped at 0:02. Display only: the stored length (end-of-track check,
+    length request) stays as reported.
 
 Patch shuffle - true shuffle and a safer end-of-track check.
   * Repeat and shuffle are one play mode (0x20000189: 0 normal, 1 repeat one,
@@ -1028,7 +1030,13 @@ FMT_TIME = [
     ('muls', 'r1', 'r0'),
     ('adds', 'r1', 'r1', 'r2'),      # length in s
     ('cbz', 'r1', 'show'),
-    *([('adds_i8', 'r1', REMAINING_ADD_S)] if REMAINING_ADD_S else []),   # the module's 2 s
+    *([('ldr', 'r2', 'r3', 0),       # +0xF4 total tracks
+       ('ldr', 'r0', 'r3', 8),       # +0xFC current track
+       ('cmp', 'r0', 'r2'),
+       ('beq', 'add_done'),          # the last track's length is exact
+       ('adds_i8', 'r1', REMAINING_ADD_S),   # the module's 2 s
+       'add_done:',
+       ('movs', 'r0', 60)] if REMAINING_ADD_S else []),
     ('muls', 'r4', 'r0'),
     ('adds', 'r4', 'r4', 'r5'),      # elapsed in s
     ('subs', 'r1', 'r1', 'r4'),
