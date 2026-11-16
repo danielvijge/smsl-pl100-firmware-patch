@@ -113,6 +113,11 @@ Patch shuffle - true shuffle and a safer end-of-track check.
     moves on to the next track by itself counts as the track's end. The
     time-based check only acts TRACK_END_LATE_S after the stored length in
     those modes, as a fallback.
+    The module can report the end twice ("end of disc", then "track
+    ended"): the late one arrived after repeat disc had started track 1 and
+    played track 2. A track-end report now only counts once the module has
+    sent a time message since the last play command, and not while a track
+    change is pending (NEXT_FLAG).
   * LAST_TRACK_END_ON: the module's "track ended" status on the last track
     played it again (+0x115 is not below the track count); MP3 discs end
     that way, audio CDs send "end of disc". Now the last track continues in
@@ -1886,7 +1891,10 @@ def time_check_code():
        ('bl', ec),                   # the mode's action
        ('movs', 'r0', 1),            # skip the message
        ('pop', reglist(pc=True)),
-       'tc_ok:'] if ec else []),
+       'tc_ok:',
+       ('ldr_lit', 'r2', 'lit_tc_state'),
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r2', 2)] if ec else []),   # the module confirmed playing
     ('movs', 'r0', 0),
     'tc_ret:',
     ('bx_lr',),
@@ -2554,8 +2562,16 @@ END_OF_DISC = 0x0800D9C4
 #  - END_CHECK itself only acts TRACK_END_LATE_S after the stored length in
 #    those modes (and repeat disc, whose last track ends with "end of disc"),
 #    as a fallback when that report does not come.
-MODE_STATE = 0x20000440    # 2 bytes spare (dead menu table, after MP3_NUM): +0 mode (0x24 / 0x25)
-                           # sent with the last play command, +1 last mode command queued
+#  - the module may report a track's end twice (seen: "end of disc", then
+#    "track ended" once repeat disc had already started track 1, which then
+#    played track 2). q_hook marks every play command (MODE_STATE+2), the
+#    next time message (time_check) clears it; te_gate() (0x0800DAAC) and
+#    eod_mode() drop a "track ended" / "end of disc" while it is set or a
+#    track change is pending (NEXT_FLAG): a report about the previous track.
+MODE_STATE = 0x20000440    # 3 bytes spare (dead menu table, after MP3_NUM): +0 mode (0x24 / 0x25)
+                           # sent with the last play command, +1 last mode command queued,
+                           # +2 play command sent, no time message since
+TE_SITE = 0x0800DAAC       # "track ended": ldr r0, =CD_STATE; ldrb r0, [r0, #4] (play state)
 END_ACTION = 0x0800D1E2    # in END_CHECK, after the time check: act on the play mode
 PARSE_RETURN = 0x0800D89E  # pop {pc}: the end of the message parser
 CD_QUEUE_COUNT = CD_STATE + 0x24  # u8: commands in the queue (CD_QUEUE takes at most 5)
@@ -2595,6 +2611,8 @@ LAST_END = [
        'qp_mode:',
        ('ldr_lit', 'r4', 'lit_mode_state'),
        ('strb', 'r2', 'r4', 0),      # the mode this play command starts
+       ('movs', 'r1', 1),
+       ('strb', 'r1', 'r4', 2),      # until the module's next time message
        ('ldrb', 'r1', 'r4', 1),
        ('cmp', 'r1', 'r2'),
        ('beq', 'qp_play'),           # already queued
@@ -2615,13 +2633,39 @@ LAST_END = [
        ('b.w', CD_QUEUE + 4),
 
        'eod_mode:',                  # end of disc (0x0800D9C4: r0 = play mode)
+       ('push', reglist(lr=True)),
+       ('bl', 'stale'),
+       ('beq', 'eod_go'),
+       ('pop', reglist('r0')),
+       ('b.w', PARSE_RETURN),
+       'eod_go:',
        ('ldr_lit', 'r0', 'lit_le_mode'),
        ('ldrb', 'r0', 'r0', 0),
        ('cmp', 'r0', 3),
        ('bne', 'eod_ret'),
+       ('pop', reglist('r1')),
        ('bl', 'ec_action'),          # shuffle: the next random track
        ('b.w', PARSE_RETURN),
        'eod_ret:',
+       ('pop', reglist(pc=True)),
+
+       'te_gate:',                   # track ended (0x0800DAAC: r0 = play state)
+       ('push', reglist(lr=True)),
+       ('bl', 'stale'),
+       ('beq', 'tg_go'),
+       ('pop', reglist('r0')),
+       ('b.w', PARSE_RETURN),
+       'tg_go:',
+       ('ldr_lit', 'r0', 'lit_le_cd'),
+       ('ldrb', 'r0', 'r0', 4),
+       ('pop', reglist(pc=True)),
+
+       'stale:',                     # -> Z clear: a report about the previous track
+       ('ldr_lit', 'r0', 'lit_mode_state'),
+       ('ldrb', 'r0', 'r0', 2),
+       ('ldr_lit', 'r1', 'lit_le_next'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('orrs', 'r0', 'r1'),
        ('bx_lr',)] if TRACK_END_EXACT_ON else []),
 
     'last_end:',
@@ -2648,7 +2692,9 @@ LAST_END = [
     ('b.w', END_OF_DISC),            # (no stack of its own: ends in the parser's return)
     ('align',),
     'lit_le_state:', ('word', CD_STATE + 0xF4),
-    *(['lit_q_count:', ('word', CD_QUEUE_COUNT),
+    *(['lit_le_cd:', ('word', CD_STATE),
+       'lit_le_next:', ('word', NEXT_FLAG),
+       'lit_q_count:', ('word', CD_QUEUE_COUNT),
        'lit_le_mode:', ('word', PLAY_MODE),
        'lit_mode_state:', ('word', MODE_STATE)] if TRACK_END_EXACT_ON else []),
 ]
@@ -2670,6 +2716,8 @@ def patch_shuffle(img):
             patch(img, CD_QUEUE, bytes.fromhex('00b50346'), code)
             code, _ = assemble([('bl', lab['eod_mode'])], END_OF_DISC)
             patch(img, END_OF_DISC, bytes.fromhex('ad480078'), code)
+            code, _ = assemble([('bl', lab['te_gate'])], TE_SITE)
+            patch(img, TE_SITE, bytes.fromhex('6e480079'), code)
     if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON or LAST_TRACK_FULL_ON):
         print('shuffle: off (TRUE_SHUFFLE_ON, TRACK_END_FIX_ON and LAST_TRACK_FULL_ON are False)')
         return
