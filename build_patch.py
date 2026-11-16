@@ -101,6 +101,10 @@ Patch shuffle - true shuffle and a safer end-of-track check.
     check now only runs with the playing track's own length. It also skipped
     every length with 0 minutes or 0 seconds (tracks under 1 min, or x:00);
     now only an unknown length (0:00).
+  * LAST_TRACK_END_ON: the module's "track ended" status on the last track
+    played it again (+0x115 is not below the track count); MP3 discs end
+    that way, audio CDs send "end of disc". Now the last track continues in
+    the end-of-disc handler (0x0800D9C4), which acts on the play mode.
   * LAST_TRACK_FULL_ON: in normal mode the firmware stopped the last track 2 s
     before its length (the remaining time never got below 0:03, and the end
     of the disc was cut). Now it plays to the end and the module's own
@@ -134,6 +138,13 @@ Patch cdtime - time messages of the CD module.
     time fill saw a track change). Time messages with frames > 74 or seconds
     > 59 are now dropped before anything is stored, the way the firmware
     already skips them while its timer 0x20000566 runs.
+  * MP3 / WMA discs (experiment, MP3_ALL_FOLDERS_ON + MP3_DISC_NUMBERS_ON):
+    the module plays files by their number on the whole disc but reports
+    the folder's file count and the number within the folder, so the
+    firmware stayed in folder 1 (Next from file 2 of folder 2 played file 3
+    of folder 1; the last file repeated). The count is no longer lowered,
+    and the reported numbers get a folder offset learned from the track the
+    firmware asked for (see mp3_msg).
   * Notes for each time message whether it is from the gap before a track,
     for PREGAP_MINUS_ON: the module counts the gap down, and those messages
     have a non-zero frames byte (normal play does too, occasionally, so a
@@ -388,8 +399,11 @@ AUTOPLAY_ON = True         # Play at an empty slot ("Disc") switches auto-play o
 TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, then stops
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
+LAST_TRACK_END_ON = True   # "track ended" on the last track = end of the disc (MP3: it was played again)
 LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
 TIME_MSG_CHECK_ON = True   # drop time messages with impossible values (frames > 74, seconds > 59)
+MP3_ALL_FOLDERS_ON = True  # EXPERIMENT: MP3/WMA discs keep the whole disc's file count (all folders)
+MP3_DISC_NUMBERS_ON = True  # EXPERIMENT: MP3/WMA track numbers from the module (per folder) -> whole disc
 SAVER_CD_ON = True         # saver patch: also the moving CD modes CD/w and CD/c (~2.6 KB more)
 SAVER_IDLE_S = 180         # idle time before the screensaver starts
 SAVER_DIM_LEVEL = 5        # backlight level for DIM and CD (5 = 10 %; the brightness levels run backwards)
@@ -1834,7 +1848,155 @@ TIME_CHECK = [
 ]
 
 
+# MP3_ALL_FOLDERS_ON (experiment): the module numbers MP3 files across the
+# whole disc. The disc info message (type 0x24, 0x0800DE3E) gives the whole
+# disc's file count; the status message while playing (type 0x26, 0x0800DDEA:
+# +0x95 current track, +0x9D track count) only the current folder's, which
+# then limits the display, number entry, Next/Prev and the end of the disc
+# to the first folder until eject. mp3_total() replaces that message's store
+# of the count: on discs other than audio CDs it never lowers it.
+MP3_TOTAL_SITE = 0x0800DDFC   # str.w r0, [r1, #0xf4] (r1 = CD state)
+MP3_TOTAL = [
+    'mp3_total:',
+    ('mov', 'r2', 'r1'),
+    ('adds_i8', 'r2', 0xF4),
+    ('ldr', 'r3', 'r2', 0x24),       # +0x118 disc type: bit0 audio CD
+    ('lsls', 'r3', 'r3', 31),
+    ('bne', 'mt_store'),
+    ('ldr', 'r3', 'r2', 0),          # +0xF4 track count so far
+    ('cmp', 'r0', 'r3'),
+    ('bhs', 'mt_store'),
+    ('mov', 'r0', 'r3'),
+    'mt_store:',
+    ('str', 'r0', 'r2', 0),
+    ('bx_lr',),
+]
+
+
+# MP3_DISC_NUMBERS_ON (experiment): the module plays MP3 files by their
+# number on the whole disc (command 8), but reports the track number within
+# the folder (file 12 = first of folder 2 is reported as 1). The firmware then
+# took Next from there to file 2 of folder 1, and never saw the last file as
+# the last (it repeated it). mp3_msg() replaces the call of the message
+# parser (0x0800E0A2): on MP3 / WMA discs ([+0x118] bit1 / [+0x119] bit1) it
+# adds a folder offset to the track number in length (type 0x20, +0x95),
+# time (0x21, +0x99) and status (0x26, +0x95) messages first. The offset is
+# learned when the firmware asks for a track (+0x115 changes to N): the first
+# reported number r that is new (or a time message at 0:00-0:01) gives
+# offset = N - r; a report that the current offset already explains (resume,
+# a jump within the folder) just ends the wait. Discs other than MP3 / WMA
+# reset it; numbers above 255 stay as they are.
+MP3_NUM = 0x2000043C       # 4 bytes spare (dead menu table, after SAVER): +0 folder offset,
+                           # +1 track asked for (0: none), +2 last reported number, +3 last +0x115
+MP3_PARSE_SITE = 0x0800E0A2   # bl CD_PARSE in the main task
+CD_PARSE = 0x0800D890
+MP3_NUMBERS = [
+    'mp3_msg:',
+    ('push', reglist('r4', 'r5', 'r6', lr=True)),
+    ('ldr_lit', 'r4', 'lit_cd_100'),
+    ('ldr_lit', 'r5', 'lit_mp3'),
+    ('movs', 'r1', 2),
+    ('ldrb', 'r0', 'r4', 0x18),      # +0x118 bit1 MP3
+    ('tst', 'r0', 'r1'),
+    ('bne', 'mm_file'),
+    ('ldrb', 'r0', 'r4', 0x19),      # +0x119 bit1 WMA
+    ('tst', 'r0', 'r1'),
+    ('bne', 'mm_file'),
+    ('movs', 'r0', 0),               # another disc: forget the offset
+    ('str', 'r0', 'r5', 0),
+    ('b', 'mm_parse'),
+    'mm_file:',
+    ('ldrb', 'r0', 'r4', 0x1A),      # +0x11A bit0: good checksum
+    ('lsls', 'r0', 'r0', 31),
+    ('beq', 'mm_parse'),
+    ('ldrb', 'r0', 'r4', 0x15),      # +0x115 track asked for (command 8)
+    ('ldrb', 'r1', 'r5', 3),
+    ('cmp', 'r0', 'r1'),
+    ('beq', 'mm_asked'),
+    ('strb', 'r0', 'r5', 3),
+    ('cbz', 'r0', 'mm_asked'),       # (0: the stopped screen clears it)
+    ('strb', 'r0', 'r5', 1),
+    'mm_asked:',
+    ('ldr_lit', 'r3', 'lit_cd_80'),
+    ('ldrb', 'r0', 'r3', 0x0F),      # +0x8F class
+    ('cmp', 'r0', 4),
+    ('bne', 'mm_parse'),
+    ('mov', 'r6', 'r3'),
+    ('ldrb', 'r0', 'r3', 0x10),      # +0x90 type
+    ('cmp', 'r0', 0x21),
+    ('beq', 'mm_time'),
+    ('cmp', 'r0', 0x26),
+    ('beq', 'mm_status'),
+    ('cmp', 'r0', 0x20),
+    ('bne', 'mm_parse'),
+    ('ldrb', 'r0', 'r3', 0x13),      # length: +0x93 1 = of a track
+    ('cmp', 'r0', 1),
+    ('bne', 'mm_parse'),
+    'mm_status:',
+    ('adds_i8', 'r6', 0x15),         # +0x95
+    ('b', 'mm_have'),
+    'mm_time:',
+    ('adds_i8', 'r6', 0x19),         # +0x99
+    'mm_have:',
+    ('ldrb', 'r0', 'r6', 0),         # reported number
+    ('ldrb', 'r1', 'r5', 1),
+    ('cbz', 'r1', 'mm_xlate'),       # not waiting
+    ('ldrb', 'r2', 'r5', 0),
+    ('adds', 'r3', 'r0', 'r2'),
+    ('cmp', 'r3', 'r1'),
+    ('beq', 'mm_done'),              # the offset already fits
+    ('ldrb', 'r3', 'r5', 2),
+    ('cmp', 'r0', 'r3'),
+    ('bne', 'mm_learn'),             # a new number
+    ('ldr_lit', 'r3', 'lit_cd_80'),
+    ('ldrb', 'r2', 'r3', 0x10),
+    ('cmp', 'r2', 0x21),
+    ('bne', 'mm_xlate'),
+    ('ldrb', 'r2', 'r6', 2),         # time message: +0x9B min
+    ('cbnz', 'r2', 'mm_xlate'),
+    ('ldrb', 'r2', 'r6', 3),         # +0x9C sec
+    ('cmp', 'r2', 1),
+    ('bhi', 'mm_xlate'),             # same number, but the file just started
+    'mm_learn:',
+    ('cbz', 'r0', 'mm_xlate'),
+    ('cmp', 'r0', 'r1'),
+    ('bhi', 'mm_xlate'),
+    ('subs', 'r2', 'r1', 'r0'),
+    ('strb', 'r2', 'r5', 0),
+    'mm_done:',
+    ('movs', 'r2', 0),
+    ('strb', 'r2', 'r5', 1),
+    'mm_xlate:',
+    ('strb', 'r0', 'r5', 2),
+    ('ldrb', 'r2', 'r5', 0),
+    ('adds', 'r0', 'r0', 'r2'),
+    ('cmp', 'r0', 255),
+    ('bhi', 'mm_parse'),
+    ('strb', 'r0', 'r6', 0),
+    'mm_parse:',
+    ('bl', CD_PARSE),
+    ('pop', reglist('r4', 'r5', 'r6', pc=True)),
+    ('align',),
+    'lit_cd_100:', ('word', CD_STATE + 0x100),
+    'lit_cd_80:', ('word', CD_STATE + 0x80),
+    'lit_mp3:', ('word', MP3_NUM),
+]
+
+
 def patch_cdtime(img):
+    if MP3_DISC_NUMBERS_ON:
+        cave, lab = assemble(MP3_NUMBERS, cave_addr(img))
+        old, _ = assemble([('bl', CD_PARSE)], MP3_PARSE_SITE)
+        site, _ = assemble([('bl', lab['mp3_msg'])], MP3_PARSE_SITE)
+        patch(img, MP3_PARSE_SITE, old, site)
+        put(img, lab['mp3_msg'], cave)
+        print(f"cdtime: mp3_msg at {lab['mp3_msg']:#x}, {len(cave)} bytes")
+    if MP3_ALL_FOLDERS_ON:
+        cave, lab = assemble(MP3_TOTAL, cave_addr(img))
+        site, _ = assemble([('bl', lab['mp3_total'])], MP3_TOTAL_SITE)
+        patch(img, MP3_TOTAL_SITE, bytes.fromhex('c1f8f400'), site)
+        put(img, lab['mp3_total'], cave)
+        print(f"cdtime: mp3_total at {lab['mp3_total']:#x}, {len(cave)} bytes")
     if TIME_MSG_CHECK_ON:
         cave, lab = assemble(TIME_CHECK, cave_addr(img))
         site, _ = assemble([('bl', lab['time_check'])], TIME_MSG_SITE)
@@ -2276,7 +2438,42 @@ def shuffle_code():
     return prog
 
 
+# LAST_TRACK_END_ON: the module's "track ended" status (class 3 type 3,
+# 40 30 40) while playing goes to 0x0800DAAC: it plays track +0xFC + 1 while
+# the last requested track (+0x115) is below the track count, else it plays
+# +0x115 again. MP3 discs report the end of the last file this way (audio CDs
+# send "end of disc", 41 30 41, to 0x0800D9C4), so the last file repeated.
+# last_end() replaces the "cmp +0x115, count; bhs" there: when the current
+# track is the last, it continues in the end-of-disc handler instead (normal:
+# stop, repeat one: again, repeat disc: track 1, shuffle: left to END_CHECK).
+LAST_END_SITE = 0x0800DAD2  # cmp r0, r1; bhs 0x0800DAE4 (r0 = +0x115, r1 = track count)
+LAST_END_PLAY = 0x0800DAE4  # play +0x115 (again)
+END_OF_DISC = 0x0800D9C4
+LAST_END = [
+    'last_end:',
+    ('ldr_lit', 'r2', 'lit_le_state'),
+    ('ldr', 'r3', 'r2', 8),          # +0xFC current track
+    ('cmp', 'r3', 'r1'),
+    ('bhs', 'le_disc'),
+    ('cmp', 'r0', 'r1'),
+    ('bhs', 'le_again'),
+    ('bx_lr',),                      # the next track (0x0800DAD6)
+    'le_again:',
+    ('b.w', LAST_END_PLAY),
+    'le_disc:',
+    ('b.w', END_OF_DISC),            # (no stack of its own: ends in the parser's return)
+    ('align',),
+    'lit_le_state:', ('word', CD_STATE + 0xF4),
+]
+
+
 def patch_shuffle(img):
+    if LAST_TRACK_END_ON:
+        cave, lab = assemble(LAST_END, cave_addr(img))
+        site, _ = assemble([('bl', lab['last_end'])], LAST_END_SITE)
+        patch(img, LAST_END_SITE, bytes.fromhex('884206d2'), site)
+        put(img, lab['last_end'], cave)
+        print(f"shuffle: last_end at {lab['last_end']:#x}, {len(cave)} bytes")
     if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON or LAST_TRACK_FULL_ON):
         print('shuffle: off (TRUE_SHUFFLE_ON, TRACK_END_FIX_ON and LAST_TRACK_FULL_ON are False)')
         return
