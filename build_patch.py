@@ -101,6 +101,18 @@ Patch shuffle - true shuffle and a safer end-of-track check.
     check now only runs with the playing track's own length. It also skipped
     every length with 0 minutes or 0 seconds (tracks under 1 min, or x:00);
     now only an unknown length (0:00).
+  * TRACK_END_EXACT_ON: the firmware acted 2 s before the stored length in
+    repeat one, shuffle and repeat disc (last track); with the module's
+    lengths (audio CD 2 s short, MP3 exact) that cut 2-4 s off the track.
+    Repeat one and shuffle now put the module in "stop at each track end"
+    mode (0x24; every play command is preceded by the play mode's 0x24 or
+    0x25), and its "track ended" or "end of disc" report starts the mode's
+    next track (a short pause; continuous play in normal and repeat disc
+    stays gapless). The module applies the mode only with a play command:
+    after switching to repeat one / shuffle while playing, the moment it
+    moves on to the next track by itself counts as the track's end. The
+    time-based check only acts TRACK_END_LATE_S after the stored length in
+    those modes, as a fallback.
   * LAST_TRACK_END_ON: the module's "track ended" status on the last track
     played it again (+0x115 is not below the track count); MP3 discs end
     that way, audio CDs send "end of disc". Now the last track continues in
@@ -400,6 +412,8 @@ TRUE_SHUFFLE_ON = True     # shuffle plays every track once in random order, the
 TRACK_END_FIX_ON = True    # end-of-track check: only the playing track's own length; also x:00 and < 1 min
 LAST_TRACK_FULL_ON = True  # normal mode: play the last track to its end (the module stops), not 2 s early
 LAST_TRACK_END_ON = True   # "track ended" on the last track = end of the disc (MP3: it was played again)
+TRACK_END_EXACT_ON = True  # repeat one / shuffle / repeat disc: act at the real end of a track, not 2 s early
+TRACK_END_LATE_S = 4       # TRACK_END_EXACT_ON: fallback if the module does not report it: length + 4 s
 LENGTH_REQUEST_ON = True   # ask the CD module for the track length right after a track change
 TIME_MSG_CHECK_ON = True   # drop time messages with impossible values (frames > 74, seconds > 59)
 MP3_ALL_FOLDERS_ON = True  # EXPERIMENT: MP3/WMA discs keep the whole disc's file count (all folders)
@@ -1822,9 +1836,17 @@ LEN_PERIOD = 2000
 # firmware timer that skips time messages while set; 0x0800D89E returns from
 # the parser). time_check() replaces the load and also reports "skip" for a
 # message with impossible values, so nothing of it is stored.
+# With TRACK_END_EXACT_ON (shuffle patch, EXPORTS['EC_ACTION']) it also
+# catches the module moving on to the next track by itself in repeat one /
+# shuffle: possible only when the mode was switched while playing (see
+# MODE_STATE); the message is skipped and the mode's action runs instead.
 TIME_MSG_SITE = 0x0800DD7C
 TIME_MSG_HOLD = 0x20000566
-TIME_CHECK = [
+
+
+def time_check_code():
+    ec = EXPORTS.get('EC_ACTION')
+    return [
     'time_check:',
     ('ldr_lit', 'r0', 'lit_hold'),
     ('ldrh', 'r0', 'r0', 0),
@@ -1836,6 +1858,35 @@ TIME_CHECK = [
     ('ldrb', 'r0', 'r1', 1),         # +0x9D frames (1/75 s)
     ('cmp', 'r0', 74),
     ('bhi', 'tc_bad'),
+    *([('ldr_lit', 'r2', 'lit_tc_cd'),
+       ('ldrb', 'r0', 'r2', 4),      # playing
+       ('cmp', 'r0', 6),
+       ('bne', 'tc_ok'),
+       ('ldr_lit', 'r2', 'lit_tc_mode'),
+       ('ldrb', 'r0', 'r2', 0),      # in repeat one / shuffle
+       ('cmp', 'r0', 1),
+       ('beq', 'tc_mode'),
+       ('cmp', 'r0', 3),
+       ('bne', 'tc_ok'),
+       'tc_mode:',
+       ('ldr_lit', 'r2', 'lit_tc_state'),
+       ('ldrb', 'r0', 'r2', 0),      # but the module plays on
+       ('cmp', 'r0', 0x25),
+       ('bne', 'tc_ok'),
+       ('ldr_lit', 'r3', 'lit_tc_cur'),
+       ('ldr', 'r0', 'r3', 0),
+       ('adds_i8', 'r0', 1),
+       ('ldr_lit', 'r3', 'lit_tc_track'),
+       ('ldrb', 'r3', 'r3', 0),
+       ('cmp', 'r0', 'r3'),
+       ('bne', 'tc_ok'),             # and has reached the next track:
+       ('movs', 'r0', 0),
+       ('strb', 'r0', 'r2', 0),      # once (the next play command sets it)
+       ('push', reglist(lr=True)),
+       ('bl', ec),                   # the mode's action
+       ('movs', 'r0', 1),            # skip the message
+       ('pop', reglist(pc=True)),
+       'tc_ok:'] if ec else []),
     ('movs', 'r0', 0),
     'tc_ret:',
     ('bx_lr',),
@@ -1845,7 +1896,12 @@ TIME_CHECK = [
     ('align',),
     'lit_hold:', ('word', TIME_MSG_HOLD),
     'lit_msg_sec:', ('word', CD_STATE + 0x9C),
-]
+    *(['lit_tc_cd:', ('word', CD_STATE),
+       'lit_tc_mode:', ('word', PLAY_MODE),
+       'lit_tc_state:', ('word', MODE_STATE),
+       'lit_tc_cur:', ('word', CD_STATE + 0xFC),
+       'lit_tc_track:', ('word', CD_MSG_TRACK)] if ec else []),
+    ]
 
 
 # MP3_ALL_FOLDERS_ON (experiment): the module numbers MP3 files across the
@@ -1998,7 +2054,7 @@ def patch_cdtime(img):
         put(img, lab['mp3_total'], cave)
         print(f"cdtime: mp3_total at {lab['mp3_total']:#x}, {len(cave)} bytes")
     if TIME_MSG_CHECK_ON:
-        cave, lab = assemble(TIME_CHECK, cave_addr(img))
+        cave, lab = assemble(time_check_code(), cave_addr(img))
         site, _ = assemble([('bl', lab['time_check'])], TIME_MSG_SITE)
         patch(img, TIME_MSG_SITE, bytes.fromhex('c0480088'), site)   # ldr r0, =0x20000566; ldrh r0, [r0]
         put(img, lab['time_check'], cave)
@@ -2067,6 +2123,30 @@ def shuffle_code():
                ('ldr', 'r1', 'r1', 0),
                ('cmp', 'r0', 'r1'),
                ('bne', 'ec_done')] if TRACK_END_FIX_ON else []),
+            *([('ldr_lit', 'r0', 'lit_mode'),  # repeat one / disc, shuffle: the real end
+               ('ldrb', 'r0', 'r0', 0),        # comes from the module; only a late
+               ('cmp', 'r0', 0),               # fallback here
+               ('beq', 'ec_orig'),
+               ('cmp', 'r0', 3),
+               ('bhi', 'ec_orig'),
+               ('ldr_lit', 'r3', 'lit_cur'),
+               ('ldr', 'r1', 'r3', 0x0C),      # +0x108 length min
+               ('movs', 'r2', 60),
+               ('muls', 'r1', 'r2'),
+               ('ldrb', 'r2', 'r3', 0x10),     # +0x10C length sec
+               ('adds', 'r1', 'r1', 'r2'),
+               ('cbz', 'r1', 'ec_done'),
+               ('ldr', 'r0', 'r3', 4),         # +0x100 elapsed min
+               ('movs', 'r2', 60),
+               ('muls', 'r0', 'r2'),
+               ('ldrb', 'r2', 'r3', 8),        # +0x104 elapsed sec
+               ('adds', 'r0', 'r0', 'r2'),
+               ('adds_i8', 'r1', TRACK_END_LATE_S),
+               ('cmp', 'r0', 'r1'),
+               ('blo', 'ec_done'),
+               ('bl', EXPORTS['EC_ACTION']),
+               ('b', 'ec_done'),
+               'ec_orig:'] if TRACK_END_EXACT_ON else []),
             ('bl', END_CHECK),
             'ec_done:',
             ('pop', reglist('r4', pc=True)),
@@ -2449,8 +2529,112 @@ def shuffle_code():
 LAST_END_SITE = 0x0800DAD2  # cmp r0, r1; bhs 0x0800DAE4 (r0 = +0x115, r1 = track count)
 LAST_END_PLAY = 0x0800DAE4  # play +0x115 (again)
 END_OF_DISC = 0x0800D9C4
+# TRACK_END_EXACT_ON: END_CHECK acts 2 s before the stored length in repeat
+# one, shuffle and repeat disc (last track). Audio CD lengths are 2 s short
+# (to the next track's start - 2 s), MP3 lengths exact: 2-4 s of the track
+# were cut. The module knows the real end: in "stop at each track end" mode
+# (command 0x24) it stops there and reports "track ended" (the last track:
+# "end of disc"). Now:
+#  - repeat one and shuffle use that mode. q_hook() wraps CD_QUEUE: every
+#    play command (8, from any of the firmware's ~10 places) is preceded by
+#    0x24 (repeat one, shuffle) or 0x25 (continuous), unless that was the
+#    last mode command queued (also the firmware's own: 0x24 before FF/REW,
+#    0x25 in Play, Shuffle on 0x0D / off 0x23 with the same bytes).
+#    Continuous play (normal, repeat disc) stays 0x25: gapless.
+#  - the module applies the mode only with a play command (a mode command
+#    while playing is ignored). MODE_STATE+0 holds the mode sent with the
+#    last play command; when it is continuous in repeat one / shuffle (the
+#    mode was switched while playing), a time message for the next track
+#    (the module moved on by itself, at the gap's start) counts as the
+#    track's end (time_check in cdtime).
+#  - "track ended" in repeat one / shuffle runs END_CHECK's own action for
+#    the mode (0x0800D1E2: the same track again / a random one) instead of
+#    the next track; so does "end of disc" in shuffle (eod_mode(), the
+#    firmware did nothing there). A short pause; the laser moves anyway.
+#  - END_CHECK itself only acts TRACK_END_LATE_S after the stored length in
+#    those modes (and repeat disc, whose last track ends with "end of disc"),
+#    as a fallback when that report does not come.
+MODE_STATE = 0x20000440    # 2 bytes spare (dead menu table, after MP3_NUM): +0 mode (0x24 / 0x25)
+                           # sent with the last play command, +1 last mode command queued
+END_ACTION = 0x0800D1E2    # in END_CHECK, after the time check: act on the play mode
+PARSE_RETURN = 0x0800D89E  # pop {pc}: the end of the message parser
+CD_QUEUE_COUNT = CD_STATE + 0x24  # u8: commands in the queue (CD_QUEUE takes at most 5)
 LAST_END = [
+    *(['ec_action:',                 # END_CHECK's action for the play mode, in its own frame
+       ('push', reglist('r4', 'r5', 'r6', lr=True)),
+       ('b.w', END_ACTION),
+
+       'q_hook:',                    # CD_QUEUE(r0 = command)
+       ('cmp', 'r0', 8),
+       ('beq', 'qh_play'),
+       ('movs', 'r1', 0x24),
+       ('cmp', 'r0', 0x24),
+       ('beq', 'qh_note'),
+       ('cmp', 'r0', 0x0D),          # Shuffle on: the same bytes
+       ('beq', 'qh_note'),
+       ('movs', 'r1', 0x25),
+       ('cmp', 'r0', 0x25),
+       ('beq', 'qh_note'),
+       ('cmp', 'r0', 0x23),          # Shuffle off: the same bytes
+       ('bne', 'q_orig'),
+       'qh_note:',
+       ('ldr_lit', 'r2', 'lit_mode_state'),
+       ('strb', 'r1', 'r2', 1),
+       ('b', 'q_orig'),
+       'qh_play:',
+       ('push', reglist('r4', lr=True)),
+       ('ldr_lit', 'r1', 'lit_le_mode'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('movs', 'r2', 0x25),
+       ('cmp', 'r1', 1),
+       ('beq', 'qp_stop'),
+       ('cmp', 'r1', 3),
+       ('bne', 'qp_mode'),
+       'qp_stop:',
+       ('movs', 'r2', 0x24),
+       'qp_mode:',
+       ('ldr_lit', 'r4', 'lit_mode_state'),
+       ('strb', 'r2', 'r4', 0),      # the mode this play command starts
+       ('ldrb', 'r1', 'r4', 1),
+       ('cmp', 'r1', 'r2'),
+       ('beq', 'qp_play'),           # already queued
+       ('ldr_lit', 'r1', 'lit_q_count'),
+       ('ldrb', 'r1', 'r1', 0),
+       ('cmp', 'r1', 3),
+       ('bhi', 'qp_play'),           # no room for both: the play command first
+       ('strb', 'r2', 'r4', 1),
+       ('mov', 'r0', 'r2'),
+       ('bl', 'q_orig'),
+       'qp_play:',
+       ('movs', 'r0', 8),
+       ('bl', 'q_orig'),
+       ('pop', reglist('r4', pc=True)),
+       'q_orig:',                    # CD_QUEUE's own first instructions
+       ('push', reglist(lr=True)),
+       ('mov', 'r3', 'r0'),
+       ('b.w', CD_QUEUE + 4),
+
+       'eod_mode:',                  # end of disc (0x0800D9C4: r0 = play mode)
+       ('ldr_lit', 'r0', 'lit_le_mode'),
+       ('ldrb', 'r0', 'r0', 0),
+       ('cmp', 'r0', 3),
+       ('bne', 'eod_ret'),
+       ('bl', 'ec_action'),          # shuffle: the next random track
+       ('b.w', PARSE_RETURN),
+       'eod_ret:',
+       ('bx_lr',)] if TRACK_END_EXACT_ON else []),
+
     'last_end:',
+    *([('ldr_lit', 'r2', 'lit_le_mode'),   # "track ended" in repeat one / shuffle:
+       ('ldrb', 'r2', 'r2', 0),            # the mode's own action
+       ('cmp', 'r2', 1),
+       ('beq', 'le_mode'),
+       ('cmp', 'r2', 3),
+       ('bne', 'le_seq'),
+       'le_mode:',
+       ('bl', 'ec_action'),
+       ('b.w', PARSE_RETURN),
+       'le_seq:'] if TRACK_END_EXACT_ON else []),
     ('ldr_lit', 'r2', 'lit_le_state'),
     ('ldr', 'r3', 'r2', 8),          # +0xFC current track
     ('cmp', 'r3', 'r1'),
@@ -2464,16 +2648,28 @@ LAST_END = [
     ('b.w', END_OF_DISC),            # (no stack of its own: ends in the parser's return)
     ('align',),
     'lit_le_state:', ('word', CD_STATE + 0xF4),
+    *(['lit_q_count:', ('word', CD_QUEUE_COUNT),
+       'lit_le_mode:', ('word', PLAY_MODE),
+       'lit_mode_state:', ('word', MODE_STATE)] if TRACK_END_EXACT_ON else []),
 ]
 
 
 def patch_shuffle(img):
+    assert not TRACK_END_EXACT_ON or (LAST_TRACK_END_ON and TRACK_END_FIX_ON), \
+        'TRACK_END_EXACT_ON needs LAST_TRACK_END_ON and TRACK_END_FIX_ON'
     if LAST_TRACK_END_ON:
         cave, lab = assemble(LAST_END, cave_addr(img))
         site, _ = assemble([('bl', lab['last_end'])], LAST_END_SITE)
         patch(img, LAST_END_SITE, bytes.fromhex('884206d2'), site)
-        put(img, lab['last_end'], cave)
-        print(f"shuffle: last_end at {lab['last_end']:#x}, {len(cave)} bytes")
+        put(img, lab['ec_action' if TRACK_END_EXACT_ON else 'last_end'], cave)
+        print(f"shuffle: last_end at {lab['last_end']:#x}, {len(cave)} bytes"
+              + (' (exact track end)' if TRACK_END_EXACT_ON else ''))
+        if TRACK_END_EXACT_ON:
+            EXPORTS['EC_ACTION'] = lab['ec_action']
+            code, _ = assemble([('b.w', lab['q_hook'])], CD_QUEUE)
+            patch(img, CD_QUEUE, bytes.fromhex('00b50346'), code)
+            code, _ = assemble([('bl', lab['eod_mode'])], END_OF_DISC)
+            patch(img, END_OF_DISC, bytes.fromhex('ad480078'), code)
     if not (TRUE_SHUFFLE_ON or TRACK_END_FIX_ON or LAST_TRACK_FULL_ON):
         print('shuffle: off (TRUE_SHUFFLE_ON, TRACK_END_FIX_ON and LAST_TRACK_FULL_ON are False)')
         return
