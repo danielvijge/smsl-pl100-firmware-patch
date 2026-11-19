@@ -187,8 +187,10 @@ Patch 6 - FN cycles the backlight brightness.
     menu's levels run backwards) and saves it like the settings menu would.
   * The settings load clamps brightness to 1..6, which would turn level 0
     into 1; brightness gets its own check instead (0..5 valid, else 3).
-  * After each press line 1 shows the new level as "10%".."100%" for about
-    2.5 s, like the firmware shows the volume: a tick hook (see
+  * Line 1 shows the level as "10%".."100%" for about 2.5 s, like the
+    firmware shows the volume. The first press only shows the current level;
+    presses while it is shown step to the next one (osd_showing). The text
+    is put on line 1 by a tick hook (see
     install_tick_hooks) puts the text into the line 1 label after the display
     update has written it. The duration is measured
     on the firmware's 75 ms clock (0x20000560, counted in the TIM1 interrupt),
@@ -258,7 +260,8 @@ Patch saver - screensaver while stopped.
     SAVER_DIM_LEVEL only), DARK (backlight off), CD/w (dim + moving white
     CD), CD/c (the same, a new colour on every move); the CD modes only with
     SAVER_CD_ON (a saved CD mode then counts as NONE). After flashing it is
-    NONE. While the screensaver runs, MENU only wakes it. This part lives in
+    NONE. Like FN, the first press only shows the current mode, presses
+    while it is shown step on. While the screensaver runs, MENU only wakes it. This part lives in
     key_hook (brightness patch, added automatically) and is only built with
     the saver patch.
   * The firmware's own idle dimmer (setting 0x200004D5, timer 0x2000054C)
@@ -1259,10 +1262,17 @@ def key_hook_code(saver):
 
         # bright_cycle(): levels 5,4,3,2,1,0 = 10,20,35,55,65,100 % (active-low
         # backlight), then back to 5. Level 6 (off) is skipped. Saved like the
-        # settings menu does.
+        # settings menu does. Only shows the level unless it is already shown.
         'bright_cycle:',
         ('push', reglist('r4', lr=True)),
         ('ldr_lit', 'r4', 'lit_bright'),
+        ('ldrb', 'r0', 'r4', 0),
+        ('cmp', 'r0', 5),
+        ('bhi', 'bright_step'),          # (not a level with a text: step to 5)
+        ('bl', 'bright_text'),
+        ('bl', 'OSD_SHOWING'),
+        ('cbz', 'r0', 'bright_show'),    # first press: the current level
+        'bright_step:',
         ('ldrb', 'r0', 'r4', 0),
         ('cbz', 'r0', 'bright_wrap'),
         ('cmp', 'r0', 5),
@@ -1275,38 +1285,50 @@ def key_hook_code(saver):
         ('strb', 'r0', 'r4', 0),
         ('bl', SET_BRIGHTNESS),
         ('bl', SCHEDULE_SAVE),
-        ('ldrb', 'r0', 'r4', 0),         # show the new level on line 1
+        'bright_show:',                  # show the level on line 1
+        ('bl', 'bright_text'),
+        ('bl', 'OSD_SHOW'),
+        ('pop', reglist('r4', pc=True)),
+        'bright_text:',                  # r0 = text of level [r4]
+        ('ldrb', 'r0', 'r4', 0),
         ('lsls', 'r0', 'r0', 2),
         ('ldr_lit', 'r1', 'lit_level_text'),
         ('adds', 'r1', 'r1', 'r0'),
         ('ldr', 'r0', 'r1', 0),
-        ('bl', 'OSD_SHOW'),
-        ('pop', reglist('r4', pc=True)),
+        ('bx_lr',),
 
-        # saver_cycle(): MENU - next screensaver mode, saved, shown on line 1
+        # saver_cycle(): MENU - next screensaver mode, saved, shown on line 1;
+        # only shows the mode unless it is already shown
         *(['saver_cycle:',
-           ('push', reglist('r4', lr=True)),
+           ('push', reglist('r4', 'r5', lr=True)),
            ('ldr_lit', 'r4', 'lit_saver_setting'),
-           ('ldrb', 'r0', 'r4', 0),
-           ('subs_i3', 'r0', 'r0', 1),       # mode: index in texts (NONE, DIM, DARK, CD/w, CD/c)
-           ('cmp', 'r0', len(texts) - 1),
+           ('ldrb', 'r5', 'r4', 0),
+           ('subs_i3', 'r5', 'r5', 1),       # mode: index in texts (NONE, DIM, DARK, CD/w, CD/c)
+           ('cmp', 'r5', len(texts) - 1),
            ('bls', 'sc_mode'),
-           ('movs', 'r0', 0),                # 0, erased, junk (CD without SAVER_CD_ON): NONE
+           ('movs', 'r5', 0),                # 0, erased, junk (CD without SAVER_CD_ON): NONE
            'sc_mode:',
-           ('adds_i8', 'r0', 1),
-           ('cmp', 'r0', len(texts)),
+           ('bl', 'sc_text'),
+           ('bl', 'OSD_SHOWING'),
+           ('cbz', 'r0', 'sc_show'),         # first press: the current mode
+           ('adds_i8', 'r5', 1),
+           ('cmp', 'r5', len(texts)),
            ('blo', 'sc_store'),              # next mode
-           ('movs', 'r0', 0),                # after the last: NONE
+           ('movs', 'r5', 0),                # after the last: NONE
            'sc_store:',
-           ('adds_i3', 'r1', 'r0', 1),
+           ('adds_i3', 'r1', 'r5', 1),
            ('strb', 'r1', 'r4', 0),
-           ('lsls', 'r0', 'r0', 2),
+           ('bl', SCHEDULE_SAVE),
+           'sc_show:',
+           ('bl', 'sc_text'),
+           ('bl', 'OSD_SHOW'),
+           ('pop', reglist('r4', 'r5', pc=True)),
+           'sc_text:',                       # r0 = text of mode r5
+           ('lsls', 'r0', 'r5', 2),
            ('ldr_lit', 'r1', 'lit_saver_text'),
            ('adds', 'r1', 'r1', 'r0'),
            ('ldr', 'r0', 'r1', 0),
-           ('bl', 'OSD_SHOW'),
-           ('bl', SCHEDULE_SAVE),
-           ('pop', reglist('r4', pc=True))] if saver else []),
+           ('bx_lr',)] if saver else []),
 
         # panel_vol(r0 = key, r1 = from remote) -> key. The player's own Vol- / Vol+
         # do nothing without a headphone; then Vol- toggles elapsed / remaining
@@ -1473,7 +1495,31 @@ def patch_remaining(img):
 # on the 75 ms clock. osd_tick(): tick hook, puts the text into the line 1
 # label after every display update while the time runs; afterwards the next
 # display update shows the track again. Shared by brightness and auto-play.
+# osd_showing(r0 = text) -> r0 = 1 if line 1 shows that text right now: a
+# setting key then steps on, else it first only shows the current value.
 OSD_CODE = [
+    'osd_showing:',
+    ('ldr_lit', 'r3', 'lit_osd'),
+    ('ldrb', 'r1', 'r3', 2),
+    ('cbz', 'r1', 'os_no'),          # not active
+    ('ldr_lit', 'r1', 'lit_osd_text'),
+    ('ldr', 'r1', 'r1', 0),
+    ('cmp', 'r0', 'r1'),
+    ('bne', 'os_no'),                # another text
+    ('ldrh', 'r0', 'r3', 0),
+    ('ldr_lit', 'r1', 'lit_clock'),
+    ('ldrh', 'r1', 'r1', 0),
+    ('subs', 'r0', 'r0', 'r1'),
+    ('uxth', 'r0', 'r0'),            # time left, as osd_tick
+    ('cbz', 'r0', 'os_no'),
+    ('cmp', 'r0', OSD_STEPS),
+    ('bhi', 'os_no'),
+    ('movs', 'r0', 1),
+    ('bx_lr',),
+    'os_no:',
+    ('movs', 'r0', 0),
+    ('bx_lr',),
+
     'osd_show:',
     ('ldr_lit', 'r1', 'lit_osd_text'),
     ('str', 'r0', 'r1', 0),
@@ -1526,8 +1572,9 @@ def ensure_osd(img):
     """Put the shared OSD code in the cave once; returns osd_show."""
     if 'osd_show' not in EXPORTS:
         cave, lab = assemble(OSD_CODE, cave_addr(img))
-        put(img, lab['osd_show'], cave)
+        put(img, lab['osd_showing'], cave)
         EXPORTS['osd_show'] = lab['osd_show']
+        EXPORTS['osd_showing'] = lab['osd_showing']
         TICK_HOOKS.append(lab['osd_tick'])
         print(f"osd: osd_show at {lab['osd_show']:#x}, {len(cave)} bytes")
     return EXPORTS['osd_show']
@@ -1536,7 +1583,8 @@ def ensure_osd(img):
 def resolve(prog):
     """Fill in placeholders for code another patch provides (see EXPORTS);
     optional ones are left out when that patch is not built."""
-    ext = {'DISC_RESET': 'disc_reset', 'OSD_SHOW': 'osd_show', 'SHUFFLE_START': 'sh_start'}
+    ext = {'DISC_RESET': 'disc_reset', 'OSD_SHOW': 'osd_show', 'OSD_SHOWING': 'osd_showing',
+           'SHUFFLE_START': 'sh_start'}
     optional = {'SHUFFLE_START'}
     out = []
     for ins in prog:
