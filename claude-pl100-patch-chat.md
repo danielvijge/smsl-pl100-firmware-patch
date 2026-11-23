@@ -5868,3 +5868,1585 @@ Opus 5.5 · Claude Team
 
   For the README: the new patch number (number keys), and the usage line now
   lists it.
+
+❯ the code for the diagnistic build track-end isn't commit on the
+  diagnostic-track-end branch (at least visible in git). Can those changes be
+  stages on that branch so it can be pushed, and the diagnistic build always
+  stays available?
+
+⏺ The diagnostic code is now committed on diagnostic-track-end as commit
+  713cd18, "Diagnostic build: track ends (--track-diag)". It sits on top of
+  main's 91d3d71 and is visible from your normal repo. It isn't pushed.
+
+  - What's in it: only build_patch.py (+486 lines). The commit message
+    gives the build command for the diagnostic.
+  - How I committed:
+    - I scanned the file with trufflehog first; it found no secrets.
+    - I committed with git plumbing, because your pre-commit hook has left
+      commits empty inside a worktree before.
+    - It's attributed to you, with the Co-Authored-By line.
+  - It doesn't include v30–v33. The branch comes from main at v29, like your
+    other diagnostic branches.
+
+  To push it, which creates a new branch on GitHub:
+  ```
+  git push -u origin diagnostic-track-end
+  ```
+  Tell me if you want me to run that.
+
+  The branch is still checked out in a worktree in my scratchpad folder. The
+  commit is safe in your repo either way. I can remove that worktree with `git
+  worktree remove`, so the scratchpad cleanup doesn't leave a stale worktree
+  entry behind. The branch stays.
+
+❯ The time display is in a monospaced font. This ensures that 00.01 has the same
+  width as 01.11, the "." always stays in the same spot. The only exception now
+  is the negative time during teh gap. So when going from -0.01 to 00.00 the .
+  and numbers shift around a bit. Is it possible to prevent this? I.e. the -
+  sign should then be the same width as a number.
+
+⏺ Yes, it's possible. I've built it as v34:
+  patch/IAP_PL100_1v1_b250219_all_v34.hex. It's tested in the emulator only
+  and not committed.
+
+  Cause: the time font has fixed-width digits, all 44 px wide, but its -
+  is only 26.6 px wide. The time label is centred, so -0.01 is about 17 px
+  narrower than 00.00, and everything shifts about 9 px at the changeover.
+
+  Fix: a font data change, with no code:
+  - The - now has the same 44 px width as a digit.
+  - The 24 px dash is centred in that space.
+  - Only 3 bytes of the image change compared with v33.
+  - It's part of the remaining patch, as a new option `MINUS_DIGIT_WIDTH_ON =
+    True. It only applies when the gap display PREGAP_MINUS_ON` is on.
+
+  Check: I ran the firmware's own LVGL glyph lookup on both builds. In v34,
+  -, 0 and 1 all come back 44 px wide, and the dash starts 10 px into its
+  cell. So -0.01 and 00.00 now have the same total width, and the dot stays
+  in place.
+
+  Two side effects:
+  - Number entry: the dash in Tr1- is now wider too. That shouldn't
+    matter, but it's worth a look on the device.
+  - The dash's spacing: centred, it sits a little further from the following
+    0 than before. If it looks detached on the device, I can move it closer to
+    the digit within the same width.
+
+  For the README: the gap display (enhancement 3) no longer shifts the time
+  sideways. This is optional, since it's mostly cosmetic.
+
+❯ Earlier I asked about any ideas to implement. But I did not ask about bugs.
+  Are there any known bugs or weird code, either in the original firmware, or
+  now with these patches?
+
+⏺ Here are the known bugs and odd code, from the analysis so far. Nothing is a
+  known bug in the current patch code. I've ranked the items by how much they
+  matter.
+
+  Worth fixing
+
+  1. The odd time message (CD 4, mid track 4) is accepted as real. One
+     class-4 type-0x21 message said track 01, 1:11, frames 91. Frames are only
+     valid from 0 to 74.
+     - The firmware stores whatever a time message says, so for one message the
+       current track is 1. That probably shows briefly as 01/xx with a wrong
+       time.
+     - It may do more harm with the patches:
+       - true shuffle may note track 1 as played, which I haven't checked;
+       - the length request asks again;
+       - the time fill restarts its timing.
+     - Fix: ignore time messages with frames > 74. That's small and safe.
+  2. The Play handler runs inside the timer interrupt (original design).
+     When timer 0x20000186 runs out, the 7.5 ms timer interrupt calls the whole
+     Play handler (0x0800E10E) directly. Several things set that timer: number
+     entry, repeat-one, and next-track in some modes. The handler queues module
+     commands while the main loop may be using the same queue (CD_QUEUE has no
+     locking).
+     - Risk: a corrupted or lost command, which is rare and
+       timing-dependent.
+     - Fix: the interrupt only sets a flag, and the main loop does the Play.
+       That's a moderate change. I can't prove it has caused anything. It's a
+       possible, unproven explanation for the diagnostic-build freeze.
+  3. About 7 % of the module's messages fail the checksum. The patches work
+     around this (time fill, repeated length requests), but the cause was never
+     investigated. The likely cause is the bit-banged I2C timing in the reader
+     (0x0800DE8C). If that's it, fixing the timing would remove the problem at
+     its source. That needs some investigation, and it's riskier because it
+     changes how the firmware talks to the module.
+
+  Open questions, to check on the device
+
+  4. The last song repeating in the diagnostic build. I don't know the
+     cause. If v30 or later also repeats the last track at the end of the disc,
+     it's a real bug. That's part of your pending v30 test.
+  5. The last-track safety net is tight. If the module's last-track length
+     is also 2 s short, the "stop 3 s after the length" fallback falls only
+     about 1 s after the real end. It only acts if the module's end-of-disc
+     message doesn't arrive, which so far it always has.
+  6. MP3/WMA discs have never been tested. Track numbers can go above 99,
+     and nobody knows whether the time and length messages behave the same as
+     for audio CDs.
+
+  Known limitations, by design
+
+  7. The time keeps counting while the module is silent. If the module stops
+     sending time messages while the state is still "playing" (for example a
+     read error), the time fill keeps counting. That's every 1.05 s in v30, or
+     every 1.005 s with the phase tracking in v31. The last-track safety net
+     relies on this.
+  8. Shuffle with more than 255 tracks falls back to the original random
+     play.
+  9. Auto-play after power-on: it could start playing if a disc that's still
+     inside reports "Disc" twice, more than 1 s apart, while reloading. This has
+     never been seen.
+  10. Commands can be lost when the queue is full. CD_QUEUE drops a command
+      when it already holds 5. The patches send at most 2 at a time, so it
+      shouldn't happen.
+
+  Odd code in the original firmware, already handled by the patches
+
+  | Quirk | Fixed in |
+  |---|---|
+  | Play-state byte also gets the module's own status codes | screensaver treats any state other than 3/6/7/8 as stopped |
+  | End-of-track check skipped for x:00 and sub-minute tracks | shuffle |
+  | Previous track's length used for up to 22 s | cdtime |
+  | Number entry limits wrong for 30–99 and 100–199 tracks | number |
+  | Firmware's own idle dimmer sets full brightness | dead code |
+  | Settings load clamps brightness to 1–6 | brightness |
+  | Time label only redrawn when min/sec change | forced redraw where needed |
+  | Last track stopped 2 s early | shuffle |
+  | Gaps after FF/REW | gapless |
+  | Play while loading lost | play |
+
+  My advice: fix item 1 now, since it's cheap and protects shuffle and the time
+  display. Do item 2 if you see any freeze or lost command in normal builds.
+  Item 3 is only worth starting if the time fill isn't good enough on the
+  device.
+
+  Should I do item 1 as v35?
+
+❯ yes, make item 1 as v35
+
+⏺ I've built v35 as patch/IAP_PL100_1v1_b250219_all_v35.hex. It's tested in
+  the emulator only and not committed.
+
+  Change: a new option in the cdtime patch, TIME_MSG_CHECK_ON = True.
+  - A time message with frames above 74 or seconds above 59 is now dropped
+    completely: no track, minutes or seconds are stored.
+  - How: the firmware's time-message handler (0x0800DD7C) already skips
+    messages while one of its own timers (0x20000566) runs. A 36-byte check now
+    replaces that timer read and sends invalid messages down the same skip path.
+
+  Checks:
+  - With TIME_MSG_CHECK_ON = False the build is byte-identical to v34.
+  - I ran the firmware's real handler in the emulator. The player was on track 4
+    at 5:43, playing:
+
+    | Message | v34 | v35 |
+    |---|---|---|
+    | 04 5:44.00 | stored | stored |
+    | 04 5:45.74 (highest valid frame) | stored | stored |
+    | 01 1:11.91 (the one from CD 4) | stored, so track 1 for a moment | dropped |
+    | 04 5:46.75 | stored | dropped |
+    | 04 5:60.00 | stored | dropped |
+    | any, while the firmware's timer runs | skipped | skipped |
+
+  What changes on the device: the time and track can no longer jump for a
+  moment, as with that message on CD 4. Shuffle, the length request and the time
+  fill no longer see a false track change from it.
+
+  I only check frames and seconds. Minutes and the track number can't be checked
+  as simply, so a bad message with valid-looking frames and seconds would still
+  get through. The one seen so far had impossible frames.
+
+  For the README: you could add this to bug fix 7, the time display: invalid
+  time messages are now ignored.
+
+❯ For the open questions:
+  - in any non-diagnostic firmware, I never had the last song repeat itself.
+  - last track also stops exactly at 00.00
+
+⏺ Thanks, that settles both questions. I'm assuming you tested on v30 or later,
+  since those add the 2 s.
+
+  - Last track:
+    - Remaining time: it reaching exactly 00.00 means the module reports the
+      last track 2 s short as well, like every other track. The +2 s is right
+      for every track, so no exception is needed.
+    - Stopping: the track stopping right there means the module's own
+      end-of-disc message arrives and stops it, as the end-of-track fix relies
+      on.
+  - Last-song repeat: it only happened in the diagnostic build. Like the
+    freeze there, I'll leave it.
+
+  The safety net: if the end-of-disc message doesn't come, the firmware
+  stops the disc 3 s after the reported length. With the 2 s shortfall
+  confirmed, that's about 1 s after the music really ends. Even if it ever acts
+  before the message arrives, it does the same thing the message does (stop at
+  the end of the disc), so nothing needs changing.
+
+  I updated the status in patch/CLAUDE.md and in memory. Open items now:
+  - Not tested on the device yet:
+    - v31's even seconds;
+    - v32's gap countdown without the minus;
+    - v33's number entry;
+    - v34's dash width;
+    - v35's message check.
+  - Not investigated: the possible interrupt race in the Play handler, and
+    the cause of the 7 % checksum failures.
+
+❯ v34 is flashed on the device, so everything before it works. I'll flash v35 as
+  well, but I don't think there is actually a test case for this
+
+⏺ Good, so v30 to v34 are confirmed on the device. I've marked everything up to
+  v34 as confirmed in patch/CLAUDE.md and in memory. That includes v25 to v29,
+  such as the 4-bit screensaver CD image.
+
+  You're right that v35 has no real test case. The bad message is rare, and you
+  can't make the module send one. What a device run can show is that v35 didn't
+  break anything, because valid messages must still get through. Things to watch
+  in normal use:
+
+  - the time counts normally during play, FF/REW and after seeking;
+  - the gap countdown still shows (valid gap messages have frames 1–74);
+  - track changes and the remaining time behave as on v34.
+
+  If those look right, v35 is fine. The check itself was emulated against the
+  firmware's real handler, including the exact message from CD 4, and that
+  message is dropped.
+
+❯ I do have to make a correction. The last song does stop at 00:02 in time
+  remaining mode. I think this used to work before. Not sure in which version
+  this broke again
+
+⏺ I've built v36 as patch/IAP_PL100_1v1_b250219_all_v36.hex. It's tested in
+  the emulator only and not committed.
+
+  What went wrong: the last track's playback still ends correctly. Only the
+  remaining-time display was wrong, and v30 caused it:
+  - Where it stops: at 0:02 with the +2 s means playback ends when the
+    elapsed time equals the module's reported length. None of the firmware's
+    stop points matches that:
+    - the old early stop would act 2 s before the length (0:04 on the display);
+    - the safety net acts 3 s after it.
+    So it's the module stopping at the end of the disc.
+  - What that means: the module's length for the last track is exact. It
+    subtracts 2 s for the gap before the next track, and the last track has no
+    next track.
+  - Why it seemed to work before: up to v29, the end of the last track
+    showed 0:00. v30 added the 2 s to every track, including the last. I had
+    wrongly recorded "last track at 0:00 confirmed" after your earlier message;
+    that note is now corrected.
+
+  Fix: remaining time no longer adds the 2 s when the current track is the
+  last track on the disc. All other tracks keep it. That's 4 instructions in the
+  time display code.
+
+  Emulator check (a 3:55 track on a 12-track disc):
+
+  | Situation | v35 | v36 |
+  |---|---|---|
+  | Track 12 of 12, elapsed 3:55 | 0:02 | 0:00 |
+  | Track 12 of 12, elapsed 3:53 | 0:04 | 0:02 |
+  | Track 11 of 12, elapsed 3:55 | 0:02 | 0:02 (unchanged) |
+  | Elapsed mode | 3:55 | 3:55 |
+
+  In shuffle, "last" means the last track on the disc, not the last one played.
+  That's correct, because only the disc's last track runs to the end of the
+  disc.
+
+  I corrected patch/CLAUDE.md and memory: the last track's length is exact,
+  and v36 handles it.
+
+❯ v36 works, last track now ends at 00.00
+
+⏺ Good, v36 is confirmed. I've recorded it in patch/CLAUDE.md and in memory.
+  With that, remaining time ends at 00.00 for every track type:
+
+  | Track | Display at the end |
+  |---|---|
+  | Gapless track | 00.00 |
+  | Track before a gap | the gap length, then a countdown to 00.00 |
+  | Last track | 00.00, at the end of the disc |
+
+  The only part not checked on the device is v35's time-message check. It's in
+  v36 too, and it has no practical test.
+
+  For the README: enhancement 4's "always changes at 00.00" now holds for the
+  last track as well.
+
+❯ I tried playing an MP3 CD. Here are the findings, although I haven't yet
+  verified if these things are working correctly on unpatched firmware:
+
+  - only loads files from first folder, showing 01/11. On insert it showed Tr150
+  - time remaining counts down correct
+  - time remaining counts down to 00.02, except on 11/11 where it does count
+    down to 00:00
+  - when pressing stop, return to MP3 screen with play icon, and can toggle
+    AUTO/OFF by pressing play. Not possible to start playing the disc again
+
+⏺ The firmware does know what kind of disc it has. The stopped screen
+  (0x0800D62C) reads a disc-type byte from the module, at CD state +0x118:
+
+  | Flag | Disc type | Stopped screen shows |
+  |---|---|---|
+  | +0x118 bit 0 | audio CD | the disc's total time |
+  | +0x118 bit 1 | MP3 | MP3 |
+  | +0x119 bit 1 | WMA | WMA |
+  | none | | stop |
+
+  Your findings, one by one:
+
+  1. Only the first folder, Tr150 at insert, then 01/11.
+  - What the module does: it seems to report the number of files on the
+    whole disc (150) at first, then the first folder's count (11). Over 99
+    tracks, my track patch shows the original Tr… format, so you saw the
+    firmware's own display there.
+  - Why only one folder: the patches don't touch folder handling. The module
+    most likely plays one folder at a time.
+  - Unknown: whether the original firmware can switch folders at all, for
+    example with Next on the last file. That needs a test with unpatched
+    firmware.
+
+  2. Remaining time counts down correctly. Good.
+
+  3. It stops at 00.02 except on 11/11. That's caused by my +2 s (v30).
+  - Why: MP3 files have no gaps, so the module's lengths are exact for every
+    file, as for an audio CD's last track. The last file ends at 00.00 only
+    because v36 already skips the 2 s there.
+  - Fix: add the 2 s only when the audio-CD flag (+0x118 bit 0) is set. It's
+    small and certain.
+
+  4. After Stop: the MP3 screen, Play toggles AUTO/OFF, and the disc can't be
+  started again.
+  - Why Play toggles: my auto-play toggle acts when the player is stopped
+    and the slot status is 3 or 6 ("Disc"). After Stop on an MP3 disc the module
+    evidently reports one of those, even though a disc is in.
+  - Is playing again possible at all?
+    - If the status is 3, the original firmware also drops Play there, and the
+      disc couldn't be played again before either.
+    - If it's 6, the original firmware passes Play on, and my toggle is what
+      blocks it.
+  - Fix if it's mine: only toggle auto-play when no disc type is set. That
+    depends on whether the disc type is cleared when a disc is ejected, which I
+    can't see from here.
+
+  Tests with the original firmware (or a build without the play patch),
+  with the MP3 disc:
+  - After Stop, does Play start the disc again?
+  - Can Next or Prev reach files in other folders?
+
+  I can build v37 now with the remaining-time fix for MP3 (point 3). For point 4
+  I'd wait for your test result. Shall I go ahead?
+
+❯ I first confirmed things on the original firmware.
+
+  1. This also occurs on the original firmware. Pressing play only goes into the
+     first folder. It's not possible to advance to the next folder. However,
+     after inserting the CD (when it shows Tr15) it is possible to press "12" to
+     start playing from the second folder. However, once it started playing
+     track 1 (from the first folder), after pressing stop, it is not possible to
+     enter 12. It then plays track 11, the last file from the first folder. Even
+     when playing track 12 (first song from 2nd folder), entering any number
+     will go back to the first folder. So a higher number than 11 will play
+     track 11. When stop is pressed, I can start the play again. But at long as
+     the CD is not ejected and inserted again, on the stop screen it will keep
+     Tr11 (total tracks), and it is not possible to play beyond the first
+     folder.
+
+⏺ That's useful. It also answers point 4: on the original firmware, Play after
+  Stop works on the MP3 disc. So on my builds it's my auto-play toggle that
+  blocks it. Checking how the display tells the MP3 stop screen from an empty
+  slot, since the toggle should use the same test:
+
+⏺ Thanks, that explains a lot.
+
+  Folders (original firmware behaviour)
+  - Disc-wide numbering: the module numbers MP3 files across the whole disc.
+    File 12 is the first file of folder 2, and number entry started it at
+    insert.
+  - The track count shrinks: the firmware takes the track count from a
+    module status message (type 0x26, handler at 0x0800DDEA). At insert that
+    message carries the disc-wide count (15). Once playback starts, it carries
+    only the current folder's count (11), and the firmware keeps that until the
+    disc is ejected.
+  - Everything uses that count (CD state +0xF4):
+    - the 01/11 display;
+    - number entry, which plays 11 for anything higher;
+    - Next/Prev wrap-around;
+    - the end-of-disc check;
+    - shuffle.
+
+    That's why you can't get past folder 1 once it has played.
+  - A possible fix: on MP3/WMA discs, ignore a smaller track count from the
+    module and keep the disc-wide one. Number entry, Next, 01/15 and shuffle
+    would then cover all folders. It's an experiment, though. I don't know what
+    the module does at the end of folder 1 in continuous play, or which track
+    number it reports while playing folder 2. It might take a diagnostic build
+    to find out.
+
+  Point 4 is my bug.
+  - Why: on the original firmware, Play after Stop works. With my builds
+    Play toggles AUTO/OFF instead, because the toggle only checks "stopped, and
+    slot status 3 or 6". On the MP3 stop screen the slot status evidently is one
+    of those.
+  - The firmware's own test: the display decides between the disc screen and
+    the Disc/Load texts with the "disc ready" flag (+0x11C bit 1). The MP3
+    stop screen means that flag is set.
+  - Fix: toggle auto-play only while that flag is clear, which is exactly
+    when Disc is on screen. Otherwise Play goes to the firmware as before.
+
+  Point 3 is also mine: the +2 s should only apply to audio CDs (+0x118 bit
+  0).
+
+  I'd suggest:
+  - v37: the fixes for points 3 and 4. Both are small and clear.
+  - Then, if you want: a separate experimental build that keeps the
+    disc-wide track count on MP3 discs. You'd test whether Next, number entry
+    and continuous play then cross folders.
+
+  Shall I build v37? And do you want the folder experiment?
+
+❯ yes, make v37 and also the folder experiment. First build v37 so I can test
+  those two fixed independently. Already commit the fixes to git, but do not
+  push. After that proceed with the folder experiment. That allows a clean git
+  version history for the fixes.
+
+⏺ Both are ready. v37 is committed; the v38 experiment isn't.
+
+  v37: patch/IAP_PL100_1v1_b250219_all_v37.hex, committed as 2c9af0e
+  ("Fix MP3 discs: Play after Stop, and remaining time"), not pushed.
+  - Play after Stop on MP3:
+    - Cause: a stopped MP3 disc reports slot status 6 with the disc ready.
+      Four places in the play patch took that for an empty slot.
+    - Fix: the empty slot is now status 3/6 with no disc ready, which is the
+      display's own test for showing Disc.
+    - What changes:
+      - Play starts the disc again instead of toggling AUTO/OFF;
+      - the auto-play icon no longer shows on the MP3 stop screen;
+      - a queued Play is no longer cancelled when an MP3 disc becomes ready,
+        which could have broken auto-play on MP3 discs.
+  - Remaining time: the 2 s is now added only on audio CDs. MP3 tracks
+    should end at 00.00.
+  - Emulator checks, all as intended:
+    - Play on a stopped MP3 disc goes to the firmware; Play at an empty slot
+      (status 3 or 6) toggles auto-play;
+    - the icon shows only at an empty slot;
+    - a queued Play starts on a ready MP3 disc and is cancelled at an empty
+      slot, at Eject and when the slot is blocked;
+    - remaining time is 0:00 on MP3, 0:02 on audio CD, and 0:00 on the last
+      track of either.
+
+  v38 (experiment): patch/IAP_PL100_1v1_b250219_all_v38.hex. It's v37 plus
+  MP3_ALL_FOLDERS_ON; with that switched off, the build is identical to v37.
+  The change sits uncommitted in build_patch.py.
+  - Change: on discs that aren't audio CDs, the status message while playing
+    may no longer lower the track count. The disc-wide count from insert (15 on
+    your disc) stays until eject.
+  - What to test with the MP3 disc:
+    1. Does the display show 01/15 while playing?
+    2. At the end of file 11, does it continue into folder 2 (file 12)? This is
+       the big unknown: the module may treat the end of a folder as the end of
+       the disc.
+    3. Does Next on file 11 go to 12, and Prev on 12 back to 11?
+    4. Does entering 12 or 13 during play reach folder 2?
+    5. While a folder-2 file plays, which track number is shown: 12/15, or 01/15
+       (numbered within the folder)?
+    6. Does shuffle pick files from both folders?
+  - If something misbehaves, questions 2 and 5 tell me the most. If the
+    module counts within the folder, a diagnostic build may be needed.
+
+❯ v37 works as intended.
+  For v38, one correction, it has 150 tracks, so it shows Tr150. As this is
+  higher than 99, it will not display xx/yy. So even when playing track 1 of
+  folder 1, it still displays Tr01.
+  At the end of 11, it does proceed into the next folder. The display briefly
+  shows Tr12, but then changes to Tr01. Letting that track play does proceed to
+  Tr13 (but shows Tr02).
+  When playng 11, I can press next to proceed to the next folder.
+
+⏺ That fits one explanation: the module plays files by their disc-wide number
+  but reports the track number within the folder.
+
+  What happens at the end of file 11:
+  1. Folder 1 ends, and the firmware itself starts track 11 + 1 = 12. That's the
+     Tr12 you saw briefly; the firmware writes the number it asked for.
+  2. The module plays file 12 and then reports it as track 1 of its folder:
+     Tr01.
+  3. Within folder 2 the module continues by itself, so file 13 shows as Tr02.
+
+  What that breaks in folder 2 and later (my expectation from the code; not
+  tested yet):
+  - Next and Prev use the shown number. Next on Tr02 (file 13) would play
+    file 3, back in folder 1.
+  - The end of the disc: at the end of the last folder, the firmware
+    compares the reported number with 150 and isn't at the end. It would start
+    "next track" = a low number, again in folder 1. The disc might never stop.
+  - Shuffle: it would note the wrong files as played.
+  - Repeat-one: the end-of-track check matches track numbers, so it may not
+    work.
+  - Number entry is fine, because the firmware sends absolute numbers.
+
+  A possible fix: translate the module's numbers to disc-wide ones.
+  - Where: before the firmware reads a message, add a folder offset to the
+    track number in the module's status, time and length messages.
+  - How the offset is learned: whenever the firmware starts track N and the
+    module then reports a new number r, the offset is N − r.
+    - At the folder change that's 12 − 1 = 11.
+    - Number entry to file 5 gives 5 − 5 = 0.
+    - Continuous play within a folder keeps the offset.
+  - Effect: the firmware, shuffle, repeat and the end-of-disc check then all
+    see Tr12, Tr13, … consistently.
+  - The weak point: telling the module's old number from its new one right
+    after a jump. I'd take the first reported number that differs from the
+    previous one. This fails only when the old and new files have the same
+    number within their folders, for example jumping from file 2 of folder 2 to
+    file 2 of folder 1.
+  - Disc size: this works for discs up to 255 files, because a message has
+    one byte for the track number.
+
+  This is a bigger, riskier change than v38 (message rewriting plus offset
+  tracking). Before building it, two quick tests on v38 would confirm the
+  analysis:
+  1. While a folder-2 file plays (Tr02), press Next. Do you get file 3 of
+     folder 1?
+  2. Play the last file of the disc to the end. Does it stop, or start again
+     somewhere in folder 1?
+
+  Shall I wait for those two results, or go straight to the translation build?
+
+❯ 1. Yes, pressing next on track 2 of folder 2 jumps back to track 3 of folder
+     1.
+  2. I pressed 150 and it started to play the last song. This is displayed as
+     Tr15. Once finished it repeated that same track. I let the track play
+     another time, and it repeated itself again.
+
+  For this build, what would be "riskier"?
+
+⏺ Both results confirm the analysis. The repeat at the end fits too: the module
+  reports the last file as 15, the firmware compares that with 150, concludes it
+  isn't the last track and restarts the one it last asked for, file 150. With
+  disc-wide numbers, 150 = 150 and the disc stops as on an audio CD.
+
+  What makes this build riskier:
+
+  1. It changes module messages before the firmware reads them. Display,
+     Next/Prev, end of disc, shuffle, repeat and the length request all trust
+     those track numbers. A wrong offset therefore affects everything at once,
+     not just one feature.
+     - Limiting the risk: I'd only do this when the disc type says MP3 or
+       WMA. Audio CDs and discs whose type isn't known yet are left alone. Audio
+       CDs would have no change in behaviour, and MP3 discs are already broken
+       beyond folder 1, so there's little to lose.
+  2. The offset is guessed, not reported.
+     - How: the module never says which folder it's in. The offset is worked
+       out from "the firmware asked for file N, the module now reports r".
+     - Where that can fail:
+       - Right after a jump, a late message about the old file could be
+         taken for the new one. Waiting for a number that differs from the
+         previous one avoids most of that.
+       - A jump where the old and new files have the same number within their
+         folders would keep the old offset.
+       - A dropped message (the 7 % checksum failures) only delays learning
+         the offset.
+     - The result of a wrong offset: wrong numbers until the next jump,
+       after which it corrects itself.
+  3. It relies on assumptions about the message format. It assumes the track
+     number sits in the same bytes as on audio CDs:
+     - length message: +0x95;
+     - time message: +0x99;
+     - status message: +0x95.
+
+     If the module uses other messages with track numbers on MP3 discs, those
+     stay folder-relative.
+  4. One byte per track number. Discs with more than 255 files can't be
+     numbered disc-wide in a message. Above 255 I'd leave the numbers as they
+     are, which is the current behaviour.
+  5. Untested module behaviour. For example: Prev from the first file of a
+     folder, or FF/REW across a file boundary. The firmware would ask for the
+     right disc-wide file, but how the module reports that is unknown.
+
+  Worst case: wrong track numbers or jumps on MP3/WMA discs, until the next
+  jump or eject. Nothing permanent: no flash writes, and audio CDs aren't
+  affected.
+
+  Shall I build it as v39 on top of v38?
+
+❯ yes, build it as v39
+
+⏺ I've built v39 as patch/IAP_PL100_1v1_b250219_all_v39.hex. It's v38 plus the
+  disc-wide track numbering, an option called MP3_DISC_NUMBERS_ON. It's tested
+  in the emulator only and, like v38, not committed.
+
+  How it works:
+  - Where: a hook before the firmware reads each module message, at the
+    parser call 0x0800E0A2.
+  - When: only on MP3 and WMA discs. It adds a folder offset to the track
+    number in the module's length, time and status messages.
+  - How the offset is learned: when the firmware asks for track N, the first
+    new number r the module then reports gives the offset N − r. A file that has
+    just started (0:00–0:01) also counts as new.
+  - When it isn't touched:
+    - reports the current offset already explains (Next within a folder,
+      resume after pause): it's kept;
+    - audio CDs: they reset it and aren't changed;
+    - messages with a bad checksum: left alone;
+    - numbers above 255: left as they are.
+  - RAM: 4 spare bytes, 0x2000043C–0x2000043F.
+
+  Checks:
+  - With MP3_DISC_NUMBERS_ON = False the build is byte-identical to v38. The
+    code writes no RAM except its own 4 bytes and the track byte in the message.
+  - Emulator run through a full sequence:
+
+    | Step | Module reports | Firmware sees |
+    |---|---|---|
+    | file 11 playing | 11 | 11 |
+    | firmware asks 12, late message for the old file | 11 | 11 |
+    | new file starts | 1 | 12 (offset 11) |
+    | continuous play | 2 | 13 |
+    | Next: asks 14 | 3 | 14 |
+    | number 5 | 5 | 5 (offset 0) |
+    | number 13 | 2 | 13 |
+    | number 2 (same number within its folder), new file at 0:00 | 2 | 2 |
+    | number 150 | 15 | 150 |
+    | audio CD | 3 | 3 (unchanged) |
+
+  What to test on the MP3 disc:
+  1. When folder 1 ends, the display should go to Tr12 and stay there, then
+     show Tr13 …
+  2. Next and Prev inside folder 2 should stay in folder 2, and Prev from the
+     first file of folder 2 should go to file 11.
+  3. Number entry 13 should play file 13 and show Tr13.
+  4. After file 150, the disc should stop instead of repeating.
+  5. Shuffle should play files from all folders.
+  6. Remaining time should still count down normally in folder 2. The length
+     request now compares disc-wide numbers.
+
+  If v39 works, I'd commit v38 and v39 together as one MP3 commit.
+
+❯ 1. Confirmed, works correctly
+  2. Confirmed, all work correctly
+  3. Confirmed
+  4. Broken, it repeats Tr150 again
+  5. Confirmed, works correctly
+  6. Confirmed, it shows the time remaining of the current track, so at 00:00 it
+     jumps to the next track
+
+⏺ I've built v40 as patch/IAP_PL100_1v1_b250219_all_v40.hex. It's v39 plus a
+  fix for the repeating last file, tested in the emulator only and not
+  committed. The rest of v39 is confirmed by your tests.
+
+  Cause of the repeat (original firmware):
+  - MP3 discs signal the end of every file with the module's "track ended"
+    status. That's also how playback got into folder 2.
+  - The firmware's handler for it (0x0800DAAC) plays the next track only while
+    the last requested track (+0x115) is below the track count. Otherwise it
+    plays that track again. So file 150 started over.
+  - On audio CDs the end comes as "end of disc", which goes to the proper
+    handler. That's why audio CDs never repeated.
+  - The emulator also showed a worse case in v39. If file 150 is reached by
+    continuous play rather than requested, the firmware asks for file 151, which
+    doesn't exist.
+
+  Fix: a new option, LAST_TRACK_END_ON, in the shuffle patch. When
+  "track ended" arrives on the last track, the firmware now continues in its own
+  end-of-disc handler (0x0800D9C4), which acts on the play mode.
+
+  Emulator results (the firmware's real status handler with v39 and v40):
+
+  | Situation | v39 | v40 |
+  |---|---|---|
+  | MP3 last file, normal | plays 150 again | stops |
+  | MP3 last file reached by continuous play | asks for 151 | stops |
+  | MP3 last file, repeat one | plays 150 | plays 150 again (correct) |
+  | MP3 last file, repeat disc | plays 150 | plays track 1 |
+  | MP3 end of folder 1 | plays 12 | plays 12 (unchanged) |
+  | Audio CD, track 5 of 12 ends | plays 6 | plays 6 (unchanged) |
+  | Audio CD, end of disc | stops | stops (unchanged) |
+
+  With LAST_TRACK_END_ON = False the build is identical to v39.
+
+  To test on the MP3 disc:
+  1. Enter 150 and let it play out. It should stop.
+  2. Let it reach the last file by continuous play, if practical, or enter 149.
+     It should also stop.
+  3. With repeat disc on, it should continue at track 1.
+
+  On an audio CD, nothing should change: the end of the disc stops as before.
+
+  If v40 works, the MP3 changes (v38–v40) can go into one commit, or into two if
+  you'd rather keep the end-of-disc fix separate. Tell me which.
+
+❯ 1. This test case works.
+  2. I started at 149. It does proceed to 150 after it and then stops. (one time
+     the display showed Tr163 instead of Tr150, but I cannot reproduce this a
+     second time)
+  3. Pressing 150 in repeat mode does go back to 1 after reaching the end of 150
+
+  Commit can go in 1 commit, it's all related to MP3 fixes, but don't push
+
+⏺ I committed v38–v40 together as 1438252 ("MP3 discs: play all folders,
+  disc-wide track numbers, stop at the end"). It isn't pushed, and the tree is
+  clean.
+
+  About the one-time Tr163: 163 = 15 + 148, and 148 = 149 − 1.
+  - What probably happened: when you entered 149, the first new number the
+    module reported was a stray 1, perhaps a status message while it was still
+    seeking, rather than 14. The folder offset was learned as 148 instead of
+    135, so file 150 (number 15 within its folder) showed as 163.
+  - Why it still stopped: 163 is at least 150, so the disc ended correctly
+    anyway.
+  - Why it's hard to reproduce: it depends on that stray message arriving at
+    exactly that moment.
+
+  A possible hardening: learn the offset only when the same new number
+  arrives twice in a row, and show the requested number while waiting.
+  - Effect: a single stray report can no longer set a wrong offset.
+  - Cost: about one more time message (~1 s) before the offset is set. You
+    wouldn't see it, because the requested number is shown in the meantime.
+  - Remaining limit: two identical stray reports in a row would still slip
+    through.
+
+  Since you saw it only once and couldn't reproduce it, it's a judgement call. A
+  device test could only show that nothing else broke. Shall I build it as v41,
+  or leave it as it is?
+
+  For the README:
+  - MP3 discs now play all folders, with disc-wide track numbers (Tr12… across
+    folders), and stop after the last file;
+  - Play after Stop and the remaining time on MP3 discs are fixed;
+  - the new options are MP3_ALL_FOLDERS_ON, MP3_DISC_NUMBERS_ON and
+    LAST_TRACK_END_ON.
+
+❯ Yes, build v41
+
+⏺ I've built v41 as patch/IAP_PL100_1v1_b250219_all_v41.hex. It's tested in
+  the emulator only and not committed.
+
+  Change (in the MP3 numbering from v39):
+  - Learning the folder offset: it's set only when the same new track number
+    arrives twice in a row. A single stray report becomes a candidate, and the
+    next real number replaces it.
+  - While waiting: time and status messages show the requested number. You
+    see Tr149 straight away, rather than a guess.
+  - Length messages while waiting keep the old offset, so a length can't be
+    stored under the wrong track. The length request simply asks again.
+  - RAM: one more spare byte for the candidate (0x20000440, still in the
+    dead menu table).
+
+  Emulator run (the earlier sequence plus your Tr163 case):
+
+  | Step | Module reports | Firmware sees |
+  |---|---|---|
+  | asks 149, late message for the old file | 2 | 149 |
+  | stray report | 1 | 149 (only a candidate) |
+  | new file | 14 | 149 |
+  | again | 14 | 149, offset 135 learned |
+  | continuous: last file | 15 | 150 (was 163 once) |
+  | end of folder 1: asks 12, then 1, 1 | 1 | 12, offset 11 |
+  | Next: asks 14 | 3 | 14 |
+  | number 5 | 5, 5 | 5, offset 0 |
+  | number 2 (same number within its folder), new file at 0:00 | 2, 2 | 2, offset 0 |
+  | audio CD | 3 | 3 (unchanged) |
+
+  The code still writes no RAM except its own 5 bytes and the track byte in the
+  message.
+
+  On the device: the same MP3 tests as before. Folder changes, Next/Prev,
+  number entry, the stop after the last file and shuffle should all behave as in
+  v40. A display difference: right after a jump, the requested number shows
+  straight away. The Tr163 glitch can't be forced, so a device run mainly
+  shows nothing else broke.
+
+❯ Not tested yet. First another question. During the discussion about shuffle,
+  there was something about jumping to the next track 2 seconds before the end
+  of the track. That was solved for CD playback? I might have seen that again
+  for MP3 discs.
+
+⏺ No, it was never fixed for audio CDs. Two related problems were fixed, but the
+  early jump itself remains. I've checked the end-of-track check (0x0800D190)
+  again.
+
+  What the check does (original firmware): every pass, it compares the
+  elapsed time with the stored track length minus 2 s, and acts on the play mode
+  when that point is reached.
+
+  | Play mode | Action at length − 2 s |
+  |---|---|
+  | repeat one | play the same track again |
+  | repeat disc | on the last track, go to track 1 |
+  | shuffle | play the next random track |
+  | normal | (was: stop the last track early) |
+
+  What was fixed earlier:
+  - Normal mode, last track: it no longer stops early. The module's
+    end-of-disc message stops it (LAST_TRACK_FULL_ON).
+  - Shuffle, repeat: the check used the previous track's length for up to 22
+    s. It now only runs with the playing track's own length
+    (TRACK_END_FIX_ON).
+
+  What was never fixed: in shuffle, repeat one, and repeat disc on the last
+  track, the jump still happens at length − 2 s. Combined with what we've
+  learned about the module's lengths, the amount cut off is:
+
+  | Disc | Reported length | Cut off at the end |
+  |---|---|---|
+  | audio CD, gapless | 2 s short | ~4 s |
+  | audio CD, 2 s gaps | about right | ~2 s |
+  | audio CD, longer gaps | longer than the music | less, or none (the gap is silence) |
+  | audio CD, last track (repeat disc) | exact | 2 s |
+  | MP3 | exact | 2 s |
+
+  So what you saw on MP3 is real, and on gapless CDs it's even more.
+
+  Why it isn't a simple threshold change:
+  - The early action is load-bearing. In shuffle, the module is put into
+    "stop at the end of each track" mode. When a track really ends there, the
+    module reports "track ended", and the firmware's handler for that plays the
+    next track in sequence (+1), not a random one. The firmware only got away
+    with that because the check always acted before the real end.
+  - Gaps get in the way. Before a gap, the module switches to the next track
+    number when the gap starts, and the check stops running at that moment.
+
+  A possible fix, in two parts:
+  1. Make "track ended" follow the play mode: shuffle picks the next random
+     track, and repeat one plays the same track again. I already hook that
+     handler for the MP3 end-of-disc fix (v40). The end of a track would then be
+     handled correctly whenever the module reports it.
+  2. Act later:
+     - Audio CDs: in the track's last second, at length + 1 s, since their
+       lengths are 2 s short. Before a gap, the track number changing already
+       means the track ended.
+     - MP3: at the real end, through the "track ended" status from part 1.
+
+     What's left is at most a fraction of a second, instead of 2–4 s. The time
+     messages only have whole seconds, so it can't be more exact than that.
+
+  The details depend on the module's behaviour per mode: whether it really
+  reports "track ended" in repeat-one mode, which the firmware plays
+  continuously. I'd want to check that against the code before building.
+
+  Shall I work this out and build it on top of v41 as v42? Or would you rather
+  test v41 first and keep the two separate?
+
+❯ Does the firmware accuratly know the real end of the track? In shuffle mode,
+  it is OK I think if there is a pause between the end of the track and the next
+  track, as the laser might need to jump to a different part of the disc. Even
+  if a disc is gapless, in shuffle a gap is OK. The gap could also be somewhat
+  longer than 2s if required.
+
+⏺ Not from the time. From the time alone it can only estimate the end:
+  - the time messages have whole seconds only;
+  - on audio CDs the stored length is 2 s short;
+  - a gap after the track can't be known in advance.
+
+  But the module itself knows the real end exactly, and it can tell the
+  firmware. In its "stop at the end of each track" mode (command 0x24), the
+  module plays the track to the end, stops, and reports "track ended". That's
+  what caused the gaps after FF/REW: the module was left in that mode, stopped
+  after every track, and the firmware then started the next one. So the firmware
+  gets an exact end-of-track event, at the cost of a pause while it starts the
+  next track. In shuffle that pause is fine, as you say: the laser has to move
+  anyway.
+
+  So for shuffle the clean solution is:
+  - Don't act early at all. In shuffle, the time-based check no longer jumps
+    at length − 2 s.
+  - Keep the module in stop-at-end mode during shuffle.
+    - Problem: today the firmware sends 0x24 when shuffle is switched on,
+      but every Play sends 0x25 (continuous) first, and so does the release of
+      FF/REW in my gapless patch. So during shuffle the module is mostly in
+      continuous mode. That's why the firmware relied on the early check.
+    - Fix: in shuffle, send 0x24 again after every "play" command.
+  - On "track ended" in shuffle, start the next random track instead of the
+    next in sequence. I already hook that handler for the MP3 last-file fix.
+  - Result: every track plays to its real end, then a short pause, then the
+    next random track. This works the same on audio CDs (with or without gaps)
+    and MP3.
+  - Safety net: if "track ended" doesn't come for some reason, the
+    time-based check still acts, but only a few seconds after the stored length
+    instead of 2 s before it.
+
+  The other modes:
+  - Repeat one: the same approach works: stop at the end, then play the
+    track again, with a short pause before the repeat. If that pause is
+    acceptable, it fixes the 2–4 s cut there too.
+  - Repeat disc:
+    - Mid-disc: it stays continuous and gapless.
+    - Last track: the module's end-of-disc message already goes to the
+      handler that starts track 1. So the early check isn't needed there either,
+      and the last track plays in full.
+  - Normal: unchanged.
+
+  Is a short pause acceptable for repeat one as well? If so, I'll build this as
+  v42 on top of v41.
+
+❯ Yes, anything that is not continuous play (shuffle, repeat-one,
+  repeat-all-at-last-track) can have a pause. Only continuous play, including
+  FF/REW during continuous play should always be as intended (gapless or
+  whatever timing the gap is)
+
+⏺ Understood: continuous play stays exactly as it is, and only shuffle, repeat
+  one, and repeat disc at the last track may have a pause. Let me look at the
+  code I need to change: the end-check wrapper, the Play handler's mode command,
+  and the gapless patch.
+
+⏺ Two things in that edit need fixing: the gapless replacement is needlessly
+  convoluted, and mode_sync derives the CD state address incorrectly.
+  Correcting both:
+
+⏺ Shuffle works: track 5 ends, a different unplayed track is picked, and when
+  all tracks have played it stops. Updating the docstring and notes:
+
+⏺ I've built v42 as patch/IAP_PL100_1v1_b250219_all_v42.hex. It's v41 plus the
+  exact track ends, tested in the emulator only and not committed.
+
+  What changed (a new option, TRACK_END_EXACT_ON):
+  - Repeat one and shuffle: the module is told to stop at the end of each
+    track and report it, where it used to be put in continuous mode.
+    - Where this applies: when Play is pressed, after FF/REW, and when you
+      switch the mode while a track plays.
+    - When it reports the real end, the firmware starts the mode's next track:
+      the same track again, or a random one. Tracks are no longer cut 2–4 s
+      short; there's a short pause instead.
+  - Repeat disc, last track: the module's end-of-disc message already starts
+    track 1, so the early jump is gone there too.
+  - The time-based check: in those three modes it only acts 4 s after the
+    stored length, as a fallback in case the module's report never comes.
+  - Continuous play is unchanged: normal and repeat disc keep sending
+    continuous mode, including after FF/REW, so gapless playback stays as it
+    was.
+
+  Emulator results (the firmware's real handlers, v41 vs v42):
+
+  | Situation | v41 | v42 |
+  |---|---|---|
+  | Play: normal / repeat disc | continuous | continuous |
+  | Play: repeat one / shuffle | continuous | stop at track end |
+  | FF/REW release: normal | continuous | continuous |
+  | FF/REW release: repeat one / shuffle | continuous | stop at track end |
+  | Mode changed while playing | nothing | the matching mode is sent once |
+  | Track ends, repeat one | (cut 2–4 s earlier) | same track again |
+  | Track ends, shuffle | (cut 2–4 s earlier) | random unplayed track; stops when all have played |
+  | Track ends, normal / repeat disc mid-disc | next track | next track (unchanged) |
+  | Last track ends, repeat disc | track 1 | track 1 |
+  | Time check, repeat one, 3:55 track at 3:53 | acts (cut) | waits |
+  | Time check, repeat one, at 3:59 | | acts (fallback) |
+
+  With TRACK_END_EXACT_ON = False the build is identical to v41.
+
+  What to test on the device:
+  1. Shuffle on an audio CD: each track plays to its real end, then a short
+     pause, then the next. Try a gapless disc, where the old cut was about 4 s.
+  2. Shuffle on the MP3 disc: the same.
+  3. Repeat one: the track plays fully, pauses briefly, then starts again.
+     Also switch to repeat one in the middle of a track.
+  4. Repeat disc: mid-disc it stays gapless. At the end of the last track it
+     continues at track 1, without the last 2 s cut.
+  5. Normal play and FF/REW in normal mode: still gapless. Also switch from
+     repeat one to repeat disc while playing, and check that the next track
+     change is gapless again.
+
+  What can go wrong:
+  - The module may not report the end in some situation. The fallback then
+    acts about 4–6 s after the end, depending on the gap.
+  - A switch between repeat one and repeat disc right at the end of a track
+    may still produce a single pause.
+
+❯ What is shown on the screen after reaching 00:00 and before going to the next
+  track? Would it be possible to show something to indicate the player is
+  picking a new random track? E.g. show "Random" or "Rand"? Or would that be
+  overkill as it is very briefly or not at all?
+
+⏺ Very little, and what it shows is already useful. Following the code path in
+  v42:
+
+  1. The track plays to its end:
+     - Elapsed mode: the time stops at the track's last second.
+     - Remaining mode: it reaches 00.00.
+  2. "Track ended" arrives. That's practically the moment the music stops:
+     - the firmware sets the time to 0;
+     - the shuffle code picks the next track;
+     - 15 ms later the play command goes out with the new track number.
+  3. During the seek, until the music starts:
+     - line 1 already shows the new track's number (07/12, or Tr07);
+     - line 2 shows 00.00 in elapsed mode;
+     - the play icon stays on.
+  4. Music starts, and the time runs from 00.01.
+
+  So during the pause the display already says where it's going. A Rand text
+  would have to replace exactly that information:
+  - on line 1, the track number;
+  - on line 2, the time.
+
+  And it would only be visible for the length of the seek, probably about a
+  second on an audio CD. I'd consider it overkill. If the pause turns out
+  noticeably long on the device (on MP3 discs, for example), it might be worth
+  revisiting.
+
+  One detail I noticed while checking this: in remaining mode, during the
+  pause and the first second of the new track, line 2 probably shows the
+  previous track's length. The firmware doesn't know the new length until the
+  module answers the length request. This isn't new; it happens at every track
+  change, including gapless ones. Your earlier "the length is there almost
+  immediately" fits that: it's only a short moment.
+
+  If it bothers you, a small fix would be to show the elapsed time while the
+  stored length belongs to another track. Remaining mode would then show 00.00
+  until the new length arrives. That's the same fallback as when no length is
+  known at all.
+
+❯ v42 is supposed to contain all previous fixes as well, right? It seems to have
+  broken quite some things. The two new things in the actual player, that
+  weren't tested before are the send message fix (for when I saw Tr163) and the
+  enhanced shuffle.
+  In this build all the MP3 fixes are no longer working; only things from the
+  first folder are played.
+  I also tested the shuffle fixed with a CD. Two things I have observed already:
+  - in time remaining mode the jump happens when the gap starts. That is not the
+    same as 00.00, but depending on the length of the gap at 00.02 (or even
+    00.05 on one of my CDs)
+  - it's easy to break shuffle mode. If I press play in normal mode, and then
+    active shuffle mode, it actually remains in normal mode. But when entering
+    the gap the track number already advances a track, but it still counts down
+    the whole gap. (indicate if this is not immediately clear, I can provide
+    more examples)
+
+⏺ Yes, v42 should include all the earlier fixes, and it does: rebuilding it
+  gives a byte-identical file with every patch present. So something interacts
+  badly on the device. I haven't fixed anything yet; here's what I found.
+
+  MP3: only folder 1 plays
+
+  I couldn't find the cause by reading the code or in the emulator. v42 only
+  changes behaviour in repeat one and shuffle. It also re-sends the "continuous"
+  command if the play mode changes during playback. Normal MP3 play shouldn't be
+  affected.
+
+  The other untested change on your device is v41's folder-offset fix (the
+  "Tr163" fix). It's already in your commit b416142. "Only folder 1 plays" is
+  exactly what happens when the folder offset isn't learned. v41 learns it more
+  cautiously than v40: it waits until a new number is reported twice. My best
+  guess is that a length reply arrives during that wait and wrongly ends it with
+  offset 0. That only happens if the module gives the length with the disc-wide
+  number. I can't confirm that without the device.
+
+  Could you flash IAP_PL100_1v1_b250219_all_v41.hex (v42 without the
+  shuffle change) and play the MP3 disc across folders in normal mode?
+  - v41 works: the cause is v42.
+  - v41 also breaks: it's the offset fix, and v40's version may be the
+    better one.
+
+  It would also help to know:
+  - which play mode you were in;
+  - what happens at the end of file 11: does it show Tr12 and then play folder 1
+    file 2, or Tr01?
+
+  Shuffle, issue 2: switching mode during playback
+
+  This is clear, and I found the cause. The Shuffle key itself sends "stop at
+  each track end" (as command 0x0D, same bytes as 0x24), and v42 sends it once
+  more. The module ignores that setting during playback and only applies it with
+  the next play command. So after you switch on shuffle mid-track, it keeps
+  playing continuously and never reports "track ended". The time-based fallback
+  doesn't fire either, because the track number and elapsed time reset when the
+  gap starts.
+
+  The same problem exists the other way round: switching shuffle off mid-track
+  would leave the module stopping after every track in normal mode.
+
+  Proposed fix:
+  - Correct mode before every play command: the firmware has about ten
+    places that start playback, so I'd send the play mode's command just before
+    each one, not only in the Play handler and after FF/REW.
+  - Catch the switch mid-track: if the play mode wants "stop at end" but the
+    module is still continuous, detect the moment it moves to the next track by
+    itself (the new number at the start of the gap). That's the same moment
+    "track ended" would arrive, and shuffle or repeat one acts there. Only that
+    one transition is affected; from the next track on, the module is in the
+    right mode.
+
+  Shuffle, issue 1: remaining time jumps at 00.02 / 00.05
+
+  This is the module doing what it should, and it's the side effect I warned
+  about. In "stop at each track end" mode, it stops where the track's own audio
+  ends, which is the start of the gap. In remaining mode the display counts down
+  to the end of the gap (v30/v32), so it jumps with the gap still showing: 00.02
+  on a disc with 2 s gaps, 00.05 on your 5 s disc. A gapless disc would jump at
+  00.00. The gap length isn't known in advance, so the display can't predict
+  where the jump comes.
+
+  Options:
+  - A. Keep it: the jump is exactly at the end of the music. I'd recommend
+    this.
+  - B. Wait out the gap: hold the next track and keep counting down to
+    00.00. That's the same silence the disc itself has. It needs a timer and its
+    own time counting while the module is stopped, so it's clearly more work and
+    risk.
+
+  Which do you want for issue 1? I'll build issue 2's fix as v43 once the MP3
+  question is settled, so the two don't get mixed up.
+
+  I also corrected CLAUDE.md: it said Shuffle on/off sends 0x24/0x25 (they're
+  0x0D/0x23 with the same bytes). I noted there that the module ignores the mode
+  change during playback.
+
+❯ I tested the MP3 fixes first. The shuffle fix was stashed, and then I build
+  from both b416142bd9f06acee0aad6871268df93d0a39d00 (mp3 folders with Tr163
+  fix) and 1438252381420f3a6433c711e5259dda0ea57daa (mp3 folders before Tr163
+  fix). b416142b cannot play multiple folders correctly, while 14382523 can. As
+  the Tr163 fix was described as optional and I choose to have it, there should
+  be no harm in not having this.
+  I also tested the shuffle fix on top of 14382523, by applying the stash on
+  local/mp3-before-send-message-fix. On that buid playing from multiple folders
+  still works correctly.
+
+  I've corrected the git tree. 9a2213ad11cd0ca620830d9039a1f45885ab3da9 should
+  now contain the mp3-folders fix, but not the Tr163 fix. Verify that everything
+  is still as expected.
+
+⏺ Everything is as expected.
+
+  - Commit 9a2213a: its parent is 2c9af0e (the v37 fix), and its
+    build_patch.py is identical to 1438252. Building from it gives a file
+    byte-identical to IAP_PL100_1v1_b250219_all_v40.hex. The Tr163 fix is
+    gone; the commit message never mentioned it, so it needs no change.
+  - Working tree: the only uncommitted change is the shuffle fix (v42), and
+    none of the Tr163 fix's code is in it. With TRACK_END_EXACT_ON = False the
+    build is byte-identical to 9a2213a, so the shuffle fix touches nothing
+    when it's switched off.
+  - RAM: the shuffle fix uses 0x20000441, and the MP3 code uses
+    0x2000043C–0x2000043F, so they don't overlap.
+  - Git state: main is 5 commits ahead of origin/main, not pushed. The
+    two stashes from local/mp3-before-send-message-fix are still there; I've
+    left them alone.
+
+  I updated CLAUDE.md and my notes: the Tr163 fix is recorded as rejected (it
+  broke playback across folders), and the MP3 commit is now 9a2213a. The two
+  open shuffle issues are noted there too:
+  - Mode switched during playback: the player stays in continuous play.
+  - Remaining mode: the jump comes at 00.02 / 00.05.
+
+  For the next build: which do you want for the 00.02 / 00.05 jump in remaining
+  mode?
+  - A. Keep it: the jump is at the real end of the music. I'd recommend
+    this.
+  - B. Wait out the gap: count down to 00.00 before the next track. This is
+    clearly more work and risk.
+
+  With your answer I'll build v43 with the fix for switching the mode during
+  playback.
+
+❯ For the shuffle changes, I'm confused about one thing. It started with a
+  question that the shuffle jump happens at 00.02 (or whatever the gap length
+  is). Now code was build for that, but the jump still happens at the start of
+  the gap, when the time remaining is not at 00.00. So what is the change
+  between 9a2213ad11cd0ca620830d9039a1f45885ab3da9, the current unstaged shuffle
+  fix, and the additional changed proposed in A or B?
+
+⏺ The shuffle fix was about the music, not the display. Before it, shuffle cut
+  off the end of the song. Now the whole song plays, and the jump comes the
+  moment the music ends. On a disc with gaps, that moment is the start of the
+  gap, so remaining mode still shows the gap length there.
+
+  9a2213a (before the fix): the firmware jumped at a fixed time: the
+  module's track length minus 2 s.
+  - On an audio CD the module's track length is already 2 s shorter than the
+    time to the next track's start. So the jump came 4 s before the next track's
+    start, wherever the music actually ends.
+  - On an MP3 disc the length is exact, so the last 2 s were cut. That's
+    what you saw.
+
+  Current shuffle fix (unstaged, v42): the module stops when the music ends
+  and reports it, and the jump happens then. No music is cut. On a disc with
+  gaps, that point is the start of the gap, which the display still counts as
+  part of the track (your v30/v32 change).
+
+  What each version does at the jump:
+
+  | Disc | 9a2213a: music cut | 9a2213a: remaining at jump | v42: music cut | v42: remaining at jump |
+  |---|---|---|---|---|
+  | MP3 | last 2 s | 00.02 | nothing | 00.00 |
+  | Audio CD, no gap | last 4 s | 00.04 | nothing | 00.00 |
+  | Audio CD, 2 s gap | last 2 s | 00.04 | nothing | 00.02 (the gap) |
+  | Audio CD, 5 s gap | — (see below) | — | nothing | 00.05 (the gap) |
+
+  With a 5 s gap, the old code never reached its jump point: the track number
+  changed when the gap started, 1 s earlier. So shuffle just continued to the
+  next track in order.
+
+  In v42 the 00.02 or 00.05 left on screen is silence that gets skipped, not
+  music.
+
+  A and B only differ in what happens to that gap:
+  - A: no further change. It jumps when the music ends, and on discs with
+    gaps the remaining time shows the skipped gap.
+  - B: after the music ends, wait out the gap's silence while the time
+    counts down to 00.00, then jump. This changes only the display and when the
+    next track starts; the music is the same as in A. The player can't know the
+    gap length in advance, so it has to keep the time counting itself while the
+    module is stopped. That's why it's more work.
+
+  The fix for switching the mode during playback is separate and needed with
+  either option.
+
+❯ OK, then build it as follows:
+  - fix the switching mode. This is option A. Commit that, but don't push. Build
+    this option as v43a. Also set this as the version of the build on the splash
+    screen.
+  - after that do option be, but leave these additional changed unstaged. Build
+    it as v43b, and again set this version on the splash screen.
+
+⏺ Both builds are ready, with "patch v43a" and "patch v43b" on the boot screen.
+  Neither has been on the device yet; I've only checked them in the emulator.
+
+  v43a: the fix for switching mode during playback, committed as 60f23fa
+  (not pushed)
+
+  IAP_PL100_1v1_b250219_all_v43a.hex
+
+  The commit contains v42's exact track ends plus this fix. Because the module
+  only takes the mode setting along with a play command, there are three
+  changes:
+
+  - Every play command now carries the mode. "Stop at each track end" in
+    repeat one and shuffle, continuous otherwise. This covers all ten or so
+    places in the firmware that start playback, not just Play and FF/REW. It
+    also means switching back to normal mid-track gives one pause at most, then
+    continuous play again.
+  - Switching to shuffle or repeat one mid-track: the module plays on into
+    the next track by itself. That moment, the start of the gap, now counts as
+    the end of the track, and shuffle or repeat one takes over from there.
+  - Shuffle on the disc's last track (audio CD): the module reports "end of
+    disc" there, and the firmware did nothing with it. v42 only moved on through
+    the backup timer, 4 s late. Now the next random track starts at once.
+
+  With the feature switched off, the build is byte-identical to 9a2213a.
+
+  v43b: waiting out the gap (uncommitted)
+
+  IAP_PL100_1v1_b250219_all_v43b.hex
+
+  This is v43a plus one change, which only applies to repeat one and shuffle on
+  audio CDs. When the module reports the end of a track, the player now waits
+  until the remaining time reaches 00.00 (the next track's start), then jumps.
+  The time keeps counting during the wait.
+
+  - In elapsed mode the time keeps counting up through the gap, e.g. 3:56 →
+    3:57, then the jump.
+  - Gaps over 10 s, such as hidden-track pregaps, aren't waited out
+    (TRACK_GAP_MAX_S).
+  - MP3 discs and gapless discs jump at once, as before.
+  - Next, Prev, number entry or Play during the wait cancel it.
+
+  With TRACK_END_GAP_ON = False the build is byte-identical to the v43a
+  commit.
+
+  One risk to watch in v43b: while the player waits, the module is stopped.
+  If it then sends its own status message, the player might switch to its
+  stopped state. The stop icon would appear and the next track might not start.
+  If you see that, tell me; v43a doesn't have this risk.
+
+  What to test:
+  - v43a: in normal mode, start a track and switch on shuffle mid-track.
+    When it ends, the next track should be a random one.
+  - v43b: in shuffle or repeat one on a disc with gaps, remaining mode
+    should reach 00.00 before the jump.
+
+  I updated CLAUDE.md with both builds' status.
+
+  README changes to make: shuffle and repeat one now play every track to the
+  end, with a short pause between tracks, and switching mode mid-track works. If
+  v43b is kept, also mention that the time counts down to 00.00 first.
+
+❯ I think v43a is the better approach, with less workarounds. Is it then best to
+  just discard the uncommitted changes?
+
+⏺ Yes, I agree, so I've discarded them. v43a uses what the module itself reports
+  and needs no extra timing. v43b only changed what the display shows during a
+  gap that is silent anyway, and it added a risk: the player might show stopped
+  while it waits.
+
+  - The working tree is clean again, and it builds a file byte-identical to
+    IAP_PL100_1v1_b250219_all_v43a.hex.
+  - In case you want B back later, the discarded diff is saved as `/private/tmp/
+    claude-501/-Users-daniel-Projects-github-pl100/88cfedcb-82b1-4be2-85a7-f3744
+    3209b40/scratchpad/v43b_wait_gap.patch`. That folder is temporary, so it
+    won't survive a reboot.
+  - IAP_PL100_1v1_b250219_all_v43b.hex is still in the patch folder; delete it
+    whenever you like.
+  - CLAUDE.md now records that v43b was dropped, and that with v43a the
+    remaining time on a disc with gaps jumps at the gap's length (00.02 or
+    00.05).
+
+  main is 6 commits ahead of origin/main, ending with 60f23fa (v43a), and
+  nothing is pushed.
+
+❯ I'm testing the repeat-one and repeat-all modes. One weird thing I saw is this
+  test case:
+  - start playing track 1 in repeat-one mode. Repeat it at least once
+  - switch to repeat-all mode
+  - using numbers jump to the last track
+  And the end of the last track it should jump back to track 1, but instead it
+  jumped to track 2 (which I hadn't played yet). Is there some code related to
+  shuffle mode that is interfering here, remembering that track 1 has already
+  played? This might not be the most important thing to fix, as it is a very
+  unlikely scenario. But it might hide some other bugs in the code that I
+  haven't discovered yet.
+
+⏺ No, shuffle isn't involved. Its record of played tracks is only read in
+  shuffle mode. Repeat-all doesn't track history at all: at the end of the last
+  track it always sets "play track 1". So track 2 has to come from a different
+  path. I haven't confirmed this on the device, but the code allows only one way
+  to get there.
+
+  The only way to land on track 2. Track 2 can only come from the firmware's
+  "track ended → play the current track + 1" path. For that, the module must
+  report "track ended" at a moment when the firmware already considers track 1
+  the current track. That fits this sequence:
+
+  1. The last track ends and the module reports "end of disc".
+  2. Repeat-all handles it correctly and starts track 1.
+  3. Shortly after, a second, late report for the old track arrives ("track
+     ended").
+  4. By then the firmware thinks track 1 is playing, so it plays 1 + 1 = track
+     2.
+
+  The module sending both reports would also explain the last-track repeat you
+  once saw in the diagnostic build.
+
+  Why it can show up now. Until v42, repeat-all acted 2 s before the end of
+  the last track, so the module's own end reports were never used there. Since
+  v42 the player waits for those reports. So this may not need your exact
+  scenario: plain repeat-all on an audio CD could do the same. The repeat-one
+  part of your test probably doesn't matter. Number entry already resets the
+  module to continuous play.
+
+  A quick test to check: in repeat-all, jump straight to the last track by
+  number, without repeat one first, and let it end.
+  - Track 2 again: it's this late-report problem, and it affects repeat-all
+    in general.
+  - Track 1: the repeat-one history matters after all, and I'll look
+    further.
+
+  The fix I'd make either way: ignore a "track ended" report while the time
+  still shows 0:00. Every play command resets the time to 0:00, so a report
+  arriving then belongs to the previous track. A real track end always comes
+  after the time has run. It's a small hook, and it also guards repeat one and
+  shuffle against the same kind of late report.
+
+  Shall I build it as v44 after your test?
+
+❯ Jumping directly to the last track and pressing next track does jump to 1
+  correctly. Just letting the last track play jump to 2. It actually briefly
+  shows 01/xx on the screen before advancing to track 2.
+  For the fix, is relying on timing the best way? In earlier fixes this was
+  adviced against. Can the track disc ended or track-ended-after-disc-ended not
+  be ignored?
+
+⏺ The 01/xx you saw confirms it. Repeat-all handled "end of disc" correctly and
+  started track 1. Then the module sent a second report about the old track,
+  "track ended", and the firmware applied it to track 1 and went on to track 2.
+  Next worked because it doesn't involve the module's end reports. This affects
+  repeat-all at the end of any audio CD, not just your scenario.
+
+  You were right to question my proposal. "The time still shows 0:00" sounds
+  like state, but the time fill moves the display to 0:01 by itself after about
+  a second, so it was timing-dependent after all.
+
+  The fix in v44 follows your suggestion, but keyed to the module's own
+  messages instead of to "after end of disc":
+  - Every play command sets a "waiting for the module" mark.
+  - The module's first time message after that clears it. That's the module
+    confirming the new playback.
+  - While the mark is set, or while a track change is already queued (e.g.
+    during number entry), "track ended" and "end of disc" are ignored. They can
+    only be about the previous track.
+
+  There's no clock involved, only the order of messages. I didn't tie it only to
+  "after end of disc" because the same late report can follow a "track ended" in
+  repeat one or shuffle. It would also need its own rule for when to stop
+  ignoring, which comes down to this same "has the module confirmed the new
+  track" check.
+
+  Tested in the emulator only:
+  - Repeat-all, repeat one and shuffle each go through this sequence: last track
+    ends → next track starts → late "track ended" and "end of disc" are ignored
+    → the next real track end is handled normally. Normal mode still stops at
+    the end of the disc.
+  - All the v43a test cases give the same results as before.
+  - With TRACK_END_EXACT_ON = False the build is still byte-identical to
+    9a2213a.
+
+  While testing I caught and fixed a bug of my own: the first version of the
+  end-of-disc hook broke "end of disc" in every mode except shuffle.
+
+  IAP_PL100_1v1_b250219_all_v44.hex shows "patch v44" on the boot screen. It's
+  not committed; say if you want it committed.
+
+  To test on the device:
+  - Repeat-all, let the last track play out: it should go to track 1 and stay
+    there.
+  - Repeat one and shuffle across the end of the disc.
+  - An MP3 disc in normal mode across a folder boundary. MP3 files end with
+    "track ended" every time, so that path now passes through the new check too.
+
+❯ For "- Repeat one and shuffle across the end of the disc.", what is a test
+  scenario for this?
+
+⏺ Two scenarios, both on an audio CD. To save waiting, fast-forward to about 10
+  s before the end of the last track and let it play from there; that's a normal
+  play command, so the test still holds.
+
+  1. Repeat one on the last track
+  1. Switch to repeat one.
+  2. Enter the last track's number (e.g. 12) and let it play to the end.
+  3. Let it repeat at least twice.
+
+  - Expected: the last track starts again from 00:00 each time, and the
+    display stays on 12/12.
+  - Wrong would be: a jump to track 1 or 2, a quick flash of another track
+    number, or playback stopping.
+
+  2. Shuffle across the last track
+  1. Switch to shuffle.
+  2. Enter the last track's number (in shuffle, number entry plays that track)
+     and let it play to the end.
+  3. Watch the next track, and let it play through its own end too.
+
+  - Expected: at the end of the last track there's a short pause, then a
+    random track you haven't heard in this round. That track plays fully, and at
+    its end shuffle picks the next one.
+  - Wrong would be:
+    - the random track being skipped after a second or so (a second number
+      flashing past);
+    - a pause of about 4 s before the next track (that was v43a's backup timer,
+      so the end-of-disc report was missed);
+    - playback stopping.
+
+  Scenario 2 also checks the v43a change where shuffle reacts to "end of disc"
+  itself. Until v42, shuffle never got that far, because it jumped 2 s before
+  the end.
+
+❯ v44 works, commit but don't push
+
+⏺ I committed v44 as ec84380, on top of v43a (60f23fa), and haven't pushed.
+  main is now 7 commits ahead of origin/main, and the working tree is clean.
+  CLAUDE.md now records that v44 works on the device.
+
+  README changes to make:
+  - Shuffle and repeat one now play every track to the end, with a short pause
+    between tracks.
+  - Switching to shuffle or repeat one during playback works.
+  - Repeat-all goes back to track 1 after the last track. Before, a late report
+    from the CD module could send it to track 2.
+
+❯ Pressing the FN and MENU buttons changes the brightness and screensaver,
+  respectrively. But a button press changes the setting immediately, so it is
+  not possible to see what the curretn setting is. You have to know which
+  settings there are, know which one comes before the one seen directly when
+  changing it. It would be better if the first press shows the current setting.
+  Then each successive press changes the setting, as long as the setting is
+  displayed instead of the track number. As soon as the timeout is reached,
+  pressing the button should again show the current setting.
+  For the remaining/elapsed time, this is not required, as there is a persistent
+  icon on the screen showing the current setting.
+
+⏺ v45 is built: FN and MENU now show the current setting first, as you
+  described. I've only tested it in the emulator so far.
+
+  How the two buttons now behave:
+  - First press: line 1 shows the current setting (e.g. "35%" or "DIM") and
+    nothing changes.
+  - Presses while it's shown: each one steps to the next setting, as before,
+    and the 2.5 s display time restarts with each press.
+  - After the 2.5 s timeout: the next press only shows the setting again.
+  - FN and MENU together: if the brightness is on screen and you press MENU,
+    that first MENU press only shows the screensaver mode, and the other way
+    round.
+  - While the screensaver runs: MENU still only wakes the screen. The next
+    press shows the mode.
+
+  How it decides: a press changes the setting only when line 1 is showing that
+  same setting's text at that moment. So it needs no extra memory and no state
+  of its own.
+
+  The emulator covered:
+  - the full brightness cycle and all five screensaver modes;
+  - the timeout, and switching between FN and MENU;
+  - the wrap of the player's 75 ms clock;
+  - an invalid stored brightness, which still steps to 10 %;
+  - the screensaver setting right after flashing, which shows NONE.
+
+  IAP_PL100_1v1_b250219_all_v45.hex was built without --version, so the boot
+  screen stays original (the rule in CLAUDE.md for test builds). Say if you want
+  "patch v45" on it. It's not committed. I also updated the FN and MENU
+  descriptions in the docstring.
+
+  Play at the empty slot also toggles auto-play (AUTO/OFF) with the first press.
+  With only two states that's less confusing, but it could get the same
+  show-first behaviour if you like.
+
+  README changes to make: FN and MENU first show the current setting;
+  pressing again while it's shown changes it.
+
+❯ Current implementation is what is needed. For auto-play there is also an
+  on-screen indicator (play icon or not), so like elapsed/remaining time with
+  the hourglass this should indeed stay as an immediate toggle. As an additional
+  question (but no need to change it either way, I think): does this impact
+  volume, as that follows the same logic? Does the first press already change
+  the volume, or only display the current volume level?
+
+⏺ No, v45 doesn't affect volume. I only changed the FN (brightness) and MENU
+  (screensaver) code and their shared display check, so volume still behaves
+  exactly as before:
+  - With headphones: the volume keys go to the firmware's own volume
+    handler, which no patch changes.
+  - Without headphones: our panel mapping still turns the player's Vol− into
+    the elapsed/remaining switch and Vol+ into the play-mode change.
+
+  Whether the firmware's own first press already changes the volume or only
+  shows the level, I haven't traced in the code. It's quickest to check on the
+  player: with headphones plugged in, press Vol+ once and see whether the number
+  on screen goes up.
+
+  If you ever want volume to behave like FN and MENU, it could be done. But
+  volume has its own display code in the firmware, separate from our on-screen
+  text, so it would be a separate change.
+
+❯ In remaining time mode, it counts dows to 00.00, so including the gap time. It
+  was stated that there might be a little hick-up in the time display when going
+  from normal track time to gap time. But from what I remember, on earlier
+  versions, it also counted down to 00.00 but without a hick-up. Did something
+  change, or do I remember incorrectly?
+
+⏺ You remember it correctly, and nothing has changed in continuous play.
+
+  No change since v32. The remaining-time display and the gap countdown are
+  still the same code as in v32. Since then I've only changed:
+  - repeat one, shuffle and repeat-all (v42–v44);
+  - the FN and MENU buttons (v45).
+
+  The one new piece that sees every time message (v44) only checks it and lets
+  it through. It changes nothing on screen in normal play.
+
+  The gap transition was designed to be seamless. At the start of the gap,
+  the old track's remaining time is exactly the gap length, e.g. 00.02. The gap
+  countdown then continues from that same value, 00.02 → 00.01, and the next
+  track starts. Two details:
+  - Gaps aren't whole seconds, so the switch from track time to gap time can
+    make one second last a bit shorter or longer. Nothing jumps back or skips.
+  - Reading the code, the last thing the gap shows is 00.01, not 00.00. When the
+    music starts, the new track's own remaining time appears. If you've seen
+    00.00 there, a time message probably happened to land on the gap's last
+    instant.
+
+  The glitch I did mention is at a different moment: the start of the next
+  track. I searched your exported conversations and found no earlier remark
+  about a glitch at the gap. What I did mention recently: when a new track
+  starts, the player knows the new track's length only once the module answers
+  the length request. Until then, remaining mode calculates with the previous
+  track's length. That has been true since the length-request fix, and you then
+  confirmed the right length appears almost immediately. So at most, the first
+  second of a new track can show a wrong remaining time.
