@@ -43,7 +43,7 @@ fade-out, so it might not have always been noticeable.
 seeking in a track.
 7. Skipping seconds is no longer there. The CD module sends the current time every second. As a result the time on the
 screen is updated. About 7% of these messages are corrupted. When that happens the time remains the same. The next good
-message would then change again the time. The display could show `00:22` -> `00:22` -> `00:24`. This is resolved by always
+message would then change again the time. The display could show `00.22` -> `00.22` -> `00.24`. This is resolved by always
 changing the time, even if there is a corrupt time message.
 8. Changing tracks by entering a number on the remote has a number of fixes. In the original firmware, entering a track number
 above 39 was not possible. Entering a number above the disc's length would play the last track. In the patched firmware:
@@ -54,8 +54,10 @@ above 39 was not possible. Entering a number above the disc's length would play 
      to wait for another number. Nothing after 8 can produce a valid track number so it jumps immediately to track 8).
    * To immediately jump to a track below 10 (if higher track exists) enter `Tr02`. This jumps immediately. Entering `Tr2-` will jump to 
      track 2 after 2.25 seconds.
-   * If an invalid track number is entered, nothing happens (e.g. `0` or a number higher than the total tracks).
-   
+   * If an invalid track number is entered, nothing happens (e.g. `00` or a number higher than the total tracks).
+9. Play all MP3 tracks, even when in folders (e.g. folders per album). In the original firmware, upon inserting an MP3
+CD it would display the total number of MP3 tracks, but was only able to play files from the first folder. Now all
+files can be played. However, there is no direct folder control. To play the first file in a folder you have to know the "track number" in the sum of all the tracks.
 
 ## Original firmware
 
